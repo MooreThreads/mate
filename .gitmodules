@@ -1,0 +1,3 @@
+[submodule "3rdparty/mutlass"]
+	path = 3rdparty/mutlass
+	url = https://github.com/MooreThreads/mutlass.git

@@ -1,0 +1,38 @@
+[project]
+name = "mate"
+description = "MATE: MUSA AI Tensor Engine - A centralized library for Large Language Models"
+readme = "README.md"
+requires-python = ">=3.9,<4.0"
+authors = [
+    { name = "MooreThreads GPU Computing Team" }
+]
+dynamic = ["version"]
+dependencies = [
+    "torch>=2.0.0",
+]
+
+[build-system]
+requires = [
+    "setuptools>=77",
+    "setuptools_scm>=8",
+    "packaging>=24",
+    "ninja",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "release-branch-semver"
+local_scheme = "node-and-date"
+
+[tool.mypy]
+files = ["mate"]
+ignore_missing_imports = true
+show_column_numbers = true
+show_error_context = true
+follow_imports = "skip"
+ignore_errors = false
+strict_optional = false
+
+[tool.setuptools.packages.find]
+where=["."]
+include=["mate*"]
