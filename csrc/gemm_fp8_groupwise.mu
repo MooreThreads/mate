@@ -1,6 +1,6 @@
 
-#include <mudnn_xmma.h>
 #include <musa.h>
+#include <mudnn_xmma.h>
 #include <musa_runtime.h>
 #include <torch/torch.h>
 #include <torch_musa/csrc/core/MUSAGuard.h>
@@ -184,6 +184,8 @@ at::Tensor gemm_fp8_nt_groupwise(const at::Tensor&                            a,
   param.m = a.size(0);
   param.n = b.size(0);
   param.k = a.size(1);
+
+  if (gemm_early_return(param.m, param.n, param.k, d)) return d;
 
   param.scale_granularity_m = std::get<0>(scale_granularity_mnk);
   param.scale_granularity_n = std::get<1>(scale_granularity_mnk);

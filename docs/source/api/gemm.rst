@@ -7,7 +7,8 @@ MoE GEMM
 -------------------------
 
 .. currentmodule:: mate.gemm
-.. autofunction:: ragged_moe_gemm_8bit
+.. autofunction:: ragged_m_moe_gemm_8bit
+.. autofunction:: ragged_k_moe_gemm_8bit
 .. autofunction:: masked_moe_gemm_8bit
 
 FP8 GEMM

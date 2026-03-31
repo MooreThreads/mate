@@ -378,7 +378,9 @@ def bench_kineto(
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
-        schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
+        schedule = torch.profiler.schedule(
+            wait=1, warmup=0, active=num_tests * 2 - 1, repeat=1
+        )
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.MUSA], schedule=schedule
         )

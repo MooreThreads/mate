@@ -4,23 +4,39 @@
 
 // clang-format off
 
+extern unsigned char bf16tce_flash_atten_512_256x64_192_128_varlen_nomask[];
+extern unsigned char bf16tce_flash_atten_512_256x128x128_persistence[];
 extern unsigned char bf16tce_flash_atten_512_256x64_192_128_causal_persistence[];
+extern unsigned char bf16tce_flash_atten_512_256x128x128_varlen[];
+extern unsigned char htce_flash_atten_512_256x128x128_varlen[];
+extern unsigned char bf16tce_flash_atten_512_256x64_192_128_nomask_persistence[];
 extern unsigned char htce_flash_atten_512_256x128x128_varlen_causal[];
 extern unsigned char htce_flash_atten_512_256x128x128_causal_persistence[];
 extern unsigned char bf16tce_flash_atten_512_256x64_192_128_varlen_causal[];
 extern unsigned char htce_flash_atten_512_256x64_192_128_varlen_causal[];
 extern unsigned char bf16tce_flash_atten_512_256x128x128_causal_persistence[];
 extern unsigned char bf16tce_flash_atten_512_256x128x128_varlen_causal[];
+extern unsigned char htce_flash_atten_512_256x64_192_128_nomask_persistence[];
+extern unsigned char htce_flash_atten_512_256x128x128_persistence[];
+extern unsigned char htce_flash_atten_512_256x64_192_128_varlen_nomask[];
 extern unsigned char htce_flash_atten_512_256x64_192_128_causal_persistence[];
 
 
+extern unsigned int bf16tce_flash_atten_512_256x64_192_128_varlen_nomask_len;
+extern unsigned int bf16tce_flash_atten_512_256x128x128_persistence_len;
 extern unsigned int bf16tce_flash_atten_512_256x64_192_128_causal_persistence_len;
+extern unsigned int bf16tce_flash_atten_512_256x128x128_varlen_len;
+extern unsigned int htce_flash_atten_512_256x128x128_varlen_len;
+extern unsigned int bf16tce_flash_atten_512_256x64_192_128_nomask_persistence_len;
 extern unsigned int htce_flash_atten_512_256x128x128_varlen_causal_len;
 extern unsigned int htce_flash_atten_512_256x128x128_causal_persistence_len;
 extern unsigned int bf16tce_flash_atten_512_256x64_192_128_varlen_causal_len;
 extern unsigned int htce_flash_atten_512_256x64_192_128_varlen_causal_len;
 extern unsigned int bf16tce_flash_atten_512_256x128x128_causal_persistence_len;
 extern unsigned int bf16tce_flash_atten_512_256x128x128_varlen_causal_len;
+extern unsigned int htce_flash_atten_512_256x64_192_128_nomask_persistence_len;
+extern unsigned int htce_flash_atten_512_256x128x128_persistence_len;
+extern unsigned int htce_flash_atten_512_256x64_192_128_varlen_nomask_len;
 extern unsigned int htce_flash_atten_512_256x64_192_128_causal_persistence_len;
 
 // clang-format on

@@ -1,0 +1,28 @@
+
+# csrc
+csrc/instantiations/*
+
+# mate
+mate/_version.py
+mate/_build_meta.py
+mate/data
+
+# vscode
+.vscode/
+
+# claude
+.claude
+
+# python
+__pycache__/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# temporary files
+mate/jit/aot-levels.json
+aot-lib/
+temp/
+mate/jit/aot-levels.json

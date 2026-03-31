@@ -103,3 +103,28 @@ inline bool is_bf16_or_fp16_tensor_type(const at::ScalarType scalar_type) {
 inline bool is_fp8_tensor_type(const at::ScalarType scalar_type) {
   return scalar_type == at::kFloat8_e4m3fn || scalar_type == at::kFloat8_e5m2;
 }
+
+inline bool is_8bit_type(const at::ScalarType scalar_type) {
+  return is_fp8_tensor_type(scalar_type) || scalar_type == at::kChar || scalar_type == at::kByte;
+}
+
+inline int torch_type_size(const at::ScalarType scalar_type) {
+  if (is_8bit_type(scalar_type)) {
+    return 1;
+  } else if (is_bf16_or_fp16_tensor_type(scalar_type)) {
+    return 2;
+  } else if (scalar_type == at::kFloat){
+    return 4;
+  } else {
+    throw std::runtime_error("torch_type_size() get INVALID Input tensor type!");
+  }
+}
+
+inline bool gemm_early_return(const int m, const int n, const int k, at::Tensor& out) {
+  if (m == 0 || n == 0) return true;
+  if (k == 0) {
+    out.zero_();
+    return true;
+  }
+  return false;
+}

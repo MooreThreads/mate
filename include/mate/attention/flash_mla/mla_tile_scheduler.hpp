@@ -38,9 +38,9 @@ struct FlashMlaTileScheduler {
                                         TileShape const&   tile_shape,
                                         Arguments          args = {}) {
     dim3 grid_dim;
-    auto [Q, PageSize, D, H, PageCount, B] = problem_size;
+    auto [Q, PageSize, D, H, PageCount, B, TotalQ, MaxQ] = problem_size;
 
-    grid_dim.x = ceil_div(Q * H, get<0>(TileShape{}));
+    grid_dim.x = ceil_div(MaxQ * H, get<0>(TileShape{}));
     if constexpr (UseTrivialScheduler) {
       grid_dim.y = 1;  // since splits=1
       grid_dim.z = B;

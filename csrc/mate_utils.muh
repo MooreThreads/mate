@@ -148,7 +148,17 @@ struct Arch {
   }
 };
 
+enum class TensorQuantMode {
+  NO_QUANT = 0,
+  TENSOR,
+  CHANNEL,
+  BLOCK,
+  GROUP,
+};  // enum class TensorQuantMode
+
 enum class MatMulScalingMode {
+
+  // TODO: replace by TensorQuantMode
 
   // Mat A + Mat B
   // for example

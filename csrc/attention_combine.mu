@@ -26,7 +26,7 @@
     }                                                          \
   }()
 
-template <typename T>
+template <typename T, bool VarlenQ>
 void run_mla_combine_kernel(const mate::flash_mla::MlaCombineParams& params, musaStream_t stream) {
   static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
   MLA_NUM_SPLITS_SWITCH(params.num_mp_parts, NUM_SPLITS, [&] {
@@ -36,17 +36,23 @@ void run_mla_combine_kernel(const mate::flash_mla::MlaCombineParams& params, mus
 
     dim3 grid;
     grid.x = params.batch_size;
-    grid.y = mutlass::ceil_div(params.h_k * params.q_seq_per_hk, BLOCK_SIZE_M);
+    grid.y = mutlass::ceil_div(params.h_k * params.max_q_seq_per_hk, BLOCK_SIZE_M);
     grid.z = 1;
-    mate::flash_mla::mpxx_mla_combine_kernel<T, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>
+    mate::flash_mla::mpxx_mla_combine_kernel<T, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, VarlenQ>
         <<<grid, NUM_THREADS, smem_size, stream>>>(params);
   });
 }
 
-template void run_mla_combine_kernel<mutlass::half_t>(const mate::flash_mla::MlaCombineParams& params,
-                                                      musaStream_t                             stream);
+template void run_mla_combine_kernel<mutlass::half_t, false>(const mate::flash_mla::MlaCombineParams& params,
+                                                             musaStream_t                             stream);
 
-template void run_mla_combine_kernel<mutlass::bfloat16_t>(const mate::flash_mla::MlaCombineParams& params,
-                                                          musaStream_t                             stream);
+template void run_mla_combine_kernel<mutlass::half_t, true>(const mate::flash_mla::MlaCombineParams& params,
+                                                            musaStream_t                             stream);
+
+template void run_mla_combine_kernel<mutlass::bfloat16_t, false>(const mate::flash_mla::MlaCombineParams& params,
+                                                                 musaStream_t                             stream);
+
+template void run_mla_combine_kernel<mutlass::bfloat16_t, true>(const mate::flash_mla::MlaCombineParams& params,
+                                                                musaStream_t                             stream);
 
 #undef MLA_NUM_SPLITS_SWITCH

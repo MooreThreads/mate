@@ -3,8 +3,10 @@ from typing import Optional, Tuple
 import torch
 
 import mate._C  # noqa: F401
+from mate.api_logging import mate_api
 
 
+@mate_api
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
     num_q_tokens_per_head_k: int,
@@ -49,6 +51,7 @@ def get_mla_metadata(
     )
 
 
+@mate_api
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -108,11 +111,10 @@ def flash_mla_with_kvcache(
     if indices is not None:
         assert not causal, "causal must be `false` if sparse attention is enabled."
 
-    # adhoc for mla TP1
-    should_run_with_plan = q.shape[-2] == 128
+    should_run_with_asm = q.shape[-2] == 128
     assert head_dim_v == 512
-    if should_run_with_plan:
-        return torch.ops.mate.mla_with_kvcache(
+    if should_run_with_asm:
+        return torch.ops.mate.flash_mla_asm(
             q[:, :, :, :head_dim_v],
             q[:, :, :, head_dim_v:],
             k_cache[:, :, :, :head_dim_v],
@@ -125,15 +127,17 @@ def flash_mla_with_kvcache(
             causal,
         )
     else:
-        return torch.ops.mate.mla(
+        return torch.ops.mate.mla_with_kvcache(
             q[:, :, :, :head_dim_v],
             q[:, :, :, head_dim_v:],
             k_cache[:, :, :, :head_dim_v],
             k_cache[:, :, :, head_dim_v:],
-            block_table,
             cache_seqlens,
+            None,
+            None,
+            block_table,
+            tile_scheduler_metadata,
+            num_splits,
             softmax_scale,
-            None,
-            None,
             causal,
         )

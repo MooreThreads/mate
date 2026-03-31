@@ -33,6 +33,9 @@ inline musa::dnn::Tensor::Type to_mudnn_tensor_type(const at::ScalarType scalar_
     case at::kFloat8_e5m2: {
       return musa::dnn::Tensor::Type::FP8_E5M2;
     }
+    case at::kInt: {
+      return musa::dnn::Tensor::Type::INT32;
+    }
     default: {
       throw std::runtime_error("to_mudnn_tensor_type get unsupported data type!");
     }

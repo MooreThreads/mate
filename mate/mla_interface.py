@@ -1,8 +1,10 @@
 import torch
 import mate._C  # noqa: F401
 from typing import Optional
+from mate.api_logging import mate_api
 
 
+@mate_api
 def mla(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -29,6 +31,7 @@ def mla(
     )
 
 
+@mate_api
 def get_mla_metadata(
     seqlens_k: torch.Tensor,
     num_q_tokens_per_head_k: int,

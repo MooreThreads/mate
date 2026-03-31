@@ -66,6 +66,20 @@ inline void init_fa_asm_kern_registry() {
     )
 
     REGISTER_FA_ASM_KERNEL(
+      0, 1,
+      0,
+      0,
+      bf16tce_flash_atten_512_256x128x128_varlen
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      0,
+      0,
+      bf16tce_flash_atten_512_256x128x128_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
       1, 1,
       1,
       0,
@@ -77,6 +91,20 @@ inline void init_fa_asm_kern_registry() {
       1,
       0,
       htce_flash_atten_512_256x128x128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 1,
+      1,
+      0,
+      htce_flash_atten_512_256x128x128_varlen
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      1,
+      0,
+      htce_flash_atten_512_256x128x128_persistence
     )
 
     REGISTER_FA_ASM_KERNEL(
@@ -94,6 +122,20 @@ inline void init_fa_asm_kern_registry() {
     )
 
     REGISTER_FA_ASM_KERNEL(
+      0, 1,
+      0,
+      1,
+      bf16tce_flash_atten_512_256x64_192_128_varlen_nomask
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      0,
+      1,
+      bf16tce_flash_atten_512_256x64_192_128_nomask_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
       1, 1,
       1,
       1,
@@ -105,6 +147,20 @@ inline void init_fa_asm_kern_registry() {
       1,
       1,
       htce_flash_atten_512_256x64_192_128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 1,
+      1,
+      1,
+      htce_flash_atten_512_256x64_192_128_varlen_nomask
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      1,
+      1,
+      htce_flash_atten_512_256x64_192_128_nomask_persistence
     )
 
     // clang-format on

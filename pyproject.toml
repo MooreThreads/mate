@@ -1,6 +1,6 @@
 [project]
 name = "mate"
-description = "MATE: MUSA AI Tensor Engine - A centralized library for Large Language Models"
+description = "MATE: MUSA AI Tensor Engine - A centralized library for Generative AI"
 readme = "README.md"
 requires-python = ">=3.9,<4.0"
 authors = [
@@ -8,21 +8,28 @@ authors = [
 ]
 dynamic = ["version"]
 dependencies = [
-    "torch>=2.0.0",
+    "torch>=2.7.0",
+    "click>=8.0.0",
 ]
+
+[tool.setuptools.dynamic]
+version = { attr = "mate._build_meta.__version__" }
 
 [build-system]
 requires = [
     "setuptools>=77",
-    "setuptools_scm>=8",
     "packaging>=24",
     "ninja",
+    "apache-tvm-ffi>=0.1.8",
+    "torch>=2.7.0",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path = ["."]
 
-[tool.setuptools_scm]
-version_scheme = "release-branch-semver"
-local_scheme = "node-and-date"
+[tool.setuptools]
+include-package-data = false
+py-modules = ["build_backend", "build_utils"]
+
 
 [tool.mypy]
 files = ["mate"]
@@ -33,6 +40,36 @@ follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
 
+[tool.ruff.lint]
+ignore = [
+    # assign `lambda` expressions
+    "E731",
+    # temp disable
+    "F821",
+]
+
 [tool.setuptools.packages.find]
 where=["."]
 include=["mate*"]
+
+[tool.setuptools.package-data]
+"mate" = ["_build_meta.py"]
+"mate.jit" = ["aot-levels.json"]
+"mate.data" = ["csrc/**", "include/**", "aot/*.so"]
+"mate.data.mutlass" = ["include/**"]
+
+[project.optional-dependencies]
+# Full functionality including safetensors support
+all = ["safetensors>=0.4.0"]
+
+# CLI extension for full replay support (safetensors enables tensor dump/replay)
+cli = ["safetensors>=0.4.0"]
+
+# Development dependencies
+dev = [
+    "safetensors>=0.4.0",
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+mate = "mate.__main__:cli"

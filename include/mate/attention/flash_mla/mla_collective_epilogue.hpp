@@ -13,7 +13,8 @@ template <class Element,
           class EpilogueTileShape,
           class StrideO,
           class StrideLSE,
-          int FragmentSize = 4>
+          bool VarlenQ,
+          int  FragmentSize = 4>
 struct MlaFwdEpilogue {
   struct Arguments {
     Element* ptr_O;
@@ -43,18 +44,37 @@ struct MlaFwdEpilogue {
                                  Params const&      params,
                                  int const          thread_idx,
                                  int const          consumer_qo_coord,
-                                 int const          split_idx) {
+                                 int const          split_idx,
+                                 int const          seq_q_begin) {
     auto acc = get<0>(result);
     auto lse = get<1>(result);
 
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
 
     if constexpr (IsNoSplit) {
-      auto [Q, D_VO, H, B] = problem_size;
+      auto [Q_, D_VO_, HQ_, HK_, B_, TotalQ_, MaxQ_] = problem_size;
 
-      Tensor mLSE_in   = make_tensor(make_gmem_ptr(params.ptr_LSE),
-                                   make_shape(Q, D_VO, make_shape(H, B)),
-                                   make_stride(_1{}, _0{}, get<1>(params.stride_LSE)));
+      int Q      = Q_;
+      int D_VO   = D_VO_;
+      int HQ     = HQ_;
+      int HK     = HK_;
+      int B      = B_;
+      int TotalQ = TotalQ_;
+      int MaxQ   = MaxQ_;
+      int h_r    = HQ / HK;
+
+      auto mLSE_in = [&] {
+        if constexpr (!VarlenQ) {
+          return make_tensor(make_gmem_ptr(params.ptr_LSE),
+                             make_shape(Q, D_VO, make_shape(HK, B)),
+                             make_stride(_1{}, _0{}, get<1>(params.stride_LSE)));
+        } else {  // domain offset for varlen Q; Q is seqlen_q for current batch.
+          return domain_offset(make_coord(seq_q_begin, _0{}, make_coord(_0{}, _0{})),
+                               make_tensor(make_gmem_ptr(params.ptr_LSE),
+                                           make_shape(Q, D_VO, make_shape(HK, 1)),
+                                           make_stride(_1{}, _0{}, get<1>(params.stride_LSE))));
+        }
+      }();
       Tensor mLSE      = domain_offset(make_coord(get<0>(blk_offset), _0{}, make_coord(_0{}, _0{})), mLSE_in);
       Tensor gLSE_full = local_tile(mLSE, EpilogueTileShape{}, make_coord(_, _, _));
       Tensor gLSE      = gLSE_full(_, _, consumer_qo_coord, _0{}, make_coord(get<1>(blk_coord), get<3>(blk_coord)));
@@ -63,7 +83,15 @@ struct MlaFwdEpilogue {
       Tensor cO   = make_identity_tensor(EpilogueTileShape{});
       Tensor tOcO = thr_mma.partition_C(cO);
 
-      Tensor mO_in   = make_tensor(make_gmem_ptr(params.ptr_O), make_shape(Q, D_VO, make_shape(H, B)), params.stride_O);
+      auto mO_in = [&] {
+        if constexpr (!VarlenQ) {
+          return make_tensor(make_gmem_ptr(params.ptr_O), make_shape(Q, D_VO, make_shape(HK, B)), params.stride_O);
+        } else {  // domain offset for varlen Q; Q is seqlen_q for current batch.
+          return domain_offset(
+              make_coord(seq_q_begin * HQ, _0{}, make_coord(_0{}, _0{})),
+              make_tensor(make_gmem_ptr(params.ptr_O), make_shape(Q, D_VO, make_shape(HK, 1)), params.stride_O));
+        }
+      }();
       Tensor mO      = domain_offset(make_coord(get<0>(blk_offset), _0{}, make_coord(_0{}, _0{})), mO_in);
       Tensor gO_full = local_tile(mO, EpilogueTileShape{}, make_coord(_, _, _));
       Tensor gO      = gO_full(_, _, consumer_qo_coord, _0{}, make_coord(get<1>(blk_coord), get<3>(blk_coord)));
@@ -88,8 +116,16 @@ struct MlaFwdEpilogue {
 
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size<0>(tOgO_mn); ++i) {
-        if (consumer_qo_coord * get<0>(EpilogueTileShape{}) + get<0>(tOcO_mn(i, 0)) < get<0>(problem_size)) {
-          tOgLSE_mn(i, _0{}) = lse(i);
+        int row = consumer_qo_coord * get<0>(EpilogueTileShape{}) + get<0>(tOcO_mn(i, 0));
+        if (row < get<0>(problem_size)) {
+          if constexpr (!VarlenQ) {
+            tOgLSE_mn(i, _0{}) = lse(i);
+          } else {
+            int h_idx = row % h_r;
+            int q_idx = row / h_r;
+
+            mLSE((h_idx)*TotalQ + q_idx, _0{}, make_coord(_0{}, _0{})) = lse(i);
+          }
 
           MUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<1>(tOgO_mn); ++j) {

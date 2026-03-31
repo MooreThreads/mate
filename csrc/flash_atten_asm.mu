@@ -17,6 +17,8 @@
 namespace mate::flash_attention {
 
 struct FlashAttenASMArgs {
+  bool is_causal{};
+
   at::ScalarType data_type;
 
   int32_t num_mp{};
@@ -71,6 +73,8 @@ struct FlashAttenASMArgs {
 };  // struct FlashAttenASMArgs
 
 struct FlashAttenVarlenASMArgs {
+  bool is_causal{};
+
   at::ScalarType data_type;
 
   int32_t num_mp{};
@@ -123,7 +127,7 @@ namespace mubin {
 template <class Args>
 struct FlashAttenASMDispatcher {
   FlashAttenASMDispatcher() {
-    // register all moe gemm mubin kernels
+    // register all fa mubin kernels
     // do only once
     init_fa_asm_kern_registry();
   }
@@ -145,9 +149,9 @@ struct FlashAttenASMDispatcher {
 
     Config config;
 
-    const int headdim_qk = args.headdim_qk;
+    const int headdim_qk = args.headdim_qk <= 128 ? 128 : args.headdim_qk;
 
-    if (args.headdim_qk == 128) {
+    if (headdim_qk == 128) {
       config.nr_thr    = 512;
       config.tile_m    = 256;
       config.tile_n    = 128;
@@ -163,9 +167,9 @@ struct FlashAttenASMDispatcher {
     }
 
     FlashAttenAsmID id;
-    id.is_causal  = static_cast<int>(true);
+    id.is_causal  = static_cast<int>(args.is_causal);
     id.is_varlen  = static_cast<int>(is_varlen);
-    id.headdim_qk = args.headdim_qk == 128 ? 0 : 1;
+    id.headdim_qk = headdim_qk == 128 ? 0 : 1;
     id.dtype      = args.data_type == at::kBFloat16 ? 0 : 1;
 
     // checking if we have this kernel
@@ -181,7 +185,7 @@ struct FlashAttenASMDispatcher {
     } else {
       auto asm_meta = fa_asm_kern_registry.find(id);
       if (asm_meta == fa_asm_kern_registry.end()) {
-        throw std::runtime_error("MoeGemm8bitAsmDispatcher() mubin kernel not found!");
+        throw std::runtime_error("FlashAttenAsmDispatcher() mubin kernel not found!");
       }
 
       // Call the kernel first time
@@ -572,12 +576,19 @@ class FlashAttentionVarlenAsmKernel {
     params.tile_v_dim2 = config.tile_k;
 
     // this is varlen == this is NOT persistence
-    launch_config.blockDimX      = config.nr_thr;
-    launch_config.blockDimY      = 1;
-    launch_config.blockDimZ      = 1;
-    launch_config.gridDimX       = params.nheads;
-    launch_config.gridDimY       = params.batch;
-    launch_config.gridDimZ       = mutlass::ceil_div(params.max_seqlen_q, config.tile_m);
+    launch_config.blockDimX = config.nr_thr;
+    launch_config.blockDimY = 1;
+    launch_config.blockDimZ = 1;
+    if (args.is_causal) {
+      launch_config.gridDimX = params.nheads;
+      launch_config.gridDimY = params.batch;
+      launch_config.gridDimZ = mutlass::ceil_div(params.max_seqlen_q, config.tile_m);
+
+    } else {
+      launch_config.gridDimX = mutlass::ceil_div(params.max_seqlen_q, config.tile_m);
+      launch_config.gridDimY = params.nheads;
+      launch_config.gridDimZ = params.batch;
+    }
     launch_config.hStream        = reinterpret_cast<MUstream>(stream);
     launch_config.sharedMemBytes = 0;
     launch_config.attrs          = NULL;
@@ -607,7 +618,8 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_asm(const at::Tensor& q,
                                                             const at::Tensor& v,
                                                             const double      softmax_scale,
                                                             at::Tensor&       out,
-                                                            at::Tensor&       out_lse) {
+                                                            at::Tensor&       out_lse,
+                                                            const bool        is_causal) {
   CHECK_MP31("dispatch_flash_atten_asm");
   at::TensorArg targs[]{{q, "q", 0}, {k, "k", 1}, {v, "v", 2}, {out, "out", 3}, {out_lse, "out_lse", 4}};
   at::checkAllSameGPU(__func__, targs);
@@ -624,6 +636,8 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_asm(const at::Tensor& q,
 
   using Args = mate::flash_attention::FlashAttenASMArgs;
   Args args;
+
+  args.is_causal = is_causal;
 
   args.data_type = q.scalar_type();
   TORCH_CHECK(is_bf16_or_fp16_tensor_type(q.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
@@ -646,9 +660,9 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_asm(const at::Tensor& q,
 
   args.headdim_v = v.size(3);
 
-  TORCH_CHECK(args.headdim_qk == 128 || args.headdim_qk == 192,
-              "dispatch_flash_atten_asm() headdim_qk must be 128 or 192!");
-  TORCH_CHECK(args.headdim_v == 128, "dispatch_flash_atten_asm() headdim_v must be 128!");
+  bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
+  bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
+  TORCH_CHECK(is_192_128 || is_128_128_or_less, "HeadDim unsupported!");
 
   CHECK_SHAPE(q, args.batch, args.seqlen_q, args.nr_heads, args.headdim_qk);
   CHECK_SHAPE(k, args.batch, args.seqlen_kv, args.nr_heads_kv, args.headdim_qk);
@@ -704,7 +718,8 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_varlen_asm(const at::Ten
                                                                    const int64_t     max_seqlen_kv,
                                                                    const double      softmax_scale,
                                                                    at::Tensor&       out,
-                                                                   at::Tensor&       out_lse) {
+                                                                   at::Tensor&       out_lse,
+                                                                   const bool        is_causal) {
   at::TensorArg targs[]{{q, "q", 0},
                         {k, "k", 1},
                         {v, "v", 2},
@@ -734,6 +749,8 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_varlen_asm(const at::Ten
   using Args = mate::flash_attention::FlashAttenVarlenASMArgs;
   Args args;
 
+  args.is_causal = is_causal;
+
   args.data_type = q.scalar_type();
   TORCH_CHECK(is_bf16_or_fp16_tensor_type(q.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
   TORCH_CHECK(is_bf16_or_fp16_tensor_type(k.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
@@ -741,6 +758,17 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_varlen_asm(const at::Ten
   TORCH_CHECK(is_bf16_or_fp16_tensor_type(out.scalar_type()), "dispatch_flash_atten_asm() out must be half or bf16!");
 
   args.batch = input_cu_seqlen_q.size(0) - 1;
+
+  // bypass bs=1
+  if (args.batch == 1) {
+    auto q_view       = q.unsqueeze(0);
+    auto k_view       = k.unsqueeze(0);
+    auto v_view       = v.unsqueeze(0);
+    auto out_view     = out.unsqueeze(0);
+    auto out_lse_view = out_lse.unsqueeze(0);
+    dispatch_flash_atten_asm(q_view, k_view, v_view, softmax_scale, out_view, out_lse_view, is_causal);
+    return std::make_tuple(out, out_lse);
+  }
 
   auto dprops = at::musa::getCurrentDeviceProperties();
   args.num_mp = dprops->multiProcessorCount;
@@ -755,8 +783,9 @@ std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_varlen_asm(const at::Ten
 
   args.headdim_v = v.size(2);
 
-  TORCH_CHECK(args.headdim_qk == 128 || args.headdim_qk == 192,
-              "dispatch_flash_atten_varlen_asm() headdim_qk must be 128 or 192!");
+  bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
+  bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
+  TORCH_CHECK(is_192_128 || is_128_128_or_less, "HeadDim unsupported!");
   TORCH_CHECK(args.nr_heads >= args.nr_heads_kv,
               "dispatch_flash_atten_varlen_asm() nr_heads must be greater than nr_heads_kv!")
   TORCH_CHECK(args.nr_heads % args.nr_heads_kv == 0,
@@ -814,6 +843,7 @@ std::tuple<at::Tensor, at::Tensor> flash_atten_varlen_asm(const at::Tensor&     
                                                           const double              softmax_scale,
                                                           at::Tensor&               out,
                                                           at::Tensor&               out_lse,
+                                                          const bool                is_causal,
                                                           std::optional<at::Tensor> input_cu_seqlen_q,
                                                           std::optional<at::Tensor> input_cu_seqlen_k,
                                                           std::optional<int64_t>    max_seqlen_q,
@@ -826,8 +856,7 @@ std::tuple<at::Tensor, at::Tensor> flash_atten_varlen_asm(const at::Tensor&     
 
   c10::musa::OptionalMUSAGuard guard(q.device());
 
-  bool is_varlen = input_cu_seqlen_q.has_value() || input_cu_seqlen_k.has_value() || max_seqlen_q.has_value() ||
-                   max_seqlen_kv.has_value();
+  bool is_varlen = input_cu_seqlen_q.has_value() || input_cu_seqlen_k.has_value();
 
   if (is_varlen) {
     TORCH_CHECK(input_cu_seqlen_q.has_value(),
@@ -846,10 +875,11 @@ std::tuple<at::Tensor, at::Tensor> flash_atten_varlen_asm(const at::Tensor&     
                                            max_seqlen_kv.value(),
                                            softmax_scale,
                                            out,
-                                           out_lse);
+                                           out_lse,
+                                           is_causal);
   } else {
     // is NOT varlen
-    return dispatch_flash_atten_asm(q, k, v, softmax_scale, out, out_lse);
+    return dispatch_flash_atten_asm(q, k, v, softmax_scale, out, out_lse, is_causal);
   }
 }
 
@@ -862,6 +892,7 @@ TORCH_LIBRARY_FRAGMENT(mate, m) {
       "float softmax_scale,"
       "Tensor out,"
       "Tensor out_lse,"
+      "bool is_causal,"
       "Tensor? input_cu_seqlen_q = None,"
       "Tensor? input_cu_seqlen_k = None,"
       "int? max_seqlen_q = None,"

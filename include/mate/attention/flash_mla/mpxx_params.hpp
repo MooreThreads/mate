@@ -23,18 +23,23 @@ struct GetDecodingMetadataParams {
 struct MlaCombineParams {
   using index_t = int64_t;
 
+  bool is_varlen_q;
+
   void* __restrict__ o_ptr;
   void* __restrict__ softmax_lse_ptr;
 
   void* __restrict__ softmax_lseaccum_ptr;
   void* __restrict__ oaccum_ptr;
   int* __restrict__ num_splits_ptr;
+  int* __restrict__ seqlens_q_ptr;
 
   index_t o_batch_stride;
   index_t o_row_stride;
   index_t o_head_stride;
 
-  int q_seq_per_hk;
+  int max_q_seq_per_hk;
+  int total_q;
+  int h_r;
   int h_k;
   int batch_size;
   int num_mp_parts;

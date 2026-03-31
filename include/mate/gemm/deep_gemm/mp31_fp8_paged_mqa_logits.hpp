@@ -7,12 +7,13 @@
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
 
+#include "../../common/mma_mp31_sqmma.hpp"
+
 namespace mate::deep_gemm {
 
 using namespace mute;
 
-// TODO: add fast divmod
-template <uint32_t kAlignedBatchSize>
+template <uint32_t kAlignedBatchSize, bool kIsContextLens2D, uint32_t kNextN>
 __global__ __launch_bounds__(32, 1) void mpxx_paged_mqa_logits_metadata(const uint32_t  batch_size,
                                                                         const uint32_t* context_lens,
                                                                         uint32_t*       schedule_metadata,
@@ -24,8 +25,10 @@ __global__ __launch_bounds__(32, 1) void mpxx_paged_mqa_logits_metadata(const ui
   uint32_t num_segs[kAlignedBatchSize / 32];
 #pragma unroll
   for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++k) {
-    const uint32_t& context_len = (k * 32 + lane_idx < batch_size ? __ldg(context_lens + k * 32 + lane_idx) : 0);
-    num_segs[k]                 = ceil_div(context_len, SPLIT_KV);
+    const uint32_t q_idx       = k * 32 + lane_idx;
+    const uint32_t lens_idx    = kIsContextLens2D ? (q_idx * kNextN + (kNextN - 1)) : q_idx;
+    const uint32_t context_len = (q_idx < batch_size ? __ldg(context_lens + lens_idx) : 0);
+    num_segs[k]                = ceil_div(context_len, SPLIT_KV);
   }
 
   __shared__ uint32_t prefix_sum[kAlignedBatchSize];
@@ -56,7 +59,7 @@ __global__ __launch_bounds__(32, 1) void mpxx_paged_mqa_logits_metadata(const ui
   }
 }
 
-template <uint32_t BLOCK_KV, uint32_t kNumMathWarpSquads>
+template <uint32_t BLOCK_KV, uint32_t kNumMathWarpSquads, uint32_t kNextN, bool kIsContextLens2D>
 struct PagedMQALogitsScheduler {
   uint32_t        batch_size;
   const uint32_t* context_lens;
@@ -64,6 +67,12 @@ struct PagedMQALogitsScheduler {
   uint32_t current_q_idx, current_kv_idx;
   uint32_t end_q_idx, end_kv_idx;
   uint32_t current_num_kv;
+
+  __device__ __forceinline__ uint32_t get_num_kv(uint32_t q_idx) const {
+    if (q_idx >= batch_size) return 0;
+    const uint32_t lens_idx = kIsContextLens2D ? (q_idx * kNextN + (kNextN - 1)) : q_idx;
+    return ceil_div(__ldg(context_lens + lens_idx), BLOCK_KV);
+  }
 
   __device__ __forceinline__ explicit PagedMQALogitsScheduler(const uint32_t& batch_size,
                                                               const uint32_t& mp_idx,
@@ -74,10 +83,12 @@ struct PagedMQALogitsScheduler {
 
     const auto& current_pack = __ldg(reinterpret_cast<const uint2*>(schedule_meta) + mp_idx);
     const auto& end_pack     = __ldg(reinterpret_cast<const uint2*>(schedule_meta) + mp_idx + 1);
-    current_q_idx = current_pack.x, current_kv_idx = current_pack.y * kNumMathWarpSquads;
-    end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumMathWarpSquads;
+    current_q_idx            = current_pack.x;
+    current_kv_idx           = current_pack.y * kNumMathWarpSquads;
+    end_q_idx                = end_pack.x;
+    end_kv_idx               = end_pack.y * kNumMathWarpSquads;
 
-    current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV) : 0;
+    current_num_kv = get_num_kv(current_q_idx);
   }
 
   __device__ __forceinline__ bool fetch_next_task(uint32_t& q_idx, uint32_t& kv_idx, uint32_t& num_kv) {
@@ -91,14 +102,13 @@ struct PagedMQALogitsScheduler {
     if (current_kv_idx >= current_num_kv) {
       ++current_q_idx;
       current_kv_idx = 0;
-      current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV) : 0;
+      current_num_kv = get_num_kv(current_q_idx);
     }
-
     return true;
   }
 
   __device__ __forceinline__ bool exist_q_idx(const uint32_t& q_idx) const {
-    return q_idx < end_q_idx or q_idx == end_q_idx and 0 < end_kv_idx;
+    return q_idx < end_q_idx or (q_idx == end_q_idx and 0 < end_kv_idx);
   }
 };
 
@@ -106,6 +116,7 @@ template <uint32_t kNextN_,
           uint32_t kNumHeads_,
           uint32_t kHeadDim_,
           uint32_t BLOCK_KV_,
+          bool     kIsContextLens2D_,
           class StrideQ_,
           class StrideK_,
           class StrideSFK_,
@@ -123,21 +134,18 @@ struct Mp31Fp8PagedMqaLogits {
   using StrideBlockTable = StrideBlockTable_;
   using StrideLogits     = StrideLogits_;
 
-  static constexpr int NumLoadWarpSquads = 1;
-  static constexpr int NumMmaWarpSquads  = 4;
+  static constexpr int  NumLoadWarpSquads = 1;
+  static constexpr int  NumMmaWarpSquads  = 4;
+  static constexpr int  Alignment         = 32 / sizeof_bits_v<Element>;
+  static constexpr int  StagesQ           = 3;
+  static constexpr int  StagesK           = 3;
+  static constexpr int  NextN             = kNextN_;
+  static constexpr int  NumHeads          = kNumHeads_;
+  static constexpr int  HeadDim           = kHeadDim_;
+  static constexpr int  BLOCK_KV          = BLOCK_KV_;
+  static constexpr int  SPLIT_KV          = BLOCK_KV * NumMmaWarpSquads;
+  static constexpr bool IsContextLens2D   = kIsContextLens2D_;  // <<< exposed as alias
 
-  static constexpr int Alignment = 32 / sizeof_bits_v<Element>;
-
-  static constexpr int StagesQ = 3;
-  static constexpr int StagesK = 3;
-
-  static constexpr int NextN    = kNextN_;
-  static constexpr int NumHeads = kNumHeads_;
-  static constexpr int HeadDim  = kHeadDim_;
-  static constexpr int BLOCK_KV = BLOCK_KV_;
-  static constexpr int SPLIT_KV = BLOCK_KV * NumMmaWarpSquads;
-
-  // Since the scheduler already coalesces (b, next_n, heads), we just use trivial tile shape here
   using TileShape = Shape<Int<BLOCK_KV>, Int<NextN * NumHeads>, Int<HeadDim>>;
 
   using CollectiveMma = typename mutlass::gemm::collective::CollectiveBuilder<mutlass::arch::Mp31,
@@ -189,12 +197,10 @@ struct Mp31Fp8PagedMqaLogits {
       make_tensor(make_gmem_ptr(static_cast<float const*>(nullptr)), repeat_like(StrideW{}, int32_t(0)), StrideW{}),
       take<0, 2>(SmemLayoutW{})));
 
-  using PipelineQ = mutlass::Mp31PipelineTmeAsync<StagesQ>;
-  using PipelineK = mutlass::Mp31PipelineTmeAsync<StagesK>;
-
+  using PipelineQ       = mutlass::Mp31PipelineTmeAsync<StagesQ>;
+  using PipelineK       = mutlass::Mp31PipelineTmeAsync<StagesK>;
   using PipelineQParams = typename PipelineQ::Params;
   using PipelineQState  = typename PipelineQ::PipelineState;
-
   using PipelineKParams = typename PipelineK::Params;
   using PipelineKState  = typename PipelineK::PipelineState;
 
@@ -346,9 +352,8 @@ struct Mp31Fp8PagedMqaLogits {
     PipelineKState pipeline_k_consumer_state;
     __syncthreads();
 
-    // Scheduler
-    auto scheduler = PagedMQALogitsScheduler<BLOCK_KV, NumMmaWarpSquads>(
-        params.batch_size, blockIdx.x, params.ptr_context_lens, params.ptr_schedule_meta);
+    using Scheduler = PagedMQALogitsScheduler<BLOCK_KV, NumMmaWarpSquads, NextN, IsContextLens2D>;
+    auto scheduler  = Scheduler(params.batch_size, blockIdx.x, params.ptr_context_lens, params.ptr_schedule_meta);
 
     uint32_t q_iter_idx  = 0;
     uint32_t kv_iter_idx = 0;
@@ -360,19 +365,19 @@ struct Mp31Fp8PagedMqaLogits {
       auto cta_tme_w   = params.tme_w.get_slice(0);
 
       Tensor mQ      = params.tme_q.get_tme_tensor(make_shape(params.batch_size * NextN * NumHeads, HeadDim));
-      Tensor gQ_full = local_tile(mQ, select<1, 2>(TileShape{}), make_coord(_, _));              // BN, BK, n, k
-      Tensor sQ      = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});  // BN, BK, pipe
-      Tensor tQgQ    = cta_tme_q.partition_S(gQ_full(_, _, _, _0{}));                            // CPY, CPY_N, CPY_K, n
-      Tensor tQsQ    = cta_tme_q.partition_D(sQ);  // CPY, CPY_N, CPY_K, pipe
+      Tensor gQ_full = local_tile(mQ, select<1, 2>(TileShape{}), make_coord(_, _));
+      Tensor sQ      = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
+      Tensor tQgQ    = cta_tme_q.partition_S(gQ_full(_, _, _, _0{}));
+      Tensor tQsQ    = cta_tme_q.partition_D(sQ);
 
       Tensor mK      = params.tme_k.get_tme_tensor(make_shape(BLOCK_KV, HeadDim, params.num_kv_blocks));
-      Tensor gK_full = local_tile(mK, select<0, 2>(TileShape{}), make_coord(_, _, _));        // BM, BK, m, k, L
-      Tensor sK   = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});  // (BM,groups), BK, pipe
-      Tensor tKgK = cta_tme_k.partition_S(gK_full(_, _, _0{}, _0{}, _));                      // CPY, CPY_M, CPY_K, L
-      Tensor tKsK = cta_tme_k.partition_D(sK(make_coord(_, kv_group_idx), _, _));             // CPY, CPY_M, CPY_K, pipe
+      Tensor gK_full = local_tile(mK, select<0, 2>(TileShape{}), make_coord(_, _, _));
+      Tensor sK      = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
+      Tensor tKgK    = cta_tme_k.partition_S(gK_full(_, _, _0{}, _0{}, _));
+      Tensor tKsK    = cta_tme_k.partition_D(sK(make_coord(_, kv_group_idx), _, _));
 
       Tensor mSFK      = params.tme_sfk.get_tme_tensor(make_shape(BLOCK_KV, params.num_kv_blocks));
-      Tensor gSFK_full = local_tile(mSFK, Shape<Int<BLOCK_KV>, _1>{}, make_coord(_, _));  // BK, BL, k, l
+      Tensor gSFK_full = local_tile(mSFK, Shape<Int<BLOCK_KV>, _1>{}, make_coord(_, _));
       Tensor sSFK      = make_tensor(make_smem_ptr(shared_storage.smem_sfk.data()), SmemLayoutSFK{});
       Tensor tSFKgSFK  = cta_tme_sfk.partition_S(gSFK_full(_, _, _0{}, _));
       Tensor tSFKsSFK  = cta_tme_sfk.partition_D(sSFK(_, _, _, kv_group_idx));
@@ -393,12 +398,10 @@ struct Mp31Fp8PagedMqaLogits {
         }
       };
 
-      // Initialize `q_idx` outside `[0, batch_size)` to indicate it was none
       uint32_t q_idx = params.batch_size, kv_idx, num_kv;
       uint32_t next_q_idx, next_kv_idx, next_num_kv;
       bool     fetched_next_task;
 
-      // Prefetch the first Q
       if ((fetched_next_task = scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv))) {
         issue_tme_q(next_q_idx);
         q_iter_idx = 1;
@@ -408,7 +411,6 @@ struct Mp31Fp8PagedMqaLogits {
       uint32_t kv_block_idx_storage;
 
       while (fetched_next_task) {
-        // Prefetch next Q when current Q changes
         bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_idx(next_q_idx + 1));
 
         q_idx  = next_q_idx;
@@ -429,7 +431,6 @@ struct Mp31Fp8PagedMqaLogits {
         }
         const auto& kv_block_idx = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr++);
 
-        // Load KV
         {
           pipeline_k.producer_acquire(pipeline_k_producer_state);
           uint32_t bar_id = pipeline_k.producer_get_barrier_id(pipeline_k_producer_state);
@@ -438,11 +439,9 @@ struct Mp31Fp8PagedMqaLogits {
           copy(params.tme_sfk.with(bar_id),
                tSFKgSFK(_, _, _, kv_block_idx),
                tSFKsSFK(_, _, _, pipeline_k_producer_state.index()));
-
           ++pipeline_k_producer_state;
         }
 
-        // Fetch next task
         fetched_next_task = scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv);
       }
     } else if (warp_squad_role == WarpSquadRole::Consumer0 || warp_squad_role == WarpSquadRole::Consumer1 ||
@@ -457,10 +456,8 @@ struct Mp31Fp8PagedMqaLogits {
       Tensor sW   = make_tensor(make_smem_ptr(shared_storage.smem_weights.data()), SmemLayoutWView{});
       Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_sfk.data()), SmemLayoutSFK{});
 
-      // Initialize `q_idx` outside `[0, batch_size)` to indicate it was none
       uint32_t q_idx = params.batch_size, kv_idx, num_kv;
       uint32_t next_q_idx, next_kv_idx, next_num_kv;
-      bool     fetched_next_task;
 
       Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
       Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
@@ -482,13 +479,10 @@ struct Mp31Fp8PagedMqaLogits {
         clear(accum);
 
         if (q_idx != next_q_idx) {
-          // Release Last Q empty
           if (q_iter_idx > 0) {
             pipeline_q.consumer_release(pipeline_q_consumer_state);
             ++pipeline_q_consumer_state;
           }
-
-          // Wait TME Q arrival
           pipeline_q.consumer_wait(pipeline_q_consumer_state);
 
           MUTE_UNROLL
@@ -502,15 +496,14 @@ struct Mp31Fp8PagedMqaLogits {
           ++q_iter_idx;
         }
 
-        // Get curret Q and KV index
         q_idx  = next_q_idx;
         kv_idx = next_kv_idx;
 
         pipeline_k.consumer_wait(pipeline_k_consumer_state);
         uint32_t kv_stage_idx = pipeline_k_consumer_state.index();
         mute::gemm(tiled_mma, tKrK(_, _, _, kv_stage_idx), tQrQ(_, _, _, pipeline_q_consumer_state.index()), accum);
+        mate::warpsquad_commit_batch();
 
-        // Read per-kv scales
         static_assert(BLOCK_KV == 64);
         float scales_kv[size<0>(accum_mn)];
         MUTE_UNROLL
@@ -518,7 +511,7 @@ struct Mp31Fp8PagedMqaLogits {
           scales_kv[i] = sSFK(i * 16 + thread_idx_in_warp_squad / 8, _0{}, kv_stage_idx, kv_group_idx);
         }
 
-        warpsquad_wait();
+        mate::warpsquad_wait();
 
         pipeline_k.consumer_release(pipeline_k_consumer_state);
         ++pipeline_k_consumer_state;
@@ -528,7 +521,6 @@ struct Mp31Fp8PagedMqaLogits {
 
         MUTE_UNROLL
         for (int row_idx = 0; row_idx < size<0>(accum_mn); ++row_idx) {
-          // Intra-thread reduce
           MUTE_UNROLL
           for (int i = 0; i < NextN; ++i) {
             float sum = 0.0f;
@@ -536,16 +528,11 @@ struct Mp31Fp8PagedMqaLogits {
             for (int j = 0; j < NumHeads / reduction_target; ++j) {
               sum += fmaxf(accum_mn(row_idx, i * NumHeads / reduction_target + j), 0.0f) * weights(i, j);
             }
-
             sum *= scales_kv[row_idx];
-
-            // Inter-thread reduce
             MUTE_UNROLL
             for (int j = 1; j < reduction_target; j *= 2) {
               sum += __shfl_xor_sync(uint32_t(-1), sum, j);
             }
-
-            // STG
             params.ptr_logits[i * get<0>(params.stride_logits) + kv_offset + base_v_offset + row_idx * 16] = sum;
           }
         }

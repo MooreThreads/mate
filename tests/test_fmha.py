@@ -4,356 +4,1396 @@
 import pytest
 import torch
 import torch_musa  # noqa: F401
+
+from einops import repeat, rearrange
+from typing import Optional, Union, Tuple  # noqa: F401
+
 from mate import flash_attn_varlen_func, flash_attn_with_kvcache
-from typing import Optional
+from mate.jit.attention.fmha import _fmha_fwd_combine as fmha_fwd_combine
+from mate.mha_interface import get_scheduler_metadata
+from mate.testing.flash_attn import (
+    attention_ref,
+    attention_accum_ref,  # noqa: F401
+    attention_combine_ref,  # noqa: F401
+    pad_accum,
+    gen_input_tensor,
+    gen_seqlen_data,
+    mask_unused,
+    generate_block_kvcache,
+    gen_padding_mask_from_seqlens,
+    lse_ref_from_score,
+    unpad_input,
+    pad_input,
+    _combine_cp_partials,
+    make_cp_rank_local_paged_kvcache,
+)
+
+# from mate.jit.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
 
 
-def ref_attn(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    cu_query_lens: torch.Tensor,
-    cu_kv_lens: torch.Tensor,
-    max_query_len: int,
-    max_kv_len: int,
-    is_causal: bool = True,
-    is_varlen: bool = True,
-    scale: float = 1.0,
-):
-    batch = len(cu_query_lens) - 1 if is_varlen else query.shape[0]
-    # head_size_qk = key_cache.shape[-1]
-
-    outputs: list[torch.Tensor] = []
-    lse_outputs: list[torch.Tensor] = []
-
-    for i in range(batch):
-        query_len = (
-            cu_query_lens[i + 1] - cu_query_lens[i] if is_varlen else query.shape[1]
-        )
-        kv_len = (
-            cu_kv_lens[i + 1] - cu_kv_lens[i] if is_varlen else value_cache.shape[1]
-        )
-        if is_varlen:
-            q = query[cu_query_lens[i] : cu_query_lens[i + 1]]
-            q *= scale
-
-            k = key_cache[cu_kv_lens[i] : cu_kv_lens[i + 1]]
-            v = value_cache[cu_kv_lens[i] : cu_kv_lens[i + 1]]
-        else:
-            q = query[i]
-            q *= scale
-            k = key_cache[i]
-            v = value_cache[i]
-
-        if q.shape[1] != k.shape[1]:
-            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-
-        # raw attention score
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
-
-        # mask
-        if is_causal:
-            empty_mask = torch.ones(query_len, kv_len, device=query.device)
-            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-            attn.masked_fill_(mask, float("-inf"))
-
-        # LSE (head, query)
-        lse = torch.logsumexp(attn, dim=-1)  # shape [H, Q]
-        lse = torch.nan_to_num(lse)
-        lse_outputs.append(lse)
-
-        # softmax = exp(score - lse)
-        attn = torch.exp(attn - lse.unsqueeze(-1)).to(v.dtype)
-
-        # output
-        out = torch.einsum("hqk,khd->qhd", attn, v)
-        out = torch.nan_to_num(out)
-        outputs.append(out)
-    if is_varlen:
-        return torch.cat(outputs, dim=0), torch.cat(lse_outputs, dim=1)
-    else:
-        return torch.stack(outputs, dim=0), torch.stack(lse_outputs, dim=0)
+# ==============================================================================
+# ============================== flash_attn_varlen_func ========================
+# ==============================================================================
 
 
-def ref_paged_attn(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    query_lens,
-    kv_lens: list[int],
-    block_tables: torch.Tensor,
-    scale: float,
-    sliding_window: Optional[int] = None,
-    soft_cap: Optional[float] = None,
-    is_causal: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    verlen_q = query_lens is not None
-    num_seqs = len(query_lens) if verlen_q else query.shape[0]
-    block_tables = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
-
-    outputs: list[torch.Tensor] = []
-    lse_outputs: list[torch.Tensor] = []
-    start_idx = 0
-    for i in range(num_seqs):
-        query_len = query_lens[i] if verlen_q else query.shape[1]
-        kv_len = kv_lens[i]
-        q = query[start_idx : start_idx + query_len] if verlen_q else query[i]
-        q *= scale
-
-        num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables[i, :num_kv_blocks]
-
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
-        k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
-        v = v[:kv_len]
-        head_num_q = q.shape[1]
-        if head_num_q != k.shape[1]:
-            k = torch.repeat_interleave(k, head_num_q // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, head_num_q // v.shape[1], dim=1)
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len, device=query.device)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-        if sliding_window is not None:
-            sliding_window_mask = (
-                torch.triu(
-                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
-                )
-                .bool()
-                .logical_not()
-            )
-            mask |= sliding_window_mask
-        if soft_cap is not None:
-            attn = soft_cap * torch.tanh(attn / soft_cap)
-        if is_causal:
-            attn.masked_fill_(mask, float("-inf"))
-
-        lse = torch.logsumexp(attn, dim=-1)  # shape [H, Q]
-        lse_outputs.append(lse)
-
-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
-        out = torch.einsum("hqk,khd->qhd", attn, v)
-
-        outputs.append(out)
-        start_idx += query_len
-        if not verlen_q:
-            start_idx = 0
-    if verlen_q:
-        return torch.cat(outputs, dim=0), torch.cat(lse_outputs, dim=1)
-    else:
-        return torch.stack(outputs, dim=0), torch.stack(lse_outputs, dim=0)
-
-
-@pytest.mark.parametrize("seq_lens", [[(1024, 1024), (333, 888), (555, 222)]])
-@pytest.mark.parametrize("num_heads", [(4, 4), (8, 2), (16, 2), (16, 1)])
-@pytest.mark.parametrize("head_size", [(128, 128), (192, 128)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("is_causal", [True])
-@pytest.mark.parametrize("batch", [8])
-@pytest.mark.parametrize("is_varlen", [False, True])
-@pytest.mark.parametrize("backend", ["auto"])
+@pytest.mark.skip(reason="Skip for CI. Avoid Long JIT")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [-1, 0, 5])
+@pytest.mark.parametrize("pack_gqa", [False])
+@pytest.mark.parametrize("mask", [None])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        (333, 444),
+        (888, 1328),
+        (222, 463),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(40, 8), (96, 8), (32, 8), (64, 4), (8, 1)],
+)
+@pytest.mark.parametrize("headdim", [(128, 128)])
+@pytest.mark.parametrize("backend", ["auto", "mutlass"])
 @torch.inference_mode()
-def test_varlen_fast_attn(
-    seq_lens: list[tuple[int, int]],
+def test_varlen_func_bshd(
+    batch_size: int,
+    seq_lens: tuple[int, int],
     num_heads: tuple[int, int],
-    head_size: tuple[int, int],
+    headdim: tuple[int, int],
     dtype: torch.dtype,
-    is_causal: bool,
-    batch: int,
-    is_varlen: bool,
+    mask: Union[None, str, Tuple[int, int]],
+    pack_gqa: bool,
+    num_splits: int,
     backend: str,
-) -> None:
-    if backend == "mubin" and not is_causal:
-        pytest.skip("mubin backend does not support non-causal attention")
+):
+    device = "musa"
 
-    torch.set_default_device("musa")
-
-    query_lens = [x[0] for x in seq_lens]
-    kv_lens = [x[1] for x in seq_lens]
-    num_query_heads = num_heads[0]
-    num_kv_heads = num_heads[1]
-    assert num_query_heads % num_kv_heads == 0
-    max_query_len = max(query_lens)
-    max_kv_len = max(kv_lens)
-    head_size_qk = head_size[0]
-    head_size_v = head_size[1]
-    scale = head_size_qk**-0.5
-
-    if not is_varlen:
-        query = torch.rand(
-            batch, max_query_len, num_query_heads, head_size_qk, dtype=dtype
-        )
-        key_cache = torch.rand(
-            batch, max_kv_len, num_kv_heads, head_size_qk, dtype=dtype
-        )
-        value_cache = torch.rand(
-            batch, max_kv_len, num_kv_heads, head_size_v, dtype=dtype
-        )
-    else:
-        query = torch.rand(
-            (sum(query_lens), num_query_heads, head_size_qk), dtype=dtype
-        )
-        key_cache = torch.rand((sum(kv_lens), num_kv_heads, head_size_qk), dtype=dtype)
-        value_cache = torch.rand((sum(kv_lens), num_kv_heads, head_size_v), dtype=dtype)
-
-    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
+    seqlen_qo = seq_lens[0]
+    head_qo = num_heads[0]
+    headdim_qk = headdim[0]
+    query, _, _ = gen_input_tensor(
+        batch_size=batch_size,
+        seqlens=seqlen_qo,
+        num_head=head_qo,
+        headdim=headdim_qk,
+        use_cu_seqlens=False,
+        datatype=dtype,
+        device=device,
+        randop=torch.randn,
     )
 
-    cu_kv_lens = torch.tensor([0] + kv_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
+    seqlen_kv = seq_lens[1]
+    head_kv = num_heads[0]
+    headdim_vo = headdim[1]
+    key, _, _ = gen_input_tensor(
+        batch_size=batch_size,
+        seqlens=seqlen_kv,
+        num_head=head_kv,
+        headdim=headdim_qk,
+        use_cu_seqlens=False,
+        datatype=dtype,
+        device=device,
+        randop=torch.randn,
+    )
+    value, _, _ = gen_input_tensor(
+        batch_size=batch_size,
+        seqlens=seqlen_kv,
+        num_head=head_kv,
+        headdim=headdim_vo,
+        use_cu_seqlens=False,
+        datatype=dtype,
+        device=device,
+        randop=torch.randn,
     )
 
-    output, lse = flash_attn_varlen_func(
-        query,
-        key_cache,
-        value_cache,
-        cu_query_lens if is_varlen else None,
-        cu_kv_lens if is_varlen else None,
-        max_query_len if is_varlen else None,
-        max_kv_len if is_varlen else None,  # max_seqlen_q/k
-        None,  # seqused_q
-        None,  # seqused_k
-        None,  # softmax_scale
-        is_causal,
-        None,  # qv
-        None,  # q_descale
-        None,  # k_descale
-        None,  # v_descale,
-        window_size=(-1, -1),
+    is_causal = False
+    window_size = (None, None)
+    if isinstance(mask, str) and mask == "causal":
+        is_causal = True
+    elif isinstance(mask, tuple) and len(mask) == 2:
+        window_size = mask  # type: ignore
+
+    softmax_scale = headdim_qk**-0.5
+
+    metadata = None
+    if num_splits >= 0:
+        metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=seqlen_qo,
+            max_seqlen_k=seqlen_kv,
+            num_heads_q=head_qo,
+            num_heads_kv=head_kv,
+            headdim=headdim_qk,
+            seqused_q=None,
+            seqused_k=None,
+            headdim_v=headdim_vo,
+            qkv_dtype=dtype,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            cu_seqlens_k_new=None,
+            cache_leftpad=None,
+            page_size=None,
+            max_seqlen_k_new=None,
+            causal=is_causal,
+            window_size=window_size,
+            attention_chunk=0,
+            has_softcap=False,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            mp_margin=0,
+        )
+
+    out_ref, _, score_ref = attention_ref(
+        q=query,
+        k=key,
+        v=value,
+        query_padding_mask=None,
+        key_padding_mask=None,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=None,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
+
+    out, lse = flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        softmax_scale=softmax_scale,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        learnable_sink=None,
         attention_chunk=0,
         softcap=0.0,
-        num_splits=1,
-        pack_gqa=None,
+        scheduler_metadata=metadata,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
         deterministic=False,
         sm_margin=0,
         return_attn_probs=True,
+        return_softmax_lse=False,
         backend=backend,
     )
 
-    ref_output, ref_lse = ref_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        cu_query_lens=cu_query_lens,
-        cu_kv_lens=cu_kv_lens,
-        max_query_len=max_query_len,
-        max_kv_len=max_kv_len,
+    _, lse_ref_pad = lse_ref_from_score(
+        score_ref,
         is_causal=is_causal,
-        is_varlen=is_varlen,
-        scale=scale,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        learnable_sink=None,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    torch.testing.assert_close(lse_ref_pad, lse, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("cp_world_size", [1, 2, 4])
+@pytest.mark.parametrize("num_splits", [-1, 0, 5])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@pytest.mark.parametrize("mask", [None, "causal"])
+@pytest.mark.parametrize(
+    "seq_lens",  # (seqlen_q, seqlen_kv) or (seqlen_q, seqlen_kv, seqlen_used_q, seqlen_used_kv)
+    [
+        [(32, 512), (192, 192), (128, 256)],
+        [(32, 512, 32, -1), (192, 192, 64, 128), (128, 256, 64, 128)],
+        [(i, i + 1234) for i in range(11)],
+        [(55, 666), (256, 463), (111, 1328)],
+        [(111, 1328), (55, 666), (222, 463)],
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(40, 8), (96, 8), (32, 8), (64, 4), (8, 1)],
+)
+@pytest.mark.parametrize("headdim", [(128, 128), (256, 256)])
+@pytest.mark.parametrize("backend", ["auto", "mutlass"])
+@torch.inference_mode()
+def test_varlen_func_ragged_qkv(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    headdim: tuple[int, int],
+    dtype: torch.dtype,
+    mask: Union[None, str, Tuple[int, int]],
+    pack_gqa: bool,
+    num_splits: int,
+    cp_world_size: int,
+    backend: str,
+):
+    torch.manual_seed(666)
+    torch.musa.manual_seed(666)
+
+    device = "musa"
+
+    batch_size = len(seq_lens)
+
+    # prepare seqlen
+    seqlens_qo, seqlens_kv, _, _, seqused_qo, seqused_kv = gen_seqlen_data(
+        seq_lens, device
+    )
+
+    # prepare q data
+    head_qo = num_heads[0]
+    headdim_qk = headdim[0]
+    max_seqlen_qo = max(seqlens_qo)
+
+    q_pad = torch.randn(
+        batch_size, max_seqlen_qo, head_qo, headdim_qk, device=device, dtype=dtype
+    )
+    q_padding_mask = gen_padding_mask_from_seqlens(
+        seqlens_qo, batch_size, seqused_qo, device
+    )
+    q_unpad, indices_q, cu_seqlens_qo, _, *rest = unpad_input(q_pad, q_padding_mask)
+
+    # prepare kv data
+    head_kv = num_heads[1]
+    headdim_vo = headdim[1]
+    max_seqlen_kv = max(seqlens_kv)
+
+    k_pad = torch.randn(
+        batch_size, max_seqlen_kv, head_kv, headdim_qk, dtype=dtype, device=device
+    )
+    v_pad = torch.randn(
+        batch_size, max_seqlen_kv, head_kv, headdim_vo, dtype=dtype, device=device
+    )
+    kv_padding_mask = gen_padding_mask_from_seqlens(
+        seqlens_kv, batch_size, seqused_kv, device
+    )
+    k_unpad, indices_k, cu_seqlens_kv, _, *rest = unpad_input(k_pad, kv_padding_mask)
+    v_unpad, indices_v, cu_seqlens_kv, _, *rest = unpad_input(v_pad, kv_padding_mask)
+
+    softmax_scale = headdim_qk**-0.5
+
+    is_causal = False
+    window_size = (None, None)
+    if isinstance(mask, str) and mask == "causal":
+        is_causal = True
+    elif isinstance(mask, tuple) and len(mask) == 2:
+        window_size = mask  # type: ignore
+
+    learnable_sink = None
+
+    out_ref, _, score_ref = attention_ref(
+        q=q_pad,
+        k=k_pad,
+        v=v_pad,
+        query_padding_mask=q_padding_mask,
+        key_padding_mask=kv_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
     )
 
     atol, rtol = 1.5e-2, 1e-2
 
-    if backend == "mutlass":
-        lse = torch.nan_to_num(lse)
-        output = torch.nan_to_num(output)
+    if cp_world_size > 1:
+        # CP path: split KV interleaved across ranks, combine partial outputs.
+        # Use effective seqlens (seqused if present) as the split boundary.
+        eff_seqlens_kv = [
+            seqused_kv[b].item() if seqused_kv is not None else seqlens_kv[b]
+            for b in range(batch_size)
+        ]
+        cp_tot_seqused_k = torch.tensor(
+            eff_seqlens_kv, dtype=torch.int32, device=device
+        )
 
-    torch.testing.assert_close(lse, ref_lse, atol=atol, rtol=rtol)
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+        rank_outs, rank_lses = [], []
+        for cp_rank in range(cp_world_size):
+            k_segs, v_segs, local_seqlens_k = [], [], []
+            for b in range(batch_size):
+                sk = eff_seqlens_kv[b]
+                k_segs.append(k_pad[b, cp_rank:sk:cp_world_size].contiguous())
+                v_segs.append(v_pad[b, cp_rank:sk:cp_world_size].contiguous())
+                local_seqlens_k.append(
+                    (sk - cp_rank + cp_world_size - 1) // cp_world_size
+                )
+
+            cu_seqlens_k_local = torch.tensor(
+                [0] + torch.cumsum(torch.tensor(local_seqlens_k), dim=0).tolist(),
+                dtype=torch.int32,
+                device=device,
+            )
+            k_local = torch.cat(k_segs, dim=0)
+            v_local = torch.cat(v_segs, dim=0)
+
+            out_rank, lse_rank = flash_attn_varlen_func(
+                q=q_unpad,
+                k=k_local,
+                v=v_local,
+                cu_seqlens_q=cu_seqlens_qo,
+                cu_seqlens_k=cu_seqlens_k_local,
+                max_seqlen_q=max_seqlen_qo,
+                max_seqlen_k=max(local_seqlens_k),
+                seqused_q=seqused_qo,
+                seqused_k=None,
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+                qv=None,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                attention_chunk=0,
+                softcap=0.0,
+                scheduler_metadata=None,
+                num_splits=1,
+                pack_gqa=(head_qo != head_kv),
+                deterministic=False,
+                sm_margin=0,
+                return_attn_probs=True,
+                return_softmax_lse=True,
+                backend=backend,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
+                cp_tot_seqused_k=cp_tot_seqused_k,
+            )
+            rank_outs.append(out_rank.float())
+            rank_lses.append(lse_rank.float())
+
+        # Combine per batch item (Q is ragged via cu_seqlens_qo)
+        total_q = q_unpad.shape[0]
+        combined_unpad = torch.zeros(
+            total_q, head_qo, headdim_vo, dtype=torch.float32, device=device
+        )
+        for b in range(batch_size):
+            s = cu_seqlens_qo[b].item()
+            e = cu_seqlens_qo[b + 1].item()
+            if s == e:
+                continue
+            out_b, _ = _combine_cp_partials(
+                [rank_outs[r][s:e] for r in range(cp_world_size)],
+                [rank_lses[r][:, s:e] for r in range(cp_world_size)],
+            )
+            combined_unpad[s:e] = out_b
+
+        out_pad = mask_unused(
+            pad_input(combined_unpad.to(dtype), indices_q, batch_size, max_seqlen_qo),
+            seqused_qo,
+        )
+        out_ref = mask_unused(out_ref, seqused_qo)
+        torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
+        return
+
+    if num_splits >= 0:
+        metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_qo,
+            max_seqlen_k=max_seqlen_kv,
+            num_heads_q=head_qo,
+            num_heads_kv=head_kv,
+            headdim=headdim_qk,
+            seqused_q=seqused_qo,
+            seqused_k=seqused_kv,
+            headdim_v=headdim_vo,
+            qkv_dtype=dtype,
+            cu_seqlens_q=cu_seqlens_qo,
+            cu_seqlens_k=cu_seqlens_kv,
+            cu_seqlens_k_new=None,
+            cache_leftpad=None,
+            page_size=None,
+            max_seqlen_k_new=None,
+            causal=is_causal,
+            window_size=window_size,
+            attention_chunk=0,
+            has_softcap=False,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            mp_margin=0,
+        )
+    else:
+        # not split
+        metadata = None  # noqa: F841
+        num_splits = -1
+
+    out, lse = flash_attn_varlen_func(
+        q=q_unpad,
+        k=k_unpad,
+        v=v_unpad,
+        cu_seqlens_q=cu_seqlens_qo,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_qo,
+        max_seqlen_k=max_seqlen_kv,
+        seqused_q=seqused_qo,
+        seqused_k=seqused_kv,
+        softmax_scale=softmax_scale,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        attention_chunk=0,
+        softcap=0.0,
+        scheduler_metadata=metadata,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=False,
+        sm_margin=0,
+        return_attn_probs=True,
+        return_softmax_lse=False,
+        backend=backend,
+    )
+
+    # lse_ref_unpad, _ = lse_ref_from_score(
+    #     score_ref,
+    #     is_causal=is_causal,
+    #     cu_seqlens_q=cu_seqlens_qo,
+    #     cu_seqlens_k=cu_seqlens_kv,
+    #     seqused_q=seqused_qo,
+    #     seqused_k=seqused_kv,
+    #     learnable_sink=learnable_sink,
+    # )
+
+    out_pad = mask_unused(
+        pad_input(out, indices_q, batch_size, max_seqlen_qo), seqused_qo
+    )
+    out_ref = mask_unused(out_ref, seqused_qo)
+
+    atol, rtol = 1.5e-2, 1e-2
+
+    # import pdb
+    # pdb.set_trace()
+
+    # torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("use_out", [True])
-@pytest.mark.parametrize("seq_lens", [[(2, 1328), (2, 18), (2, 463)]])
-@pytest.mark.parametrize("num_heads", [(4, 4), (8, 2), (16, 2), (16, 1)])
-@pytest.mark.parametrize("head_size", [(128, 128)])
-@pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.skip(reason="Skip for CI. Avoid Long JIT")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize("num_blocks", [32768, 2048])
-@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
+@pytest.mark.parametrize("num_splits", [-1, 0, 5])
+@pytest.mark.parametrize("pack_gqa", [False, True])
+@pytest.mark.parametrize("is_learnable_sink", [False, True])
+@pytest.mark.parametrize("mask", [None, "causal", (44, 88)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(111, 1328), (55, 666), (222, 463)],
+        [(111, 1328, 66, 888), (55, 666, 55, -1), (222, 463, -1, 256)],
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(40, 8), (8, 1)],
+)
+@pytest.mark.parametrize("headdim", [(128, 128), (256, 256)])
 @torch.inference_mode()
-def test_varlen_with_paged_kv(
-    use_out: bool,
+def test_varlen_func_ragged_qkv_advance(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
-    head_size: tuple[int, int],
-    sliding_window: Optional[int],
+    headdim: tuple[int, int],
     dtype: torch.dtype,
-    block_size: int,
-    soft_cap: Optional[float],
-    num_blocks: int,
-    is_causal,
-) -> None:
-    torch.set_default_device("musa")
-    num_seqs = len(seq_lens)
-    query_lens = [x[0] for x in seq_lens]
-    kv_lens = [x[1] for x in seq_lens]
-    num_query_heads = num_heads[0]
-    num_kv_heads = num_heads[1]
-    assert num_query_heads % num_kv_heads == 0
-    max_query_len = max(query_lens)
-    max_kv_len = max(kv_lens)
-    scale = head_size[0] ** -0.5
+    mask: Union[None, str, Tuple[int, int]],
+    pack_gqa: bool,
+    is_learnable_sink: bool,
+    num_splits: int,
+    softcap: float,
+):
+    torch.manual_seed(666)
+    torch.musa.manual_seed(666)
 
-    query = torch.randn(
-        len(query_lens), max_query_len, num_query_heads, head_size[0], dtype=dtype
+    device = "musa"
+
+    batch_size = len(seq_lens)
+
+    # prepare seqlen
+    seqlens_qo, seqlens_kv, _, _, seqused_qo, seqused_kv = gen_seqlen_data(
+        seq_lens, device
     )
-    key_cache = (
-        torch.randn(num_blocks, block_size, num_kv_heads, head_size[1], dtype=dtype)
-        / 10
+
+    # prepare q data
+    head_qo = num_heads[0]
+    headdim_qk = headdim[0]
+    max_seqlen_qo = max(seqlens_qo)
+
+    q_pad = torch.randn(
+        batch_size, max_seqlen_qo, head_qo, headdim_qk, device=device, dtype=dtype
     )
-    value_cache = torch.randn_like(key_cache) / 10
-    # cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
-    #     dim=0, dtype=torch.int32
+    q_padding_mask = gen_padding_mask_from_seqlens(
+        seqlens_qo, batch_size, seqused_qo, device
+    )
+    q_unpad, indices_q, cu_seqlens_qo, _, *rest = unpad_input(q_pad, q_padding_mask)
+
+    # prepare kv data
+    head_kv = num_heads[1]
+    headdim_vo = headdim[1]
+    max_seqlen_kv = max(seqlens_kv)
+
+    k_pad = torch.randn(
+        batch_size, max_seqlen_kv, head_kv, headdim_qk, dtype=dtype, device=device
+    )
+    v_pad = torch.randn(
+        batch_size, max_seqlen_kv, head_kv, headdim_vo, dtype=dtype, device=device
+    )
+    kv_padding_mask = gen_padding_mask_from_seqlens(
+        seqlens_kv, batch_size, seqused_kv, device
+    )
+    k_unpad, indices_k, cu_seqlens_kv, _, *rest = unpad_input(k_pad, kv_padding_mask)
+    v_unpad, indices_v, cu_seqlens_kv, _, *rest = unpad_input(v_pad, kv_padding_mask)
+
+    softmax_scale = headdim_qk**-0.5
+
+    is_causal = False
+    is_local = False
+    window_size = (None, None)
+    if isinstance(mask, str) and mask == "causal":
+        is_causal = True
+    elif isinstance(mask, tuple) and len(mask) == 2:
+        window_size = mask  # type: ignore
+        is_local = True
+
+    if is_learnable_sink:
+        if not is_local:
+            pytest.skip("learnable sink is tested for local attention")
+        learnable_sink = torch.randn(head_qo, device=device, dtype=dtype) * 10
+    else:
+        learnable_sink = None
+
+    if num_splits >= 0:
+        metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_qo,
+            max_seqlen_k=max_seqlen_kv,
+            num_heads_q=head_qo,
+            num_heads_kv=head_kv,
+            headdim=headdim_qk,
+            seqused_q=seqused_qo,
+            seqused_k=seqused_kv,
+            headdim_v=headdim_vo,
+            qkv_dtype=dtype,
+            cu_seqlens_q=cu_seqlens_qo,
+            cu_seqlens_k=cu_seqlens_kv,
+            cu_seqlens_k_new=None,
+            cache_leftpad=None,
+            page_size=None,
+            max_seqlen_k_new=None,
+            causal=is_causal,
+            window_size=window_size,
+            attention_chunk=0,
+            has_softcap=softcap != 0.0,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            mp_margin=0,
+        )
+    else:
+        # not split
+        metadata = None  # noqa: F841
+        num_splits = -1
+
+    out, lse = flash_attn_varlen_func(
+        q=q_unpad,
+        k=k_unpad,
+        v=v_unpad,
+        cu_seqlens_q=cu_seqlens_qo,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_qo,
+        max_seqlen_k=max_seqlen_kv,
+        seqused_q=seqused_qo,
+        seqused_k=seqused_kv,
+        softmax_scale=softmax_scale,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        attention_chunk=0,
+        softcap=softcap,
+        scheduler_metadata=metadata,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=False,
+        sm_margin=0,
+        return_attn_probs=True,
+        return_softmax_lse=False,
+        backend="mutlass",
+    )
+
+    out_ref, _, score_ref = attention_ref(
+        q=q_pad,
+        k=k_pad,
+        v=v_pad,
+        query_padding_mask=q_padding_mask,
+        key_padding_mask=kv_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
+
+    # import pdb
+    # pdb.set_trace()
+
+    # lse_ref_unpad, lse_ref_pad = lse_ref_from_score(
+    #     score_ref,
+    #     is_causal=is_causal,
+    #     cu_seqlens_q=cu_seqlens_qo,
+    #     cu_seqlens_k=cu_seqlens_kv,
+    #     seqused_q=seqused_qo,
+    #     seqused_k=seqused_kv,
+    #     learnable_sink=learnable_sink,
     # )
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
 
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+    out_pad = mask_unused(
+        pad_input(out, indices_q, batch_size, max_seqlen_qo), seqused_qo
+    )
+    out_ref = mask_unused(out_ref, seqused_qo)
+
+    atol, rtol = 1.5e-2, 1e-2
+
+    # torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
+
+
+# ==============================================================================
+# ============================= flash_attn_with_kvcache ========================
+# ==============================================================================
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("cp_world_size", [1, 2, 4])
+@pytest.mark.parametrize("num_splits", [0, 5])  # neg value disable split
+@pytest.mark.parametrize("pack_gqa", [True, False])
+@pytest.mark.parametrize("mask", [None, "causal"])
+@pytest.mark.parametrize("page_size", [1, 3, 4, 16, 64, 111])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(32, 512), (192, 192), (128, 256)],
+        [(i, i + 1234) for i in range(11)],
+        [(55, 666), (222, 463), (111, 1328)],
+        [(111, 1328), (55, 666), (222, 463)],
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(40, 8), (96, 8), (32, 8), (64, 4), (8, 1)],
+)
+@pytest.mark.parametrize("headdim", [(128, 128), (256, 256)])
+@torch.inference_mode()
+def test_paged_attn(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    headdim: tuple[int, int],
+    dtype: torch.dtype,
+    page_size: int,
+    mask: Union[None, str, Tuple[int, int]],
+    pack_gqa: bool,
+    num_splits: int,
+    cp_world_size: int,
+):
+    torch.manual_seed(666)
+    torch.musa.manual_seed(666)
+
+    device = "musa"
+
+    batch_size = len(seq_lens)
+
+    seqlens_qo = [x[0] for x in seq_lens]
+    head_qo = num_heads[0]
+    headdim_qk = headdim[0]
+    max_seqlen_qo = max(seqlens_qo)
+    # total_seqlen_qo = sum(seqlens_qo)
+    cu_seqlens_qo = torch.cumsum(
+        torch.tensor([0] + seqlens_qo, dtype=torch.int32, device=device),
+        dim=0,
+        dtype=torch.int32,
+    )
+    query_pad = torch.randn(
+        batch_size, max_seqlen_qo, head_qo, headdim_qk, device=device, dtype=dtype
+    )
+    query_padding_mask = gen_padding_mask_from_seqlens(
+        seqlens_qo, batch_size, None, device
+    )
+    query_unpad, indices_query, cu_seqlens_query, max_seqlen_query, *rest = unpad_input(
+        query_pad, query_padding_mask
     )
 
-    output, lse, *rest = flash_attn_with_kvcache(
-        query,
-        key_cache,
-        value_cache,
-        None,
-        None,
-        None,
-        None,
-        None,
-        kv_lens,  # cache_seqlens
-        None,  # cache_batch_idx
-        None,
-        block_tables,  # page_table
-        None,  # cu_query_lens
-        None,
-        max_query_len,  # max_seqlen_q
-        None,
-        None,
-        None,
-        None,
-        scale,
-        is_causal,
-        window_size=(-1, -1),
+    seqlens_kv = [x[1] for x in seq_lens]
+    head_kv = num_heads[1]
+    headdim_vo = headdim[1]
+    max_seqlen_kv = max(seqlens_kv)
+    # total_seqlen_kv = sum(seqlens_kv)
+    # cu_seqlens_kv = torch.cumsum(
+    #     torch.tensor([0] + seqlens_kv, dtype=torch.int32, device=device), dim=0
+    # )
+    cache_seqlens = torch.tensor(seqlens_kv, dtype=torch.int32, device=device)
+    (
+        k_cache,
+        v_cache,
+        page_table,
+        k_cache_paged,
+        v_cache_paged,
+        num_blocks,
+    ) = generate_block_kvcache(
+        max_seqlen_kv,
+        page_size,
+        batch_size,
+        head_kv,
+        headdim_qk,
+        headdim_vo,
+        device,
+        dtype,
+    )
+
+    softmax_scale = headdim_qk**-0.5
+
+    is_causal = False
+    window_size = (None, None)
+    if isinstance(mask, str) and mask == "causal":
+        is_causal = True
+    elif isinstance(mask, tuple) and len(mask) == 2:
+        window_size = mask  # type: ignore
+
+    learnable_sink = None
+
+    # calc ref
+    k_cache_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+    v_cache_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+    max_seqlen_kv_arange = rearrange(
+        torch.arange(max_seqlen_kv, device=device), "s -> 1 s"
+    )
+    key_padding_mask = max_seqlen_kv_arange < rearrange(cache_seqlens, "b -> b 1")
+    out_ref, _, score_ref = attention_ref(
+        q=query_pad,
+        k=k_cache_rep,
+        v=v_cache_rep,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+
+    if cp_world_size > 1:
+        cp_tot_seqused_k = cache_seqlens.clone()
+
+        rank_outs, rank_lses = [], []
+        for cp_rank in range(cp_world_size):
+            # pre-gather rank-local paged KV
+            k_local, v_local, pt_local, local_seqlens = (
+                make_cp_rank_local_paged_kvcache(
+                    k_cache_paged,
+                    v_cache_paged,
+                    page_table,
+                    cache_seqlens,
+                    page_size,
+                    cp_rank,
+                    cp_world_size,
+                    device,
+                )
+            )
+
+            out_rank, lse_rank, *_ = flash_attn_with_kvcache(
+                q=query_unpad,
+                k_cache=k_local,
+                v_cache=v_local,
+                cache_seqlens=local_seqlens,  # rank-local seqlen
+                page_table=pt_local,
+                cu_seqlens_q=cu_seqlens_qo,
+                max_seqlen_q=max_seqlen_qo,
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                num_splits=1,
+                pack_gqa=(head_qo != head_kv),
+                sm_margin=0,
+                return_softmax_lse=True,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
+                cp_tot_seqused_k=cp_tot_seqused_k,
+            )
+            rank_outs.append(out_rank.float())
+            rank_lses.append(lse_rank.float())
+
+        total_q = query_unpad.shape[0]
+        combined_unpad = torch.zeros(
+            total_q, head_qo, headdim_vo, dtype=torch.float32, device=device
+        )
+        cu_q = cu_seqlens_qo.tolist()
+        for b in range(batch_size):
+            s, e = cu_q[b], cu_q[b + 1]
+            if s == e:
+                continue
+            out_b, _ = _combine_cp_partials(
+                [rank_outs[r][s:e] for r in range(cp_world_size)],
+                [rank_lses[r][:, s:e] for r in range(cp_world_size)],
+            )
+            combined_unpad[s:e] = out_b
+
+        out_pad = pad_input(
+            combined_unpad.to(dtype), indices_query, batch_size, max_seqlen_query
+        )
+        torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
+        return
+
+    if num_splits >= 0:
+        metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_qo,
+            max_seqlen_k=max_seqlen_kv,
+            num_heads_q=head_qo,
+            num_heads_kv=head_kv,
+            headdim=headdim_qk,
+            seqused_q=None,
+            seqused_k=cache_seqlens,
+            headdim_v=headdim_vo,
+            qkv_dtype=dtype,
+            cu_seqlens_q=cu_seqlens_qo,
+            cu_seqlens_k=None,
+            cu_seqlens_k_new=None,
+            cache_leftpad=None,
+            page_size=page_size,
+            max_seqlen_k_new=None,
+            causal=is_causal,
+            window_size=window_size,
+            attention_chunk=0,
+            has_softcap=False,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            mp_margin=0,
+        )
+        # print(metadata[:4*batch_size].view(4, -1))
+
+        # TODO: too many feat unsupported
+        # out_accum_ref, lse_accum_ref = attention_accum_ref(
+        #     query=query_pad,
+        #     key=k_cache_rep,
+        #     value=v_cache_rep,
+        #     metadata=metadata,
+        #     num_splits=num_splits,
+        #     softmax_scale=softmax_scale,
+        #     seqused_q=None,
+        #     seqused_kv=cache_seqlens,
+        #     cu_seqlens_q=cu_seqlens_qo,
+        #     cu_seqlens_kv=None,
+        # )
+    else:
+        # not split
+        metadata = None  # noqa: F841
+        num_splits = -1
+
+    out, lse, out_accum, lse_accum, *rest = flash_attn_with_kvcache(
+        q=query_unpad,
+        k_cache=k_cache if page_size is None else k_cache_paged,
+        v_cache=v_cache if page_size is None else v_cache_paged,
+        k=None,
+        v=None,
+        qv=None,
+        rotary_cos=None,
+        rotary_sin=None,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=None,
+        cache_leftpad=None,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_qo,
+        cu_seqlens_k_new=None,
+        max_seqlen_q=max_seqlen_qo,
+        rotary_seqlens=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        softmax_scale=softmax_scale,
+        causal=is_causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
         attention_chunk=0,
         softcap=0.0,
         rotary_interleaved=False,
-        scheduler_metadata=None,
-        num_splits=1,
-        pack_gqa=None,
+        scheduler_metadata=metadata,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
         sm_margin=0,
         return_softmax_lse=True,
     )
 
-    torch.set_default_device("musa")
-    ref_output, ref_lse = ref_paged_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        query_lens=None,
-        kv_lens=kv_lens,
-        block_tables=block_tables,
-        scale=scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
+    if num_splits >= 0:
+        out_accum = torch.utils.dlpack.from_dlpack(out_accum)
+        lse_accum = torch.utils.dlpack.from_dlpack(lse_accum)
+        out_accum_pad, lse_accum_pad = pad_accum(
+            out_accum=out_accum,
+            lse_accum=lse_accum,
+            seqused_q=None,
+            cu_seqlens_q=cu_seqlens_qo,
+        )
+
+    out_pad = pad_input(out, indices_query, batch_size, max_seqlen_query)
+    lse_ref, _ = lse_ref_from_score(
+        score_ref,
         is_causal=is_causal,
+        cu_seqlens_q=cu_seqlens_qo,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=cache_seqlens,
+        learnable_sink=learnable_sink,
     )
+
     atol, rtol = 1.5e-2, 1e-2
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(lse_ref, lse, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skip(reason="Skip for CI. Avoid Long JIT")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [0, 5])  # neg value disable split
+@pytest.mark.parametrize("pack_gqa", [True, False])
+@pytest.mark.parametrize("is_learnable_sink", [True, False])
+@pytest.mark.parametrize("is_varlen_q", [True, False])
+@pytest.mark.parametrize("mask", [None, "causal", (44, 88)])
+@pytest.mark.parametrize("page_size", [1, 4, 16, 64])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(111, 1328), (55, 666), (222, 463)],
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads",
+    [(40, 8), (8, 1)],
+)
+@pytest.mark.parametrize("headdim", [(128, 128), (256, 256)])
+@torch.inference_mode()
+def test_paged_attn_advance(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    headdim: tuple[int, int],
+    dtype: torch.dtype,
+    page_size: int,
+    mask: Union[None, str, Tuple[int, int]],
+    pack_gqa: bool,
+    is_learnable_sink: bool,
+    is_varlen_q: bool,
+    num_splits: int,
+):
+    torch.manual_seed(666)
+    torch.musa.manual_seed(666)
+
+    device = "musa"
+
+    batch_size = len(seq_lens)
+
+    seqlens_qo = [x[0] for x in seq_lens]
+    head_qo = num_heads[0]
+    headdim_qk = headdim[0]
+    max_seqlen_qo = max(seqlens_qo)
+    # total_seqlen_qo = sum(seqlens_qo)
+    cu_seqlens_qo = torch.cumsum(
+        torch.tensor([0] + seqlens_qo, dtype=torch.int32, device=device),
+        dim=0,
+        dtype=torch.int32,
+    )
+    query_pad = torch.randn(
+        batch_size, max_seqlen_qo, head_qo, headdim_qk, device=device, dtype=dtype
+    )
+    query_padding_mask = gen_padding_mask_from_seqlens(
+        seqlens_qo, batch_size, None, device
+    )
+    query_unpad, indices_query, cu_seqlens_query, max_seqlen_query, *rest = unpad_input(
+        query_pad, query_padding_mask
+    )
+
+    seqlens_kv = [x[1] for x in seq_lens]
+    head_kv = num_heads[1]
+    headdim_vo = headdim[1]
+    max_seqlen_kv = max(seqlens_kv)
+    # total_seqlen_kv = sum(seqlens_kv)
+    # cu_seqlens_kv = torch.cumsum(
+    #     torch.tensor([0] + seqlens_kv, dtype=torch.int32, device=device), dim=0
+    # )
+    cache_seqlens = torch.tensor(seqlens_kv, dtype=torch.int32, device=device)
+    (
+        k_cache,
+        v_cache,
+        page_table,
+        k_cache_paged,
+        v_cache_paged,
+        num_blocks,
+    ) = generate_block_kvcache(
+        max_seqlen_kv,
+        page_size,
+        batch_size,
+        head_kv,
+        headdim_qk,
+        headdim_vo,
+        device,
+        dtype,
+    )
+
+    softmax_scale = headdim_qk**-0.5
+
+    is_causal = False
+    is_local = False
+    window_size = (None, None)
+    if isinstance(mask, str) and mask == "causal":
+        is_causal = True
+    elif isinstance(mask, tuple) and len(mask) == 2:
+        window_size = mask  # type: ignore
+        is_local = True
+
+    if is_learnable_sink:
+        if not is_local:
+            pytest.skip("learnable sink is tested for local attention")
+        learnable_sink = torch.randn(head_qo, device=device, dtype=dtype) * 10
+    else:
+        learnable_sink = None
+
+    # calc ref
+    k_cache_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+    v_cache_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+    max_seqlen_kv_arange = rearrange(
+        torch.arange(max_seqlen_kv, device=device), "s -> 1 s"
+    )
+    key_padding_mask = max_seqlen_kv_arange < rearrange(cache_seqlens, "b -> b 1")
+    out_ref, _, score_ref = attention_ref(
+        q=query_pad,
+        k=k_cache_rep,
+        v=v_cache_rep,
+        query_padding_mask=query_padding_mask if is_varlen_q else None,
+        key_padding_mask=key_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
+
+    if num_splits >= 0:
+        metadata = get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_qo,
+            max_seqlen_k=max_seqlen_kv,
+            num_heads_q=head_qo,
+            num_heads_kv=head_kv,
+            headdim=headdim_qk,
+            seqused_q=None,
+            seqused_k=cache_seqlens,
+            headdim_v=headdim_vo,
+            qkv_dtype=dtype,
+            cu_seqlens_q=cu_seqlens_qo if is_varlen_q else None,
+            cu_seqlens_k=None,
+            cu_seqlens_k_new=None,
+            cache_leftpad=None,
+            page_size=page_size,
+            max_seqlen_k_new=None,
+            causal=is_causal,
+            window_size=window_size,
+            attention_chunk=0,
+            has_softcap=False,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            mp_margin=0,
+        )
+        # print(metadata[:4*batch_size].view(4, -1))
+
+        # TODO: too many feat unsupported
+        # out_accum_ref, lse_accum_ref = attention_accum_ref(
+        #     query=query_pad,
+        #     key=k_cache_rep,
+        #     value=v_cache_rep,
+        #     metadata=metadata,
+        #     num_splits=num_splits,
+        #     softmax_scale=softmax_scale,
+        #     seqused_q=None,
+        #     seqused_kv=cache_seqlens,
+        #     cu_seqlens_q=cu_seqlens_qo,
+        #     cu_seqlens_kv=None,
+        # )
+    else:
+        # not split
+        metadata = None  # noqa: F841
+        num_splits = -1
+
+    out, lse, out_accum, lse_accum, *rest = flash_attn_with_kvcache(
+        q=query_unpad if is_varlen_q else query_pad,
+        k_cache=k_cache if page_size is None else k_cache_paged,
+        v_cache=v_cache if page_size is None else v_cache_paged,
+        k=None,
+        v=None,
+        qv=None,
+        rotary_cos=None,
+        rotary_sin=None,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=None,
+        cache_leftpad=None,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_qo if is_varlen_q else None,
+        cu_seqlens_k_new=None,
+        max_seqlen_q=max_seqlen_qo if is_varlen_q else None,
+        rotary_seqlens=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        softmax_scale=softmax_scale,
+        causal=is_causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        attention_chunk=0,
+        softcap=0.0,
+        rotary_interleaved=False,
+        scheduler_metadata=metadata,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sm_margin=0,
+        return_softmax_lse=True,
+    )
+
+    # if num_splits >= 0:
+    #     out_accum = torch.utils.dlpack.from_dlpack(out_accum)
+    #     lse_accum = torch.utils.dlpack.from_dlpack(lse_accum)
+    #     if is_varlen_q:
+    #         out_accum_pad, lse_accum_pad = pad_accum(
+    #             out_accum=out_accum,
+    #             lse_accum=lse_accum,
+    #             seqused_q=None,
+    #             cu_seqlens_q=cu_seqlens_qo,
+    #         )
+    #     else:
+    #         out_accum_pad = out_accum
+    #         lse_accum_pad = lse_accum
+
+    if is_varlen_q:
+        out_pad = pad_input(out, indices_query, batch_size, max_seqlen_query)
+    else:
+        out_pad = out
+    lse_ref_unpad, lse_ref_pad = lse_ref_from_score(
+        score_ref,
+        is_causal=is_causal,
+        cu_seqlens_q=cu_seqlens_qo if is_varlen_q else None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=cache_seqlens,
+        learnable_sink=learnable_sink,
+    )
+    lse_ref = lse_ref_unpad if is_varlen_q else lse_ref_pad
+
+    atol, rtol = 1.5e-2, 1e-2
+
+    torch.testing.assert_close(lse_ref, lse, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skip(reason="Will be verified in fwd PR.")
+@pytest.mark.parametrize("seqlen_q", [1, 3])
+@pytest.mark.parametrize("headdim_v", [128, 256])
+@pytest.mark.parametrize("num_head", [1, 4, 5, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mode", ["normal", "ragged", "padded"])
+@pytest.mark.parametrize("reorder", [False])
+@pytest.mark.parametrize("batch_size", [1, 5, 32])
+@pytest.mark.parametrize("max_splits", [5])
+def test_combine(
+    max_splits: int,
+    batch_size: int,
+    reorder: bool,
+    mode: str,
+    dtype: torch.dtype,
+    num_head: int,
+    headdim_v: int,
+    seqlen_q: int,
+) -> None:
+    device = torch.device("musa")
+
+    # torch.manual_seed(666)
+    # torch.musa.manual_seed(666)
+
+    assert not reorder, "Reorder is not supported yet."
+
+    # Prepare metadata
+    num_splits = torch.randint(
+        2, max_splits + 1, (batch_size,), device=device, dtype=torch.int32
+    )
+    batch_table = torch.arange(batch_size, device=device, dtype=torch.int32)
+    batch_table = batch_table[torch.randperm(batch_size)] if reorder else batch_table
+    metadata = torch.cat(
+        [
+            num_splits,
+            batch_table,
+            torch.empty_like(num_splits),
+            torch.empty_like(num_splits),
+        ],
+        dim=0,
+    )
+
+    # Prepare data
+    cu_seqlens_q, seqused_q, max_seqlen_q = None, None, None
+    if mode in ("padded", "normal"):
+        shape_oaccum = (batch_size, num_head, max_splits, seqlen_q, headdim_v)  # type: ignore[assignment]
+        shape_lseaccum = (batch_size, num_head, max_splits, seqlen_q)  # type: ignore[assignment]
+        shape_out = (batch_size, seqlen_q, num_head, headdim_v)  # type: ignore[assignment]
+        shape_lse = (batch_size, num_head, seqlen_q)  # type: ignore[assignment]
+    elif mode == "ragged":
+        seqlens_q = torch.randint(
+            1, seqlen_q + 1, (batch_size,), device=device, dtype=torch.int32
+        )
+        cu_seqlens_q = torch.cat(
+            [
+                torch.tensor([0], dtype=torch.int32, device=device),
+                seqlens_q.cumsum(dim=0),
+            ]
+        ).to(torch.int32)
+        total_q = cu_seqlens_q[-1].item()
+        max_seqlen_q = seqlen_q
+        shape_oaccum = (1, num_head, max_splits, total_q, headdim_v)  # type: ignore[assignment]
+        shape_lseaccum = (1, num_head, max_splits, total_q)  # type: ignore[assignment]
+        shape_out = (total_q, num_head, headdim_v)  # type: ignore[assignment]
+        shape_lse = (num_head, total_q)  # type: ignore[assignment]
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+    if mode == "padded":
+        seqused_q = torch.randint(
+            1, seqlen_q + 1, (batch_size,), device=device, dtype=torch.int32
+        )
+        # max_seqlen_q = seqlen_q
+
+    out_accum = torch.randn(shape_oaccum, device=device, dtype=torch.float32)
+    lse_accum = torch.randn(shape_lseaccum, device=device, dtype=torch.float32)
+    out = torch.empty(shape_out, device=device, dtype=dtype)
+    lse = torch.empty(shape_lse, device=device, dtype=torch.float32)
+
+    fmha_fwd_combine(
+        out,
+        lse,
+        out_accum,
+        lse_accum,
+        64,  # tile_n
+        cu_seqlens_q,
+        seqused_q,
+        max_seqlen_q,
+        max_splits,
+        metadata,
+    )
+
+    # Mask Seqlen
+    if mode == "padded":
+        for batch_idx, cur_seqlen_q in enumerate(seqused_q):
+            out_accum[batch_idx, ..., cur_seqlen_q:, :] = 0
+            lse_accum[batch_idx, ..., cur_seqlen_q:] = float("-inf")
+
+    # Mask Splits
+    for batch_idx, cur_splits in enumerate(num_splits):
+        cur_splits = cur_splits.item()
+        if cur_splits < max_splits:
+            if mode == "ragged":
+                # pdb.set_trace()
+                out_accum[
+                    ...,
+                    cur_splits:,
+                    cu_seqlens_q[batch_idx] : cu_seqlens_q[batch_idx + 1],
+                    :,
+                ] = 0
+                lse_accum[
+                    ...,
+                    cur_splits:,
+                    cu_seqlens_q[batch_idx] : cu_seqlens_q[batch_idx + 1],
+                ] = float("-inf")
+            else:
+                out_accum[batch_idx, :, cur_splits:, :, :] = 0
+                lse_accum[batch_idx, :, cur_splits:, :] = float("-inf")
+
+    ref_out, ref_lse = attention_combine_ref(
+        out_accum,
+        lse_accum,
+    )
+
+    if mode == "ragged":
+        ref_out.squeeze_(0)
+        ref_lse.squeeze_(0)
+    elif mode == "padded":
+        for batch_idx, cur_seqlen_q in enumerate(seqused_q):
+            cur_seqlen_q = cur_seqlen_q.item()
+            ref_out[batch_idx, cur_seqlen_q:] = 0
+            ref_lse[batch_idx, ..., cur_seqlen_q:] = 0
+            out[batch_idx, cur_seqlen_q:] = 0
+            lse[batch_idx, ..., cur_seqlen_q:] = 0
+
+    torch.set_printoptions(sci_mode=False)
+    atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(lse, ref_lse, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
