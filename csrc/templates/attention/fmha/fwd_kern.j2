@@ -12,8 +12,7 @@
 #include "mate/attention/fmha/tile_scheduler.hpp"
 #include "mate/attention/fmha/metadata.hpp"
 
-#include "mate_utils.muh"
-#include "tvm_ffi_utils.hpp"
+#include "op_utils.hpp"
 
 using namespace mute;
 using namespace tvm;
@@ -67,9 +66,11 @@ ffi::Array<ffi::Any> {{ func_name }} (
   constexpr bool HasSequsedQ = {{ 'true' if has_seqused_q else 'false' }};
   constexpr bool HasSequsedK = {{ 'true' if has_seqused_k else 'false' }};
   constexpr bool HasCuseqlensKNew = {{ 'true' if has_cu_seqlens_k_new else 'false' }};
+  constexpr bool HasKvBatchIdx = {{ 'true' if has_kv_batch_idx else 'false' }};
   constexpr bool HasLeftpadK = {{ 'true' if has_leftpad_k else 'false' }};
   constexpr bool PagedKV = {{ 'true' if paged_kv else 'false' }};
   constexpr bool HasSoftcap = {{ 'true' if has_softcap else 'false' }};
+  constexpr bool IsAppendKV = {{ 'true' if is_append_kv else 'false' }};
   constexpr bool HasLearnableSink = {{ 'true' if has_learnable_sink else 'false' }};
   constexpr bool IsCausal = {{ 'true' if is_causal else 'false' }};
   constexpr bool IsLocal = {{ 'true' if is_local else 'false' }};
@@ -110,6 +111,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          NumQKConsumers,
                                                          HasCuseqlensQ,
                                                          HasCuseqlensK,
+                                                         HasCuseqlensKNew,
+                                                         HasKvBatchIdx,
                                                          HasSequsedQ,
                                                          HasSequsedK,
                                                          PagedKV,
@@ -118,6 +121,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          IsLocal,
                                                          HasLearnableSink,
                                                          HasSoftcap,
+                                                         IsAppendKV,
                                                          HeadRatio,
                                                          IsPackGQA,
                                                          IsSplit /*Split*/,
@@ -163,6 +167,10 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const headdim_rounded = mate::attention::fmha::round_up_headdim(headdim);
   int const headdim_v = static_cast<int>(v.size(-1));
   int const headdim_v_rounded = mate::attention::fmha::round_up_headdim(headdim_v);
+  bool const is_varlen_k_new = IsAppendKV && HasCuseqlensKNew;
+  int const seqlen_k_new = !IsAppendKV ? 0 : (!is_varlen_k_new ? static_cast<int>(k_new.value().size(1)) : 0);
+  int const total_k_new = !IsAppendKV ? 0 : (!is_varlen_k_new ? batch_size * static_cast<int>(k_new.value().size(1))
+                                                                : static_cast<int>(k_new.value().size(0)));
   int mp_count = mutlass::KernelHardwareInfo::query_device_multiprocessor_count() - mp_margin;
 
   // Set Params
@@ -200,22 +208,37 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .b = batch_size,
     .seqlen_q = seqlen_q,
     .seqlen_k = seqlen_k,
+    .seqlen_knew = seqlen_k_new,
     .total_q = total_q,
     .total_k = total_k,
+    .total_knew = total_k_new,
     .d = headdim,
     .d_rounded = headdim_rounded,
     .dv = headdim_v,
     .dv_rounded = headdim_v_rounded,
 
+    .b_k = HasKvBatchIdx ? static_cast<int>(PagedKV ? page_table.value().size(0) : k.size(0)) : batch_size,
+
     // Scale factor
     .scale_softmax = softmax_scale,
-
 
     // Ragged params
     .cu_seqlens_q = HasCuseqlensQ ? static_cast<uint32_t*>(cu_seqlens_q.value().data_ptr()) : nullptr,
     .cu_seqlens_k = HasCuseqlensK ? static_cast<uint32_t*>(cu_seqlens_k.value().data_ptr()) : nullptr,
+    .cu_seqlens_knew = is_varlen_k_new ? static_cast<uint32_t*>(cu_seqlens_k_new.value().data_ptr()) : nullptr,
     .seqused_q = HasSequsedQ ? static_cast<uint32_t*>(seqused_q.value().data_ptr()) : nullptr,
     .seqused_k = HasSequsedK ? static_cast<uint32_t*>(seqused_k.value().data_ptr()) : nullptr,
+
+    // AppendKV
+    .knew_ptr = IsAppendKV ? k_new.value().data_ptr() : nullptr,
+    .vnew_ptr = IsAppendKV ? v_new.value().data_ptr() : nullptr,
+    .knew_batch_stride = IsAppendKV && !is_varlen_k_new ? k_new.value().stride(0) : 0,
+    .vnew_batch_stride = IsAppendKV && !is_varlen_k_new ? v_new.value().stride(0) : 0,
+    .knew_row_stride = IsAppendKV ? k_new.value().stride(-3) : 0,
+    .vnew_row_stride = IsAppendKV ? v_new.value().stride(-3) : 0,
+    .knew_head_stride = IsAppendKV ? k_new.value().stride(-2) : 0,
+    .vnew_head_stride = IsAppendKV ? v_new.value().stride(-2) : 0,
+    .kv_batch_idx = HasKvBatchIdx ? static_cast<uint32_t*>(kv_batch_idx.value().data_ptr()) : nullptr,
 
     // Learnable Sink
     .learnable_sink_ptr =  HasLearnableSink ? learnable_sink.value().data_ptr() : nullptr,
@@ -276,26 +299,35 @@ ffi::Array<ffi::Any> {{ func_name }} (
 
   // std::cout << params << std::endl;
 
+  int seqlen_q_mainloop = HasCuseqlensQ ? params.total_q : params.seqlen_q;
+  int batch_q_mainloop = HasCuseqlensQ ? 1 : params.b;
+  int batch_k_mainloop = HasCuseqlensK ? 1 : (HasKvBatchIdx ? params.b_k : params.b);
+
   // Set Mainloop Args
   typename CollectiveMainloop::Arguments mainloop_args {
      // QKV Args
     .ptr_Q = static_cast<Element const*>(params.q_ptr),
-    .shape_Q = {HasCuseqlensQ ? params.total_q : params.seqlen_q, params.d, params.h, HasCuseqlensQ ? 1 : params.b},
+    .shape_Q = {seqlen_q_mainloop, params.d, params.h, batch_q_mainloop},
     .stride_Q = {params.q_row_stride, _1{}, params.q_head_stride, HasCuseqlensQ ? 0 : params.q_batch_stride},
     .ptr_K = static_cast<Element*>(params.k_ptr),
     .shape_K = {PagedKV ? params.page_size : (HasCuseqlensK ? params.total_k : params.seqlen_k), params.d, params.h_k,
-                PagedKV ? params.num_pages : (HasCuseqlensK ? 1 : params.b)}, // FIXME: change batch if kv_batch is different
+                PagedKV ? params.num_pages : batch_k_mainloop},
     .stride_K = {params.k_row_stride, _1{}, params.k_head_stride, HasCuseqlensK ? 0 : params.k_batch_stride},
     .ptr_V = static_cast<Element*>(params.v_ptr),
     .headdim_V = params.dv,
     .stride_V = {params.v_row_stride, _1{}, params.v_head_stride, HasCuseqlensK ? 0 : params.v_batch_stride},
 
     // AppendKV
+    .ptr_K_new = static_cast<Element const*>(params.knew_ptr),
+    .shape_K_new = {HasCuseqlensKNew ? params.total_knew : params.seqlen_knew, params.d, params.h_k, HasCuseqlensKNew ? 1 : params.b},
+    .stride_K_new = {params.knew_row_stride, _1{}, params.knew_head_stride, HasCuseqlensKNew ? 0 : params.knew_batch_stride},
+    .ptr_V_new = static_cast<Element const*>(params.vnew_ptr),
+    .stride_V_new = {params.vnew_row_stride, _1{}, params.vnew_head_stride, HasCuseqlensKNew ? 0 : params.vnew_batch_stride},
     // Rotary
 
     // PageTable Args
     .ptr_pagetable = params.page_table,
-    .shape_pagetable = {params.b, PagedKV ? params.seqlen_k / params.page_size : 0},
+    .shape_pagetable = {HasKvBatchIdx ? params.b_k : params.b, PagedKV ? params.seqlen_k / params.page_size : 0},
     .stride_pagetable = {params.page_table_batch_stride, _1{}},
 
     // Scale
@@ -310,8 +342,11 @@ ffi::Array<ffi::Any> {{ func_name }} (
 
     .softcap_val = softcap,
 
+    .num_splits = params.num_splits,
+    .kv_batch_idx = static_cast<uint32_t const*>(params.kv_batch_idx),
     .cu_seqlens_q = static_cast<uint32_t const*>(params.cu_seqlens_q),
     .cu_seqlens_k = static_cast<uint32_t const*>(params.cu_seqlens_k),
+    .cu_seqlens_k_new = static_cast<uint32_t const*>(params.cu_seqlens_knew),
     .seqused_q = static_cast<uint32_t const*>(params.seqused_q),
     .seqused_k = static_cast<uint32_t const*>(params.seqused_k),
 

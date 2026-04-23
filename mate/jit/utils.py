@@ -1,8 +1,5 @@
 import torch
 from jinja2 import Template
-from . import env as jit_env
-
-import tvm_ffi
 
 
 TVM_HEADER = """
@@ -28,12 +25,3 @@ dtype_torch2mutlass_map = {
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-
-
-@jit_env.check_force_jit()
-@jit_env.check_no_aot_build()
-def update_aot_mod(configs, encoding_fn, mod_path, mod_cache):
-    mod = tvm_ffi.load_module(mod_path)
-    for config in configs:
-        dispatch_name = encoding_fn(tuple(config.items()))
-        mod_cache[dispatch_name] = mod

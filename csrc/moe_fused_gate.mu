@@ -3,13 +3,12 @@
 #include <mutlass/mutlass.h>
 #include <mutlass/numeric_types.h>
 #include <stdio.h>
-#include <torch/all.h>
-#include <torch_musa/csrc/core/MUSAGuard.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <type_traits>
 
-#include "torch_musa/csrc/aten/musa/MUSAContext.h"
+#include "op_utils.hpp"
 
 template <typename T, int N, int Align = (mutlass::sizeof_bits<T>::value * N + 7) / 8>
 using AlignedArray = mutlass::AlignedArray<T, N, Align>;
@@ -29,25 +28,20 @@ static __device__ __forceinline__ float fast_rcpf(float x) {
   return y;
 }
 
-// QQ NOTE: to handle the case for at::Half, error: more than one operator ">"
-// matches these operands: built-in operator "arithmetic > arithmetic" function
-// "operator>(const __half &, const __half &)"
+// QQ NOTE: mutlass::half_t can cause operator ambiguity on device, so compare in
+// float for fp16.
 template <typename T>
 __device__ inline bool cmp_gt(const T& a, const T& b) {
-  if constexpr (std::is_same<T, at::Half>::value) {
-    // at::Half (or float16_t in our native case) causes ambiguity, so we cast
-    // to float.
+  if constexpr (std::is_same_v<T, float16_t>) {
     return static_cast<float>(a) > static_cast<float>(b);
   } else {
-    // For types like float, at::BFloat16, or mutlass::half_t /
-    // mutlass::bfloat16_t, assume operator> works as expected.
     return a > b;
   }
 }
 
 template <typename T>
 __device__ inline bool cmp_eq(const T& a, const T& b) {
-  if constexpr (std::is_same<T, at::Half>::value) {
+  if constexpr (std::is_same_v<T, float16_t>) {
     return static_cast<float>(a) == static_cast<float>(b);
   } else {
     return a == b;
@@ -585,35 +579,35 @@ __global__ void moe_fused_gate_kernel_static(void*    input,
 }
 
 // Macro to compute compile-time constants and launch the kernel.
-#define LAUNCH_MOE_GATE_CONFIG(T, EXPERTS, EXPERT_GROUP, MAP_POLICY)                  \
-  do {                                                                                \
-    constexpr int vlen       = EXPERTS / WARP_SIZE;                                   \
-    int           block_x    = num_experts / vlen;                                    \
-    int           block_y    = block_size / block_x;                                  \
-    int64_t       num_blocks = (num_rows + block_y - 1) / block_y;                    \
-    dim3          block_dim(block_size, 1, 1);                                        \
-    constexpr int VPT          = (EXPERTS) / (EXPERT_GROUP);                          \
-    constexpr int ROWS_PER_CTA = block_size / (EXPERTS / vlen);                       \
-    moe_fused_gate_kernel_static<T, VPT, (EXPERTS), ROWS_PER_CTA, vlen, MAP_POLICY>   \
-        <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),                      \
-                                               bias.data_ptr(),                       \
-                                               output.data_ptr<float>(),              \
-                                               indices.data_ptr<int32_t>(),           \
-                                               num_rows,                              \
-                                               topk_group,                            \
-                                               topk,                                  \
-                                               num_fused_shared_experts,              \
-                                               routed_scaling_factor,                 \
-                                               renorm,                                \
-                                               apply_routed_scaling_factor_on_output, \
-                                               last_val,                              \
-                                               num_token_non_padded,                  \
-                                               static_index_map_ptr,                  \
-                                               dynamic_index_map_ptr,                 \
-                                               dynamic_index_map_valid_ptr,           \
-                                               random_index_ptr,                      \
-                                               num_physical_experts);                 \
-    dispatched = true;                                                                \
+#define LAUNCH_MOE_GATE_CONFIG(T, EXPERTS, EXPERT_GROUP, MAP_POLICY)                      \
+  do {                                                                                    \
+    constexpr int vlen       = EXPERTS / WARP_SIZE;                                       \
+    int           block_x    = num_experts / vlen;                                        \
+    int           block_y    = block_size / block_x;                                      \
+    int64_t       num_blocks = (num_rows + block_y - 1) / block_y;                        \
+    dim3          block_dim(block_size, 1, 1);                                            \
+    constexpr int VPT          = (EXPERTS) / (EXPERT_GROUP);                              \
+    constexpr int ROWS_PER_CTA = block_size / (EXPERTS / vlen);                           \
+    moe_fused_gate_kernel_static<T, VPT, (EXPERTS), ROWS_PER_CTA, vlen, MAP_POLICY>       \
+        <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),                          \
+                                               bias.data_ptr(),                           \
+                                               static_cast<float*>(output.data_ptr()),    \
+                                               static_cast<int32_t*>(indices.data_ptr()), \
+                                               num_rows,                                  \
+                                               topk_group,                                \
+                                               topk,                                      \
+                                               num_fused_shared_experts,                  \
+                                               routed_scaling_factor,                     \
+                                               renorm,                                    \
+                                               apply_routed_scaling_factor_on_output,     \
+                                               last_val,                                  \
+                                               num_token_non_padded,                      \
+                                               static_index_map_ptr,                      \
+                                               dynamic_index_map_ptr,                     \
+                                               dynamic_index_map_valid_ptr,               \
+                                               random_index_ptr,                          \
+                                               num_physical_experts);                     \
+    dispatched = true;                                                                    \
   } while (0);
 
 //------------------------------------------------------------------------------
@@ -679,41 +673,46 @@ __global__ void moe_fused_gate_kernel_dynamic(void*    input,
                                  map_policy);
 }
 
-void dispatch_moe_fuse_gate_dynamic(at::Tensor& output,
-                                    at::Tensor& indices,
-                                    at::Tensor& input,
-                                    at::Tensor& bias,
-                                    int64_t     num_rows,
-                                    int64_t     num_experts,
-                                    int64_t     num_expert_group,
-                                    int64_t     topk_group,
-                                    int64_t     topk,
-                                    int64_t     num_fused_shared_experts,
-                                    double      routed_scaling_factor,
-                                    bool        renorm,
-                                    bool        apply_routed_scaling_factor_on_output,
-                                    int         num_token_non_padded,
-                                    int32_t*    static_index_map_ptr,
-                                    int32_t*    dynamic_index_map_ptr,
-                                    int32_t*    dynamic_index_map_valid_ptr,
-                                    int32_t*    random_index_ptr,
-                                    int         num_physical_experts,
-                                    int         map_policy) {
-  // Compute grid dimensions based on runtime value for num_expert_group.
+namespace {
+
+inline int32_t* optional_int32_data_ptr(ffi::Optional<ffi::TensorView> maybe_tensor) {
+  return maybe_tensor.has_value() ? static_cast<int32_t*>(maybe_tensor.value().data_ptr()) : nullptr;
+}
+
+}  // namespace
+
+void dispatch_moe_fuse_gate_dynamic(ffi::TensorView output,
+                                    ffi::TensorView indices,
+                                    ffi::TensorView input,
+                                    ffi::TensorView bias,
+                                    int64_t         num_rows,
+                                    int64_t         num_experts,
+                                    int64_t         num_expert_group,
+                                    int64_t         topk_group,
+                                    int64_t         topk,
+                                    int64_t         num_fused_shared_experts,
+                                    double          routed_scaling_factor,
+                                    bool            renorm,
+                                    bool            apply_routed_scaling_factor_on_output,
+                                    int             num_token_non_padded,
+                                    int32_t*        static_index_map_ptr,
+                                    int32_t*        dynamic_index_map_ptr,
+                                    int32_t*        dynamic_index_map_valid_ptr,
+                                    int32_t*        random_index_ptr,
+                                    int             num_physical_experts,
+                                    int             map_policy) {
   int64_t            rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
   int64_t            num_warps     = (num_rows + rows_per_warp - 1) / rows_per_warp;
   int64_t            num_blocks    = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
-  const musaStream_t stream        = at::musa::getCurrentMUSAStream();
+  const musaStream_t stream        = get_current_stream();
+  const int64_t      input_dtype   = encode_dlpack_dtype(input.dtype());
   dim3               block_dim(WARP_SIZE, WARPS_PER_CTA);
-  // Fallback to the dynamic kernel if none of the supported combinations match.
-  // currently only support num_experts / num_expert_group <= 32 for dynamic
-  // kernels
-  if (input.scalar_type() == at::kBFloat16) {
+  if (input_dtype == bfloat16_code) {
     moe_fused_gate_kernel_dynamic<bfloat16_t>
         <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),
                                                bias.data_ptr(),
-                                               output.data_ptr<float>(),
-                                               indices.data_ptr<int32_t>(),
+                                               static_cast<float*>(output.data_ptr()),
+                                               static_cast<int32_t*>(indices.data_ptr()),
                                                num_rows,
                                                num_experts,
                                                num_expert_group,
@@ -730,12 +729,12 @@ void dispatch_moe_fuse_gate_dynamic(at::Tensor& output,
                                                random_index_ptr,
                                                num_physical_experts,
                                                map_policy);
-  } else if (input.scalar_type() == at::kHalf) {
+  } else if (input_dtype == float16_code) {
     moe_fused_gate_kernel_dynamic<float16_t>
         <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),
                                                bias.data_ptr(),
-                                               output.data_ptr<float>(),
-                                               indices.data_ptr<int32_t>(),
+                                               static_cast<float*>(output.data_ptr()),
+                                               static_cast<int32_t*>(indices.data_ptr()),
                                                num_rows,
                                                num_experts,
                                                num_expert_group,
@@ -752,12 +751,12 @@ void dispatch_moe_fuse_gate_dynamic(at::Tensor& output,
                                                random_index_ptr,
                                                num_physical_experts,
                                                map_policy);
-  } else if (input.scalar_type() == at::kFloat) {
+  } else if (input_dtype == float32_code) {
     moe_fused_gate_kernel_dynamic<float32_t>
         <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),
                                                bias.data_ptr(),
-                                               output.data_ptr<float>(),
-                                               indices.data_ptr<int32_t>(),
+                                               static_cast<float*>(output.data_ptr()),
+                                               static_cast<int32_t*>(indices.data_ptr()),
                                                num_rows,
                                                num_experts,
                                                num_expert_group,
@@ -775,127 +774,129 @@ void dispatch_moe_fuse_gate_dynamic(at::Tensor& output,
                                                num_physical_experts,
                                                map_policy);
   } else {
-    TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
+    TVM_FFI_ICHECK(false) << "Unsupported data type for moe_fused_gate";
   }
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
-bool dispatch_moe_fuse_gate_static(at::Tensor& output,
-                                   at::Tensor& indices,
-                                   at::Tensor& input,
-                                   at::Tensor& bias,
-                                   int64_t     num_rows,
-                                   int64_t     num_experts,
-                                   int64_t     num_expert_group,
-                                   int64_t     topk_group,
-                                   int64_t     topk,
-                                   int64_t     num_fused_shared_experts,
-                                   double      routed_scaling_factor,
-                                   bool        renorm,
-                                   bool        apply_routed_scaling_factor_on_output,
-                                   int         num_token_non_padded,
-                                   int32_t*    static_index_map_ptr,
-                                   int32_t*    dynamic_index_map_ptr,
-                                   int32_t*    dynamic_index_map_valid_ptr,
-                                   int32_t*    random_index_ptr,
-                                   int         num_physical_experts,
-                                   int         map_policy) {
-  const musaStream_t stream     = at::musa::getCurrentMUSAStream();
-  bool               dispatched = false;
-  float              last_val   = apply_routed_scaling_factor_on_output ? 1.f : 1.f / routed_scaling_factor;
+bool dispatch_moe_fuse_gate_static(ffi::TensorView output,
+                                   ffi::TensorView indices,
+                                   ffi::TensorView input,
+                                   ffi::TensorView bias,
+                                   int64_t         num_rows,
+                                   int64_t         num_experts,
+                                   int64_t         num_expert_group,
+                                   int64_t         topk_group,
+                                   int64_t         topk,
+                                   int64_t         num_fused_shared_experts,
+                                   double          routed_scaling_factor,
+                                   bool            renorm,
+                                   bool            apply_routed_scaling_factor_on_output,
+                                   int             num_token_non_padded,
+                                   int32_t*        static_index_map_ptr,
+                                   int32_t*        dynamic_index_map_ptr,
+                                   int32_t*        dynamic_index_map_valid_ptr,
+                                   int32_t*        random_index_ptr,
+                                   int             num_physical_experts,
+                                   int             map_policy) {
+  const musaStream_t stream      = get_current_stream();
+  const int64_t      input_dtype = encode_dlpack_dtype(input.dtype());
+  bool               dispatched  = false;
+  float              last_val    = apply_routed_scaling_factor_on_output ? 1.f : 1.f / routed_scaling_factor;
 
-  TORCH_CHECK(num_experts % WARP_SIZE == 0, "num_experts must be a multiple of WARP_SIZE");
+  TVM_FFI_ICHECK(num_experts % WARP_SIZE == 0) << "num_experts must be a multiple of WARP_SIZE";
 
   constexpr int block_size = 256;
 #define DISPATCH_FOR_MAP_POLICY(MAP_POLICY)                        \
   switch (num_experts) {                                           \
     case 384:                                                      \
       if (num_expert_group == 8) {                                 \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 384, 8, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 384, 8, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 384, 8, MAP_POLICY);   \
         }                                                          \
       } else if (num_expert_group == 16) {                         \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 384, 16, MAP_POLICY); \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 384, 16, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 384, 16, MAP_POLICY);  \
         }                                                          \
       } else if (num_expert_group == 1) {                          \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 384, 1, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 384, 1, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 384, 1, MAP_POLICY);   \
         }                                                          \
       }                                                            \
       break;                                                       \
     case 256:                                                      \
       if (num_expert_group == 8) {                                 \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 8, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 8, MAP_POLICY);   \
         }                                                          \
       } else if (num_expert_group == 16) {                         \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 16, MAP_POLICY); \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 16, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16, MAP_POLICY);  \
         }                                                          \
       } else if (num_expert_group == 1) {                          \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 1, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 1, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 1, MAP_POLICY);   \
         }                                                          \
       }                                                            \
       break;                                                       \
     case 128:                                                      \
       if (num_expert_group == 4) {                                 \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 4, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 4, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 4, MAP_POLICY);   \
         }                                                          \
       } else if (num_expert_group == 8) {                          \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 8, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8, MAP_POLICY);   \
         }                                                          \
       }                                                            \
       break;                                                       \
     case 160:                                                      \
       if (num_expert_group == 1) {                                 \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 160, 1, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 160, 1, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 160, 1, MAP_POLICY);   \
         }                                                          \
       } else if (num_expert_group == 8) {                          \
-        if (input.scalar_type() == at::kBFloat16) {                \
+        if (input_dtype == bfloat16_code) {                        \
           LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 160, 8, MAP_POLICY);  \
-        } else if (input.scalar_type() == at::kHalf) {             \
+        } else if (input_dtype == float16_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float16_t, 160, 8, MAP_POLICY);   \
-        } else if (input.scalar_type() == at::kFloat) {            \
+        } else if (input_dtype == float32_code) {                  \
           LAUNCH_MOE_GATE_CONFIG(float32_t, 160, 8, MAP_POLICY);   \
         }                                                          \
       }                                                            \
@@ -915,49 +916,119 @@ bool dispatch_moe_fuse_gate_static(at::Tensor& output,
       DISPATCH_FOR_MAP_POLICY(2);
       break;
     default:
-      TORCH_CHECK(false, "Unsupported map_policy: ", map_policy);
+      TVM_FFI_ICHECK(false) << "Unsupported map_policy: " << map_policy;
   }
 #undef DISPATCH_FOR_MAP_POLICY
 
+  if (dispatched) {
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
+  }
   return dispatched;
 }
 
 #undef LAUNCH_MOE_GATE_CONFIG
 
-//------------------------------------------------------------------------------
-// Host Launcher Function
-//------------------------------------------------------------------------------
-std::vector<at::Tensor> moe_fused_gate(at::Tensor&                      input,
-                                       at::Tensor&                      bias,
-                                       int64_t                          num_expert_group,
-                                       int64_t                          topk_group,
-                                       int64_t                          topk,
-                                       int64_t                          num_fused_shared_experts,
-                                       double                           routed_scaling_factor,
-                                       bool                             renorm,
-                                       bool                             apply_routed_scaling_factor_on_output,
-                                       int64_t                          num_token_non_padded,
-                                       const c10::optional<at::Tensor>& static_index_map,
-                                       const c10::optional<at::Tensor>& dynamic_index_map,
-                                       const c10::optional<at::Tensor>& dynamic_index_map_valid,
-                                       const c10::optional<at::Tensor>& random_index,
-                                       int64_t                          num_physical_experts,
-                                       int64_t                          map_policy) {
-  const at::musa::OptionalMUSAGuard device_guard(input.device());
-  TORCH_CHECK(input.dtype() == bias.dtype(), "input and bias should have the same dtype");
-  int64_t num_rows    = input.size(0);
-  int32_t num_experts = input.size(1);
-  auto    options     = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
-  auto    output      = torch::empty({num_rows, topk}, options);
-  auto    indices     = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+void moe_fused_gate(ffi::TensorView                output,
+                    ffi::TensorView                indices,
+                    ffi::TensorView                input,
+                    ffi::TensorView                bias,
+                    int64_t                        num_expert_group,
+                    int64_t                        topk_group,
+                    int64_t                        topk,
+                    int64_t                        num_fused_shared_experts,
+                    double                         routed_scaling_factor,
+                    bool                           renorm,
+                    bool                           apply_routed_scaling_factor_on_output,
+                    int64_t                        num_token_non_padded,
+                    ffi::Optional<ffi::TensorView> static_index_map,
+                    ffi::Optional<ffi::TensorView> dynamic_index_map,
+                    ffi::Optional<ffi::TensorView> dynamic_index_map_valid,
+                    ffi::Optional<ffi::TensorView> random_index,
+                    int64_t                        num_physical_experts,
+                    int64_t                        map_policy) {
+  CHECK_INPUT(output);
+  CHECK_INPUT(indices);
+  CHECK_INPUT(input);
+  CHECK_INPUT(bias);
+  CHECK_DIM(2, output);
+  CHECK_DIM(2, indices);
+  CHECK_DIM(2, input);
+  CHECK_DIM(1, bias);
+  CHECK_INPUT_TYPE(output, dl_float32);
+  CHECK_INPUT_TYPE(indices, dl_int32);
+  CHECK_DEVICE(output, input);
+  CHECK_DEVICE(indices, input);
+  CHECK_DEVICE(bias, input);
 
-  // Get pointers from optional tensors, or nullptr if None
-  int32_t* static_index_map_ptr = static_index_map.has_value() ? static_index_map.value().data_ptr<int32_t>() : nullptr;
-  int32_t* dynamic_index_map_ptr =
-      dynamic_index_map.has_value() ? dynamic_index_map.value().data_ptr<int32_t>() : nullptr;
-  int32_t* dynamic_index_map_valid_ptr =
-      dynamic_index_map_valid.has_value() ? dynamic_index_map_valid.value().data_ptr<int32_t>() : nullptr;
-  int32_t* random_index_ptr = random_index.has_value() ? random_index.value().data_ptr<int32_t>() : nullptr;
+  const int64_t input_dtype = encode_dlpack_dtype(input.dtype());
+  TVM_FFI_ICHECK(input.dtype() == bias.dtype()) << "input and bias should have the same dtype";
+  TVM_FFI_ICHECK(input_dtype == float16_code || input_dtype == bfloat16_code || input_dtype == float32_code)
+      << "moe_fused_gate only supports fp16/bf16/fp32 input";
+
+  const int64_t num_rows      = input.size(0);
+  const int64_t num_experts   = input.size(1);
+  const int64_t total_experts = num_experts + num_fused_shared_experts;
+
+  TVM_FFI_ICHECK_EQ(bias.size(0), num_experts) << "bias shape must match input.shape[1]";
+  TVM_FFI_ICHECK_EQ(output.size(0), num_rows) << "output.shape[0] must match input.shape[0]";
+  TVM_FFI_ICHECK_EQ(indices.size(0), num_rows) << "indices.shape[0] must match input.shape[0]";
+  TVM_FFI_ICHECK_EQ(output.size(1), topk) << "output.shape[1] must match topk";
+  TVM_FFI_ICHECK_EQ(indices.size(1), topk) << "indices.shape[1] must match topk";
+  TVM_FFI_ICHECK(num_expert_group > 0) << "num_expert_group must be positive";
+  TVM_FFI_ICHECK(topk_group > 0) << "topk_group must be positive";
+  TVM_FFI_ICHECK(topk_group <= num_expert_group) << "topk_group must be <= num_expert_group";
+  TVM_FFI_ICHECK(topk > 0) << "topk must be positive";
+  TVM_FFI_ICHECK(num_fused_shared_experts >= 0) << "num_fused_shared_experts must be >= 0";
+  TVM_FFI_ICHECK(topk > num_fused_shared_experts) << "topk must be larger than num_fused_shared_experts";
+  TVM_FFI_ICHECK(num_experts % num_expert_group == 0) << "num_experts must be divisible by num_expert_group";
+  TVM_FFI_ICHECK(topk - num_fused_shared_experts <= num_experts)
+      << "topk - num_fused_shared_experts must be <= num_experts";
+  TVM_FFI_ICHECK(routed_scaling_factor != 0.0) << "routed_scaling_factor must be non-zero";
+  TVM_FFI_ICHECK(num_token_non_padded <= num_rows) << "num_token_non_padded must be <= num_rows";
+  TVM_FFI_ICHECK(num_physical_experts >= 0) << "num_physical_experts must be >= 0";
+  TVM_FFI_ICHECK(map_policy == 0 || map_policy == 1 || map_policy == 2) << "Unsupported map_policy: " << map_policy;
+
+  if (map_policy == 1) {
+    CHECK_HAS_VALUE(static_index_map);
+    CHECK_INPUT(static_index_map.value());
+    CHECK_DIM(1, static_index_map.value());
+    CHECK_INPUT_TYPE(static_index_map.value(), dl_int32);
+    CHECK_DEVICE(static_index_map.value(), input);
+    TVM_FFI_ICHECK_EQ(static_index_map.value().size(0), total_experts)
+        << "static_index_map size must match num_experts + num_fused_shared_experts";
+  } else if (map_policy == 2) {
+    CHECK_HAS_VALUE(dynamic_index_map);
+    CHECK_HAS_VALUE(dynamic_index_map_valid);
+    CHECK_HAS_VALUE(random_index);
+    CHECK_INPUT(dynamic_index_map.value());
+    CHECK_INPUT(dynamic_index_map_valid.value());
+    CHECK_INPUT(random_index.value());
+    CHECK_DIM(2, dynamic_index_map.value());
+    CHECK_DIM(1, dynamic_index_map_valid.value());
+    CHECK_DIM(2, random_index.value());
+    CHECK_INPUT_TYPE(dynamic_index_map.value(), dl_int32);
+    CHECK_INPUT_TYPE(dynamic_index_map_valid.value(), dl_int32);
+    CHECK_INPUT_TYPE(random_index.value(), dl_int32);
+    CHECK_DEVICE(dynamic_index_map.value(), input);
+    CHECK_DEVICE(dynamic_index_map_valid.value(), input);
+    CHECK_DEVICE(random_index.value(), input);
+    TVM_FFI_ICHECK(num_physical_experts > 0) << "num_physical_experts must be positive for dynamic map";
+    TVM_FFI_ICHECK_EQ(dynamic_index_map.value().size(0), total_experts)
+        << "dynamic_index_map.shape[0] must match num_experts + num_fused_shared_experts";
+    TVM_FFI_ICHECK_EQ(dynamic_index_map.value().size(1), num_physical_experts)
+        << "dynamic_index_map.shape[1] must match num_physical_experts";
+    TVM_FFI_ICHECK_EQ(dynamic_index_map_valid.value().size(0), total_experts)
+        << "dynamic_index_map_valid size must match num_experts + num_fused_shared_experts";
+    TVM_FFI_ICHECK_EQ(random_index.value().size(0), num_rows) << "random_index.shape[0] must match num_rows";
+    TVM_FFI_ICHECK_EQ(random_index.value().size(1), topk) << "random_index.shape[1] must match topk";
+  }
+
+  ffi::MUSADeviceGuard device_guard(input.device().device_id);
+
+  int32_t* static_index_map_ptr        = optional_int32_data_ptr(static_index_map);
+  int32_t* dynamic_index_map_ptr       = optional_int32_data_ptr(dynamic_index_map);
+  int32_t* dynamic_index_map_valid_ptr = optional_int32_data_ptr(dynamic_index_map_valid);
+  int32_t* random_index_ptr            = optional_int32_data_ptr(random_index);
 
   bool static_dispatched = dispatch_moe_fuse_gate_static(output,
                                                          indices,
@@ -981,13 +1052,9 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor&                      input,
                                                          static_cast<int>(map_policy));
 
   if (!static_dispatched) {
-    int computed_vpt = num_experts / num_expert_group;
-    TORCH_CHECK(computed_vpt <= MAX_VPT,
-                "Per group experts: num_experts / num_expert_group = (",
-                computed_vpt,
-                ") exceeds the maximum supported (",
-                MAX_VPT,
-                ")");
+    int64_t computed_vpt = num_experts / num_expert_group;
+    TVM_FFI_ICHECK(computed_vpt <= MAX_VPT) << "Per group experts: num_experts / num_expert_group = (" << computed_vpt
+                                            << ") exceeds the maximum supported (" << MAX_VPT << ")";
     dispatch_moe_fuse_gate_dynamic(output,
                                    indices,
                                    input,
@@ -1009,32 +1076,6 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor&                      input,
                                    static_cast<int>(num_physical_experts),
                                    static_cast<int>(map_policy));
   }
-
-  return {output, indices};
-  // return {None, None};
 }
 
-TORCH_LIBRARY_FRAGMENT(mate, m) {
-  m.def(
-      "moe_fused_gate("
-      "Tensor input,"
-      "Tensor bias,"
-      "int num_expert_group,"
-      "int topk_group,"
-      "int topk,"
-      "int num_fused_shared_experts,"
-      "float routed_scaling_factor,"
-      "bool renormalize,"
-      "bool apply_routed_scaling_factor_on_output,"
-      "int num_token_non_padded,"
-      "Tensor? static_index_map,"
-      "Tensor? dynamic_index_map,"
-      "Tensor? dynamic_index_map_valid,"
-      "Tensor? random_index,"
-      "int num_physical_experts,"
-      "int map_policy) -> Tensor[]");
-}
-
-TORCH_LIBRARY_IMPL(mate, PrivateUse1, m) {
-  m.impl("moe_fused_gate", &moe_fused_gate);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, moe_fused_gate);

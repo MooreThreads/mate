@@ -1,5 +1,5 @@
+import functools
 import torch
-import mate._C  # noqa: F401
 from typing import Tuple, Optional
 from mate.api_logging import mate_api
 from mate.gemm import (
@@ -11,6 +11,23 @@ from mate.gemm import (
     gemm_fp8_nt_groupwise,
     ragged_k_moe_gemm_8bit,
 )
+from mate.jit.deep_gemm_attention import get_deep_gemm_attention_module
+from mate.jit.runtime import ffi_to_torch
+
+
+@functools.cache
+def _get_module():
+    return get_deep_gemm_attention_module()
+
+
+def _resolve_num_mps(device: torch.device, num_mps: int) -> int:
+    if num_mps > 0:
+        return num_mps
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.musa.current_device()
+    return torch.musa.get_device_properties(device_index).multi_processor_count
 
 
 def m_grouped_bf16_gemm_nt_contiguous(
@@ -65,7 +82,9 @@ def m_grouped_fp8_gemm_nt_contiguous(
     if not disable_ue8m0_cast:
         raise Exception("m_grouped_fp8_gemm_nt_contiguous UE8M0 cast is not supported!")
 
-    ragged_m_moe_gemm_8bit(a, b, m_indices, d, scale_granularity_mnk=recipe, alignment_m=alignment_m)
+    ragged_m_moe_gemm_8bit(
+        a, b, m_indices, d, scale_granularity_mnk=recipe, alignment_m=alignment_m
+    )
 
 
 def m_grouped_fp8_gemm_nt_masked(
@@ -96,6 +115,7 @@ def m_grouped_fp8_gemm_nt_masked(
 
     return res[2:] if enable_overlap else None
 
+
 def k_grouped_fp8_gemm_tn_contiguous(
     a: Tuple[torch.Tensor, torch.Tensor],
     b: Tuple[torch.Tensor, torch.Tensor],
@@ -105,21 +125,21 @@ def k_grouped_fp8_gemm_tn_contiguous(
     recipe: Optional[Tuple[int, int, int]] = None,
     compiled_dims: str = "nk",
 ):
-    
     if ks_tensor is None:
         if ks is None:
             raise Exception("Must give the ks whether on host or device!")
         ks_tensor = torch.tensor(ks, device="musa", dtype=torch.int32)
-    
-    res = ragged_k_moe_gemm_8bit(
+
+    ragged_k_moe_gemm_8bit(
         a,
         b,
         ks_tensor,
         d,
-        scale_granularity_mnk = recipe,
+        scale_granularity_mnk=recipe,
     )
 
     return d
+
 
 def k_grouped_bf16_gemm_tn_contiguous(
     a: torch.Tensor,
@@ -129,13 +149,12 @@ def k_grouped_bf16_gemm_tn_contiguous(
     ks_tensor: Optional[torch.Tensor] = None,
     compiled_dims: str = "nk",
 ):
-    
     if ks_tensor is None:
         if ks is None:
             raise Exception("Must give the ks whether on host or device!")
         ks_tensor = torch.tensor(ks, device="musa", dtype=torch.int32)
 
-    res = ragged_k_moe_gemm_16bit(
+    ragged_k_moe_gemm_16bit(
         a,
         b,
         ks_tensor,
@@ -143,6 +162,7 @@ def k_grouped_bf16_gemm_tn_contiguous(
     )
 
     return d
+
 
 # legacy deepgemm api
 fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
@@ -185,7 +205,14 @@ def get_paged_mqa_logits_metadata(
     Tensor
         Schedule metadata, shape ``(num_mps + 1, 2)``
     """
-    return torch.ops.mate.get_paged_mqa_logits_metadata(context_lens, block_kv, num_mps)
+    num_mps = _resolve_num_mps(context_lens.device, num_mps)
+    schedule_meta = torch.empty(
+        (num_mps + 1, 2), device=context_lens.device, dtype=torch.int32
+    )
+    _get_module().get_function("get_paged_mqa_logits_metadata")(
+        context_lens, block_kv, schedule_meta
+    )
+    return schedule_meta
 
 
 @mate_api
@@ -237,15 +264,17 @@ def fp8_paged_mqa_logits(
     Tensor
         FP32 logits, shape ``(batch_size * next_n, max_context_len)``
     """
-    return torch.ops.mate.fp8_paged_mqa_logits(
-        q,
-        fused_kv_cache,
-        weights,
-        context_lens,
-        block_table,
-        schedule_meta,
-        max_context_len,
-        clean_logits,
+    return ffi_to_torch(
+        _get_module().get_function("fp8_paged_mqa_logits")(
+            q,
+            fused_kv_cache,
+            weights,
+            context_lens,
+            block_table,
+            schedule_meta,
+            max_context_len,
+            clean_logits,
+        )
     )
 
 
@@ -302,13 +331,15 @@ def fp8_mqa_logits(
     kv_fp8, kv_scale = kv
     if max_seqlen_k > 0 and clean_logits:
         raise ValueError("max_seq_len_k is not supported with clean_logits")
-    return torch.ops.mate.fp8_mqa_logits(
-        q,
-        kv_fp8,
-        weights,
-        cu_seq_len_k_start,
-        cu_seq_len_k_end,
-        kv_scale,
-        clean_logits,
-        int(max_seqlen_k),
+    return ffi_to_torch(
+        _get_module().get_function("fp8_mqa_logits")(
+            q,
+            kv_fp8,
+            weights,
+            cu_seq_len_k_start,
+            cu_seq_len_k_end,
+            kv_scale,
+            clean_logits,
+            int(max_seqlen_k),
+        )
     )

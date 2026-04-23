@@ -1,10 +1,22 @@
+import functools
 import torch
-import mate._C  # noqa: F401
-from typing import Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple
 
 from mate.api_logging import mate_api
+from .jit.flash_attention_ops import get_flash_attention_ops_module
+from .jit.mla_ops import get_mla_ops_module
 from .jit.attention.fmha import _fmha_get_metadata as jit_fmha_get_metadata  # noqa: F401
 from .jit.attention.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
+
+
+@functools.cache
+def _get_flash_attention_ops():
+    return get_flash_attention_ops_module()
+
+
+@functools.cache
+def _get_mla_ops():
+    return get_mla_ops_module()
 
 
 def _check_valid_asm_input(
@@ -15,6 +27,7 @@ def _check_valid_asm_input(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    page_table,
     seqused_q,
     seqused_k,
     window_size,
@@ -46,12 +59,14 @@ def _check_valid_asm_input(
 
     enable_mubin &= is_192_128 or is_128_128_or_less
 
+    enable_mubin &= page_table is None
+
     enable_mubin &= seqused_q is None
     enable_mubin &= seqused_k is None
 
     window_size_left, window_size_right = window_size
     enable_mubin &= window_size_left is None or window_size_left < 0
-    enable_mubin &= window_size_right is None or window_size_right < 0
+    enable_mubin &= window_size_right is None or window_size_right <= 0
 
     enable_mubin &= learnable_sink is None
 
@@ -91,6 +106,47 @@ def _check_valid_asm_input(
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _allocate_mla_decode_outputs(q: torch.Tensor, head_dim_v: int):
+    if q.dim() == 4:
+        out = torch.empty(
+            (*q.shape[:-1], head_dim_v),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        softmax_lse = torch.empty(
+            q.shape[:-1],
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        out = torch.empty(
+            (q.shape[0], q.shape[1], head_dim_v),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        softmax_lse = torch.empty(
+            (q.shape[1], q.shape[0]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    return out, softmax_lse
+
+
+def _prepare_mla_query_input(
+    x: torch.Tensor, *, require_seq_dense: bool
+) -> torch.Tensor:
+    # Match Python-side materialization to the exact MLA backend stride contract.
+    if x.stride(-1) != 1:
+        return x.contiguous()
+    if require_seq_dense and x.dim() == 4:
+        if x.stride(1) != x.shape[-2] * x.stride(2):
+            return x.contiguous()
+    if require_seq_dense and x.dim() == 3:
+        if x.stride(0) != x.shape[-2] * x.stride(1):
+            return x.contiguous()
+    return x
 
 
 def _flash_attn_forward(
@@ -217,7 +273,7 @@ def _flash_attn_varlen_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d = torch.ops.mate.dnn_mha_varlen_bwd(
+    _get_flash_attention_ops().get_function("dnn_mha_varlen_bwd")(
         dout,
         q,
         k,
@@ -243,8 +299,6 @@ def _flash_attn_varlen_backward(
         None,
         None,
     )
-    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
     return None
 
 
@@ -261,28 +315,33 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_k: Optional[int] = None,
         seqused_q: Optional[torch.Tensor] = None,
         seqused_k: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         qv: Optional[torch.Tensor] = None,
         q_descale: Optional[torch.Tensor] = None,
         k_descale: Optional[torch.Tensor] = None,
         v_descale: Optional[torch.Tensor] = None,
-        window_size: Tuple = (-1, -1),
+        window_size: Union[Tuple, List, None] = (-1, -1),
         learnable_sink: Optional[torch.Tensor] = None,
-        attention_chunk: int = 0,
+        attention_chunk: Optional[int] = 0,
         softcap: float = 0.0,
         scheduler_metadata: Optional[torch.Tensor] = None,
         num_splits: int = -1,
         pack_gqa=None,
         deterministic: bool = False,
         sm_margin=0,
-        return_attn_probs: bool = False,
         return_softmax_lse: bool = False,
         backend: str = "auto",  # "auto", "mutlass", "mubin"
         cp_world_size: int = 1,
         cp_rank: int = 0,
         cp_tot_seqused_k: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
     ):
+        if window_size is None:
+            window_size = (-1, -1)
+        if attention_chunk is None:
+            attention_chunk = 0
         select_backend = backend
         if select_backend == "auto":
             enable_mubin = _check_valid_asm_input(
@@ -293,6 +352,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
+                page_table=page_table,
                 seqused_q=seqused_q,
                 seqused_k=seqused_k,
                 window_size=window_size,
@@ -320,7 +380,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 k_new=None,
                 v_new=None,
                 qv=qv,
-                out=None,
+                out=out,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 cu_seqlens_k_new=None,
@@ -328,7 +388,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 seqused_k=seqused_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                page_table=None,
+                page_table=page_table,
                 kv_batch_idx=None,
                 leftpad_k=None,
                 rotary_cos=None,
@@ -365,6 +425,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
             assert learnable_sink is None
 
+            assert page_table is None
+
             if is_varlen:
                 assert cu_seqlens_q is not None
                 assert cu_seqlens_k is not None
@@ -374,9 +436,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 total_seqlen, nr_heads, _ = q.shape
                 headdim_v = v.shape[-1]
 
-                out = torch.empty(
-                    (total_seqlen, nr_heads, headdim_v), dtype=q.dtype, device=q.device
-                )
+                if out is None:
+                    out = torch.empty(
+                        (total_seqlen, nr_heads, headdim_v),
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
 
                 batch = cu_seqlens_q.shape[0] - 1
                 softmax_lse = torch.empty(
@@ -391,15 +456,18 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 batch, seq_q, nr_heads, _ = q.shape
                 headdim_v = v.shape[-1]
 
-                out = torch.empty(
-                    (batch, seq_q, nr_heads, headdim_v), dtype=q.dtype, device=q.device
-                )
+                if out is None:
+                    out = torch.empty(
+                        (batch, seq_q, nr_heads, headdim_v),
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
 
                 softmax_lse = torch.empty(
                     (batch, nr_heads, seq_q), dtype=torch.float32, device=q.device
                 )
 
-            out, softmax_lse = torch.ops.mate.flash_atten_varlen_asm(
+            _get_flash_attention_ops().get_function("flash_atten_varlen_asm")(
                 q,
                 k,
                 v,
@@ -429,7 +497,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap = softcap
             ctx.deterministic = deterministic
 
-        should_return_lse = return_attn_probs or return_softmax_lse
+        should_return_lse = return_softmax_lse
 
         return (out, softmax_lse) if should_return_lse else out
 
@@ -488,13 +556,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             rng_state=None,
         )
-        dq = dq[..., : dout.shape[-1]]
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        # dq = dq[..., : dout.shape[-1]]
+        # dk = dk[..., : dout.shape[-1]]
+        # dv = dv[..., : dout.shape[-1]]
         return (
             dq,
             dk,
             dv,
+            None,
             None,
             None,
             None,
@@ -536,27 +605,28 @@ def flash_attn_varlen_func(
     max_seqlen_k: Optional[int] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     qv: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
-    window_size: Tuple = (-1, -1),
+    window_size: Union[Tuple, List, None] = (-1, -1),
     learnable_sink: Optional[torch.Tensor] = None,
-    attention_chunk: int = 0,
+    attention_chunk: Optional[int] = 0,
     softcap: float = 0.0,
     scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: int = 0,
     pack_gqa=None,
     deterministic: bool = False,
     sm_margin=0,
-    return_attn_probs: bool = False,
     return_softmax_lse: bool = False,
     backend: str = "auto",  # "auto", "mutlass", "mubin"
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     r"""
     FlashAttention3 compaitible API: forward with varlen or non-varlen inputs
@@ -602,11 +672,8 @@ def flash_attn_varlen_func(
 
         ``logits = softcap * tanh(logits / softcap)`` before the softmax.
         0.0 (default) disables softcapping.
-    return_attn_probs: bool
-        Whether to return the logsumexp of the attention scores.
     return_softmax_lse: bool
         Whether to return the logsumexp of the attention scores.
-        Same as :attr:`return_attn_probs`. Some frameworks (e.g. SGLang) use this name.
 
     backend: str
         The backend to use. It's recommend to use the default ``auto``.
@@ -626,9 +693,9 @@ def flash_attn_varlen_func(
     Returns
     -------
     Union[Tensor, Tuple[Tensor, Tensor]]
-        If :attr:`return_attn_probs` is ``False``, the attention output, shape ``(total_q, nheads, headdim_v)``
+        If :attr:`return_softmax_lse` is ``False``, the attention output, shape ``(total_q, nheads, headdim_v)``
 
-        If :attr:`return_attn_probs` is ``True``, a tuple of two tensors:
+        If :attr:`return_softmax_lse` is ``True``, a tuple of two tensors:
 
         * The attention output, shape ``(total_q, nheads, headdim_v)``
         * The log sum exp value, shape ``(nheads, total_q)``
@@ -644,6 +711,7 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         seqused_q,
         seqused_k,
+        page_table,
         softmax_scale,
         causal,
         qv,
@@ -659,12 +727,12 @@ def flash_attn_varlen_func(
         pack_gqa,
         deterministic,
         sm_margin,
-        return_attn_probs,
         return_softmax_lse,
         backend,
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        out,
     )
 
 
@@ -691,9 +759,12 @@ def flash_attn_with_kvcache(
     v_descale: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    window_size: Tuple = (-1, -1),  # -1 means infinite context window
+    window_size: Union[Tuple, List, None] = (
+        -1,
+        -1,
+    ),  # -1 means infinite context window
     learnable_sink: Optional[torch.Tensor] = None,
-    attention_chunk: int = 0,
+    attention_chunk: Optional[int] = 0,
     softcap: float = 0.0,  # 0.0 means deactivated
     rotary_interleaved: bool = True,
     scheduler_metadata: Optional[torch.Tensor] = None,
@@ -721,14 +792,15 @@ def flash_attn_with_kvcache(
         or ``(num_blocks, page_block_size, nheads_k, headdim_v)`` if there's a page_table (i.e. paged KV cache)
 
     k : Optional[Tensor]
-        The key tensor with shape ``(batch_size, seqlen_new, nheads_k, headdim)``. If not None, we concatenate
-        k with k_cache, starting at the indices specified by cache_seqlens.
+        The key tensor with shape ``(batch_size, seqlen_new, nheads_k, headdim)`` if cu_seqlens_k_new is None,
+        or ``(total_k_new, nheads_k, headdim)`` if cu_seqlens_k_new is not None.
+        If k is not None, we concatenate k with k_cache, starting at the indices specified by cache_seqlens.
 
-        *Not supported now.*
     v : Optional[Tensor]
-        The value tensor with shape ``(batch_size, seqlen_new, nheads_k, headdim_v)``. Similar to k.
+        The value tensor with shape ``(batch_size, seqlen_new, nheads_k, headdim_v)`` if cu_seqlens_k_new is None.
+        or ``(total_k_new, nheads_k, headdim_v)`` if cu_seqlens_k_new is not None.
+        Similar to k.
 
-        *Not supported now.*
     rotary_cos: Optional[Tensor]
         Tensor with shape ``(seqlen_ro, rotary_dim / 2)``. If not None, we apply rotary embedding to k and q.
         Only applicable if k and v are passed in. rotary_dim must be divisible by 16.
@@ -740,6 +812,7 @@ def flash_attn_with_kvcache(
         *Not supported now.*
     cache_seqlens: Union[int, Tensor]
         The sequence lengths of the KV cache, shape ``(batch_size)`` if it is tensor.
+
     cache_batch_idx: Optional[Tensor]
         The indices used to index into the KV cache, shape ``(batch_size)``.
         If the indices are not distinct, and k and v are provided, the values updated in the cache might come from any of the duplicate indices.
@@ -752,14 +825,12 @@ def flash_attn_with_kvcache(
     page_table: Optional[Tensor]
         The page table tensor with shape ``(batch_size, max_num_blocks_per_seq)``
 
-        *Must provide now.*
     cu_seqlens_q: Optional[Tensor]
         The cumulative sequence lengths of the query, shape ``(batch_size + 1)``.
 
     cu_seqlens_k_new: Optional[Tensor]
         The cumulative sequence lengths of the new KV, shape ``(batch_size + 1)``.
 
-        *Not supported now.*
     softmax_scale: Optional[float]
         The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
     causal: bool
@@ -778,6 +849,8 @@ def flash_attn_with_kvcache(
         If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
         rotary embedding will combine dimensions 0 & rotary_dim / 2, 1 & rotary_dim / 2 + 1
         (i.e. GPT-NeoX style).
+
+        *Not supported now.*
     num_splits: int
         If > 1, split the key/value into this many chunks along the sequence.
         If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
@@ -814,6 +887,10 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    if window_size is None:
+        window_size = (-1, -1)
+    if attention_chunk is None:
+        attention_chunk = 0
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
@@ -827,9 +904,16 @@ def flash_attn_with_kvcache(
     is_mla_decode = qv is not None and qv.shape[-1] == 512 and q.shape[-1] == 64
 
     if is_mla_decode:
-        out, softmax_lse, *rest = torch.ops.mate.dispatch_mla_impl_for_fa_interface(
-            qv,
-            q,
+        mla_qv = qv
+        mla_q = q
+        use_flash_mla_asm = mla_qv.shape[-2] == 128
+        require_seq_dense = not use_flash_mla_asm
+        mla_qv = _prepare_mla_query_input(mla_qv, require_seq_dense=require_seq_dense)
+        mla_q = _prepare_mla_query_input(mla_q, require_seq_dense=require_seq_dense)
+        out, softmax_lse = _allocate_mla_decode_outputs(mla_q, mla_qv.shape[-1])
+        _get_mla_ops().get_function("dispatch_mla_impl_for_fa_interface")(
+            mla_qv,
+            mla_q,
             v_cache,
             k_cache,
             cache_seqlens,
@@ -838,16 +922,19 @@ def flash_attn_with_kvcache(
             causal,
             cu_seqlens_q,
             max_seqlen_q,
+            out,
+            softmax_lse,
             scheduler_metadata[0] if scheduler_metadata is not None else None,
             scheduler_metadata[1] if scheduler_metadata is not None else False,
         )
+        rest = []
     else:
         out, softmax_lse, *rest = jit_fmha_fwd(
             q=q,
             k=k_cache,
             v=v_cache,
-            k_new=None,
-            v_new=None,
+            k_new=k,
+            v_new=v,
             q_v=qv,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=None,
@@ -922,6 +1009,7 @@ def get_scheduler_metadata(
         batch_size=batch_size,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        max_seqlen_k_new=max_seqlen_k_new,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         headdim=headdim,
@@ -934,5 +1022,6 @@ def get_scheduler_metadata(
         num_splits=num_splits,
         packgqa=pack_gqa,
         mp_margin=mp_margin,
+        cu_seqlens_k_new=cu_seqlens_k_new,
     )
     return scheduler_metadata

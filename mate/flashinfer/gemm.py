@@ -23,7 +23,12 @@ def group_deepgemm_fp8_nt_groupwise(
         out = torch.empty((m, n), dtype=out_dtype, device=a.device)
 
     return ragged_m_moe_gemm_8bit(
-        (a, a_scale), (b, b_scale), m_indices, out, scale_granularity_mnk=scale_granularity_mnk, alignment_m=alignment_m
+        (a, a_scale),
+        (b, b_scale),
+        m_indices,
+        out,
+        scale_granularity_mnk=scale_granularity_mnk,
+        alignment_m=alignment_m,
     )
 
 

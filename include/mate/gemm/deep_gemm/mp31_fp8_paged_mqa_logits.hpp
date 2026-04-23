@@ -3,11 +3,11 @@
 
 #include <mutlass/mutlass.h>
 
-#include <collective/fmha_common.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
 
 #include "../../common/mma_mp31_sqmma.hpp"
+#include "mate/attention/fmha/utils.hpp"
 
 namespace mate::deep_gemm {
 
@@ -449,7 +449,7 @@ struct Mp31Fp8PagedMqaLogits {
       TiledMma tiled_mma;
       auto     thr_mma = tiled_mma.get_thread_slice(thread_idx_in_warp_squad);
 
-      constexpr int reduction_target = size(mutlass::fmha::collective::reduction_target_n(tiled_mma));
+      constexpr int reduction_target = size(mate::attention::fmha::reduction_target_n(tiled_mma));
 
       Tensor weights = make_tensor<float>(Shape<Int<NextN>, Int<NumHeads / reduction_target>>{});
 
@@ -472,9 +472,8 @@ struct Mp31Fp8PagedMqaLogits {
       const auto& base_v_offset   = lane_idx / 8;
 
       while (scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)) {
-        Tensor accum = partition_fragment_C(TiledMma{}, take<0, 2>(TileShape{}));
-        Tensor accum_mn =
-            make_tensor(accum.data(), mutlass::fmha::collective::layout_acc_mn(tiled_mma, accum.layout()));
+        Tensor accum    = partition_fragment_C(TiledMma{}, take<0, 2>(TileShape{}));
+        Tensor accum_mn = make_tensor(accum.data(), mate::attention::fmha::layout_acc_mn(tiled_mma, accum.layout()));
 
         clear(accum);
 

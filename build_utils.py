@@ -86,29 +86,13 @@ def get_git_short_commit(cwd: Optional[Path] = None) -> Optional[str]:
         return None
 
 
-def get_torch_version_suffix() -> str:
-    """Get torch version suffix for wheel name.
-
-    Returns:
-        Torch version string like "torch2.7" or "torch-unknown".
-    """
-    try:
-        import torch
-
-        ver = torch.__version__.split("+")[0]  # Remove local version if present
-        major, minor = ver.split(".")[:2]
-        return f"torch{major}.{minor}"
-    except Exception:
-        return "torch-unknown"
-
-
 def build_version_string(
     base_version: str,
     cwd: Optional[Path] = None,
     dev_suffix: str = "",
     local_version: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Build full version string with torch info (git version separate).
+    """Build full version string with MUSA info (git version separate).
 
     Args:
         base_version: Base version from version.txt (e.g., "0.1.2")
@@ -118,7 +102,7 @@ def build_version_string(
 
     Returns:
         Tuple of (full_version, git_version)
-        - full_version: e.g., "0.1.2+torch2.7" (no git commit in package name)
+        - full_version: e.g., "0.1.2+mu436" (no git commit in package name)
         - git_version: full git commit hash for CLI display
     """
     version = base_version
@@ -130,17 +114,14 @@ def build_version_string(
     # Get git version (full hash for metadata/CLI display)
     git_version = get_git_version(cwd=cwd)
 
-    # Build local version parts (use '.' as separator per PEP 440)
-    # Note: git commit is NOT included in package name, only torch and musa version
+    # Build local version parts.
+    # Note: git commit is NOT included in package name. The wheel local suffix
+    # still carries the MUSA SDK version plus any explicit local suffix.
     local_parts = []
 
     # Add MUSA version
     musa_suffix = get_musa_version_suffix()
     local_parts.append(musa_suffix)
-
-    # Add torch version
-    torch_suffix = get_torch_version_suffix()
-    local_parts.append(torch_suffix)
 
     # Append additional local version suffix if available
     if local_version:

@@ -121,7 +121,7 @@ struct FmhaFwdParams {
   int* __restrict__ seqlens_rotary;
 
   // The indices to index into the KV cache.
-  int* __restrict__ kv_batch_idx;
+  uint32_t* __restrict__ kv_batch_idx;
 
   // Learnable Sink
   void* __restrict__ learnable_sink_ptr;

@@ -8,7 +8,7 @@
 
 #include "mate/attention/fmha/fmha.hpp"
 #include "mate/attention/fmha/metadata.hpp"
-#include "mate_utils.muh"
+#include "mate_utils.hpp"
 
 using namespace mute;
 using namespace tvm;
@@ -21,10 +21,12 @@ void {{ func_name }} (
   int headdim_v,
   int max_seqlen_q,
   int max_seqlen_k,
+  int max_seqlen_k_new,
   ffi::Optional<ffi::TensorView> cu_seqlens_q,
   ffi::Optional<ffi::TensorView> cu_seqlens_k,
   ffi::Optional<ffi::TensorView> seqused_q,
   ffi::Optional<ffi::TensorView> seqused_k,
+  ffi::Optional<ffi::TensorView> cu_seqlens_k_new,
   ffi::TensorView num_splits_dynamic,
   ffi::TensorView batch_table,
   ffi::TensorView num_m_blocks,
@@ -48,6 +50,7 @@ void {{ func_name }} (
 
   int const seqlen_q = static_cast<int>(max_seqlen_q);
   int const seqlen_k = static_cast<int>(max_seqlen_k);
+  int const seqlen_k_new = static_cast<int>(max_seqlen_k_new);
   int mp_count = mutlass::KernelHardwareInfo::query_device_multiprocessor_count();
   int num_mp = mp_count - mp_margin;
 
@@ -72,12 +75,14 @@ void {{ func_name }} (
     .b = batch_size,
     .seqlen_q = seqlen_q,
     .seqlen_k = seqlen_k,
+    .seqlen_knew = seqlen_k_new,
     .d = headdim,
     .dv = headdim_v,
 
     // Ragged params
     .cu_seqlens_q = HasCuseqlensQ ? static_cast<uint32_t*>(cu_seqlens_q.value().data_ptr()) : nullptr,
     .cu_seqlens_k = HasCuseqlensK ? static_cast<uint32_t*>(cu_seqlens_k.value().data_ptr()) : nullptr,
+    .cu_seqlens_knew = HasCuseqlensKNew ? static_cast<uint32_t*>(cu_seqlens_k_new.value().data_ptr()) : nullptr,
     .seqused_q = HasSequsedQ ? static_cast<uint32_t*>(seqused_q.value().data_ptr()) : nullptr,
     .seqused_k = HasSequsedK ? static_cast<uint32_t*>(seqused_k.value().data_ptr()) : nullptr,
 
@@ -110,7 +115,7 @@ void {{ func_name }} (
     HasCuseqlensK, HasSequsedK,
     HasCuseqlensKNew, HasLeftpadK
   ><<<num_ctas, num_threads, 0, stream>>>(
-    params.seqlen_q, params.seqlen_k, 0,
+    params.seqlen_q, params.seqlen_k, params.seqlen_knew,
     params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
     params.seqused_q, params.seqused_k, params.leftpad_k,
     params.b, !IsPackGQA ? params.h : params.h_k, HeadRatio,

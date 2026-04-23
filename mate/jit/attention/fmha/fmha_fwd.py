@@ -1,37 +1,90 @@
-import pathlib
+import functools
+from pathlib import Path
 import torch
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping, Sequence
 import math
-
-import tvm_ffi.cpp
 
 import hashlib
 import json
 
 from ... import env as jit_env
-from .fmha_utils import fmha_template_env, _get_fwd_kernel_config, ceil_div
+from ...core import JitSpec, gen_jit_spec
+from .fmha_utils import (
+    FMHA_EXTRA_CUDA_CFLAGS,
+    _get_fwd_kernel_config,
+    ceil_div,
+    fmha_extra_include_paths,
+    get_fmha_template,
+)
 from .fmha_combine import _fmha_fwd_combine
 from ...utils import (
     dtype_torch2mutlass_map,
     maybe_contiguous,
     TVM_HEADER,
     EXPORT_FUNC,
-    update_aot_mod,
 )
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
 
 
-kern_fwd = fmha_template_env.get_template("fwd_kern.j2")
+kern_fwd = get_fmha_template("fwd_kern.j2")
 
 
-def _fmha_fwd_encode(config_tuple: tuple) -> str:
-    config = dict(config_tuple)
+def _resolve_mask(
+    seqlen_q,
+    seqlen_k,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    attention_chunk=0,
+):
+    if window_size_left is None or window_size_left >= seqlen_k - 1:
+        window_size_left = -1
+    if window_size_right is None or window_size_right >= seqlen_q - 1:
+        window_size_right = -1
+
+    if is_causal:
+        window_size_right = 0
+
+    is_causal = window_size_left < 0 and window_size_right == 0 and attention_chunk == 0
+    is_local = (
+        window_size_left >= 0 or window_size_right >= 0 or attention_chunk >= 1
+    ) and not is_causal
+
+    # chunk
+    if window_size_left < 0:
+        window_size_left = seqlen_k - 1
+    if window_size_right < 0:
+        window_size_right = seqlen_q - 1
+    if attention_chunk > 0:
+        window_size_left = min(window_size_left, attention_chunk - 1)
+        window_size_right = min(window_size_right, attention_chunk - 1)
+
+    return is_causal, is_local, window_size_left, window_size_right
+
+
+def _fmha_fwd_encode(config: Mapping[str, object]) -> str:
     uri = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     return f"fmha_fwd_{uri}"
 
 
-# module cache: dispatch_name -> compiled module
-_FMHA_FWD_MOD_CACHE: Dict[str, Any] = {}
+def _render_fmha_fwd_source(config: Mapping[str, object]) -> str:
+    render_config = dict(config)
+    render_config["func_name"] = str(
+        render_config.get("func_name") or _fmha_fwd_encode(render_config)
+    )
+    return (
+        TVM_HEADER + kern_fwd.render(render_config) + EXPORT_FUNC.render(render_config)
+    )
+
+
+@functools.cache
+def _load_fmha_fwd_module(frozen_config: tuple[tuple[str, object], ...]):
+    return gen_fmha_fwd_spec(dict(frozen_config)).build_and_load()
+
+
+def _fmha_fwd_module(config: Mapping[str, object]):
+    dispatch_name = _fmha_fwd_encode(config)
+    return dispatch_name, _load_fmha_fwd_module(tuple(sorted(config.items())))
 
 
 def config_selector(cfg):
@@ -57,13 +110,16 @@ CONFIG_TABLE: Dict[int, Dict[str, Any]] = {
         "headdim": [(128, 128), (192, 128), (256, 256)],
         "head_ratio": [1, 4, 5, 8, 12, 16],
         "mode_q": ["ragged"],
-        "mode_k": ["ragged", "padded"],
+        "mode_k": ["normal", "ragged", "padded"],
         "mode_mask": ["none", "causal", "local"],
         "is_packgqa": [False, True],
         "has_metadata": [False, True],
         "has_cu_seqlens_k_new": [False],
         "has_leftpad_k": [False],
         "has_softcap": [False, True],
+        "paged_kv": [False, True],
+        "has_learnable_sink": [False, True],
+        "enable_cp": [False, True],
     },
 }
 
@@ -127,13 +183,25 @@ mode_k = [
         meaningful_if=lambda cfg: bool(cfg["paged_kv"]),
         depends_on=("paged_kv",),
     ),
-    ParamSpec(  # NOTE:  Change me when supported.
+    ParamSpec(
+        name="is_append_kv",  # AppendKV not in AOT
+        domain=[False],
+        default=False,
+    ),
+    ParamSpec(
         name="has_cu_seqlens_k_new",
+        domain=[False],
+        default=False,
+        meaningful_if=lambda cfg: bool(cfg["is_append_kv"]),
+        depends_on=("is_append_kv",),
+    ),
+    ParamSpec(  # NOTE:  Change me when supported.
+        name="has_leftpad_k",
         domain=[False],
         default=False,
     ),
     ParamSpec(  # NOTE:  Change me when supported.
-        name="has_leftpad_k",
+        name="has_kv_batch_idx",
         domain=[False],
         default=False,
     ),
@@ -338,38 +406,31 @@ def _gen_specs_from_config(cfg_level: int):
     specs.extend(config)
 
     config_graph = KernelConfigGraph(specs)
-    aot_fwd_configs = config_graph.resolve_and_expand()
-
-    return aot_fwd_configs
+    return config_graph.resolve_and_expand()
 
 
-def _get_aot_configs():
-    cfg_level_key = "attention.fmha.fwd".split(".")
-    try:
-        aot_level_file = pathlib.Path(__file__).parents[2] / "aot-levels.json"
-        with open(aot_level_file.resolve(), "r") as f:
-            config_level = json.load(f)
-        for key in cfg_level_key:
-            config_level = config_level[key]
-    except FileNotFoundError:
-        # Default to 0 if file doesn't exist
-        config_level = 0
-
+def get_fmha_fwd_aot_configs(config_level: int) -> list[dict[str, object]]:
     if config_level == 0:
         return []
+    if config_level not in CONFIG_TABLE:
+        raise ValueError(f"Unsupported FMHA fwd AOT level: {config_level}")
+    return _gen_specs_from_config(config_level)
 
-    configs = _gen_specs_from_config(config_level)
 
-    return configs
+def gen_fmha_fwd_spec(config: Mapping[str, object]) -> JitSpec:
+    dispatch_name = _fmha_fwd_encode(config)
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        name=dispatch_name,
+        sources=[source_file],
+        generated_sources={source_file: _render_fmha_fwd_source(config)},
+        extra_cuda_cflags=list(FMHA_EXTRA_CUDA_CFLAGS),
+        extra_include_paths=fmha_extra_include_paths(),
+    )
 
 
-aot_fwd_configs = _get_aot_configs()
-update_aot_mod(
-    aot_fwd_configs,
-    _fmha_fwd_encode,
-    jit_env.MATE_AOT_DIR / "fmha_fwd_aot.so",
-    _FMHA_FWD_MOD_CACHE,
-)
+def gen_fmha_fwd_specs(configs: Sequence[Mapping[str, object]]) -> list[JitSpec]:
+    return [gen_fmha_fwd_spec(config) for config in configs]
 
 
 def _fmha_fwd(
@@ -415,15 +476,24 @@ def _fmha_fwd(
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
 ):
-    assert k_new is None, "k_new parameter is not supported yet"
-    assert kv_batch_idx is None, "kv_batch_idx parameter is not supported yet"
+    # Feature gates.
     assert leftpad_k is None, "leftpad_k parameter is not supported yet"
     assert rotary_cos is None, "rotary_cos parameter is not supported yet"
     assert q_v is None, "qv parameter is not supported yet"
     assert attention_chunk == 0, "attention_chunk parameter is not supported yet"
+    assert not ((k_new is None) ^ (v_new is None)), (
+        "k_new and v_new must be provided together"
+    )
 
+    # Canonicalize tensor layout before deriving runtime metadata.
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    if k_new is not None:
+        k_new, v_new = [maybe_contiguous(t) for t in (k_new, v_new)]
+
+    # Infer runtime shape metadata.
     num_head, head_dim = q.shape[-2:]
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
 
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -436,32 +506,95 @@ def _fmha_fwd(
         total_q = q.shape[0]
 
     if page_table is not None:
+        max_num_pages_per_seq = page_table.shape[1]
+        num_pages, page_size = k.shape[:2]
+        seqlen_k = max_num_pages_per_seq * page_size
+    else:
+        num_pages, page_size = 0, 1
+        seqlen_k = k.shape[-3]
+
+    batch_size_k = (
+        page_table.shape[0]
+        if page_table is not None
+        else (k.shape[0] if cu_seqlens_k is None else cu_seqlens_k.shape[0] - 1)
+    )
+
+    # Validate device placement and dtypes.
+    assert all(
+        t is None or t.is_musa
+        for t in (
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_k_new,
+            seqused_q,
+            seqused_k,
+            page_table,
+            learnable_sink,
+            k_new,
+            v_new,
+            kv_batch_idx,
+        )
+    ), "inputs must be on MUSA device"
+
+    assert q.dtype in [torch.float16, torch.bfloat16], (
+        "inputs must be float16 or bfloat16"
+    )
+    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if k_new is not None:
+        assert k_new.dtype == q.dtype == v_new.dtype, (
+            "k_new and v_new must have the same dtype as q, k and v"
+        )
+
+    for t in [cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k]:
+        if t is not None:
+            assert t.dtype == torch.int32, (
+                "cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k must be int32"
+            )
+            assert t.stride(0) == 1, (
+                "cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k must be contiguous"
+            )
+
+    if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
         assert page_table.dtype == torch.int32, "page_table must be int32"
         assert page_table.stride(-1) == 1, "page_table must be contiguous"
-        max_num_pages_per_seq = page_table.shape[1]
-        assert page_table.shape == (batch_size, max_num_pages_per_seq)
-        num_pages, page_size = k.shape[:2]
-        seqlen_k = num_pages * page_size
-    else:
-        seqlen_k = k.shape[-3]
-        num_pages, page_size = 0, 1
 
-    num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1]
+    if kv_batch_idx is not None:
+        assert kv_batch_idx.dtype == torch.int32, "kv_batch_idx must be int32"
+        assert kv_batch_idx.shape == (batch_size,), (
+            "kv_batch_idx must have shape (batch_size,)"
+        )
+        assert kv_batch_idx.stride(0) == 1, "kv_batch_idx must be contiguous"
+
+    if learnable_sink is not None:
+        assert learnable_sink.shape == (num_head,)
+        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+
+    # Validate old-KV and append-KV layouts.
+    if kv_batch_idx is None:
+        assert batch_size_k == batch_size, (
+            "batch_size must equal batch_size_k when kv_batch_idx is None"
+        )
 
     if cu_seqlens_k is None:
         if page_table is None:
-            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+            assert k.shape == (batch_size_k, seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (batch_size_k, seqlen_k, num_head_kv, head_dim_v)
         else:
             assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
             assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
+            assert page_table.shape == (batch_size_k, max_num_pages_per_seq)
     else:
         assert k.shape == (seqlen_k, num_head_kv, head_dim)
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
+        )
+        assert kv_batch_idx is None, (
+            "kv_batch_idx is not supported when cu_seqlens_k is provided"
         )
 
     if cu_seqlens_q is not None:
@@ -476,57 +609,51 @@ def _fmha_fwd(
         "seqused_k must have shape (batch_size,)"
     )
 
-    assert q.dtype in [torch.float16, torch.bfloat16], (
-        "inputs must be float16 or bfloat16"
-    )
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
-    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
-        if t is not None:
-            assert t.dtype == torch.int32, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
+    if k_new is not None:
+        if cu_seqlens_k_new is None:
+            seqlen_k_new = k_new.shape[1]
+            assert k_new.shape == (batch_size, seqlen_k_new, num_head_kv, head_dim), (
+                "k_new must have shape (batch_size, seqlen_k_new, num_head_kv, head_dim)"
             )
-            assert t.stride(0) == 1, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
+            assert v_new.shape == (batch_size, seqlen_k_new, num_head_kv, head_dim_v), (
+                "v_new must have shape (batch_size, seqlen_k_new, num_head_kv, head_dim_v)"
+            )
+        else:
+            total_k_new = k_new.shape[0]
+            assert k_new.shape == (total_k_new, num_head_kv, head_dim), (
+                "packed k_new must have shape (total_k_new, num_head_kv, head_dim)"
+            )
+            assert v_new.shape == (total_k_new, num_head_kv, head_dim_v), (
+                "packed v_new must have shape (total_k_new, num_head_kv, head_dim_v)"
+            )
+            assert cu_seqlens_k_new.shape == (batch_size + 1,), (
+                "cu_seqlens_k_new must have shape (batch_size + 1,)"
+            )
+            assert cu_seqlens_k_new[-1].item() == total_k_new, (
+                "cu_seqlens_k_new[-1] must equal total_k_new"
             )
 
+    assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+
+    # Derive execution policy.
     if learnable_sink is not None:
-        assert learnable_sink.shape == (num_head,)
-        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
-
         # FIXME: bug learnable_sink + split
         num_splits = -1
         scheduler_metadata = None
-
-    assert all(
-        t is None or t.is_musa
-        for t in (
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            learnable_sink,
-        )
-    ), "inputs must be on MUSA device"
-
-    assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     qhead_per_kvhead = num_head // num_head_kv
 
-    local = False
-    if window_size_left is not None and window_size_right is not None:
-        if window_size_left >= 0 and window_size_right >= 0:
-            local = True
-    if is_causal:
-        local = False
-    if not local:
-        window_size_left, window_size_right = -1, -1
+    is_causal, is_local, window_size_left, window_size_right = _resolve_mask(
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        is_causal=is_causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        attention_chunk=attention_chunk,
+    )
 
     # CP sanity checks
     assert cp_world_size > 0, (
@@ -538,7 +665,7 @@ def _fmha_fwd(
     assert cp_world_size == 1 or cp_tot_seqused_k is not None, (
         "cp_tot_seqused_k must be provided when context parallelism is enabled."
     )
-    assert not (local and cp_world_size > 1), (
+    assert not (is_local and cp_world_size > 1), (
         "Local attention (sliding window) is not currently supported with context parallelism (cp_world_size > 1)."
     )
 
@@ -614,12 +741,14 @@ def _fmha_fwd(
         "has_cu_seqlens_k": cu_seqlens_k is not None,
         "has_seqused_q": seqused_q is not None,
         "has_seqused_k": seqused_k is not None,
-        "has_cu_seqlens_k_new": False,
+        "has_cu_seqlens_k_new": cu_seqlens_k_new is not None,
+        "has_kv_batch_idx": kv_batch_idx is not None,
         "has_leftpad_k": False,
         "paged_kv": page_table is not None,
         "has_softcap": softcap != 0.0,
+        "is_append_kv": k_new is not None,
         "has_learnable_sink": learnable_sink is not None,
-        "is_local": local,
+        "is_local": is_local,
         "is_causal": is_causal,
         "is_packgqa": enable_packgqa,
         "head_ratio": qhead_per_kvhead,
@@ -639,41 +768,7 @@ def _fmha_fwd(
     }
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 
-    uri = hashlib.sha256(
-        json.dumps(constexpr_dict, sort_keys=True).encode()
-    ).hexdigest()
-
-    dispatch_name = f"fmha_fwd_{uri}"
-
-    if dispatch_name in _FMHA_FWD_MOD_CACHE:
-        mod = _FMHA_FWD_MOD_CACHE[dispatch_name]
-    else:
-        constexpr_dict["func_name"] = dispatch_name
-        # print("Compiling forward kernel JIT...", flush=True)
-        mod = tvm_ffi.cpp.load_inline(
-            name="fmha_fwd",
-            cuda_sources=kern_fwd.render(constexpr_dict),
-            functions=[dispatch_name],
-            extra_include_paths=[
-                jit_env.MATE_INCLUDE_DIR.as_posix(),
-                jit_env.MATE_CSRC_DIR.as_posix(),
-                jit_env.MUTLASS_INCLUDE_DIR.as_posix(),
-            ],
-            extra_ldflags=["-lmusa"],
-            extra_cuda_cflags=[
-                "-Od3",
-                "-DNDEBUG",
-                "-fno-strict-aliasing",
-                "-fno-signed-zeros",
-                "-mllvm",
-                "-mtgpu-load-cluster-mutation=1",
-                "-mllvm",
-                "--num-dwords-of-load-in-mutation=64",
-            ],
-        )
-        _FMHA_FWD_MOD_CACHE[dispatch_name] = mod
-        # print("Done.")
-
+    dispatch_name, mod = _fmha_fwd_module(constexpr_dict)
     fmha_fwd_impl = mod.get_function(dispatch_name)
 
     accums, num_splits = fmha_fwd_impl(
@@ -737,54 +832,5 @@ def _fmha_fwd(
     return (out, lse, o_accum, lse_accum) if return_lse else (out, o_accum)
 
 
-def gen_fmha_fwd_aot(dry_run: bool = False) -> int:
-    configs = _get_aot_configs()
-
-    musa_instances = []
-    musa_set = set()
-
-    for config in configs:
-        dispatch_name = _fmha_fwd_encode(tuple(config.items()))
-        if dispatch_name in musa_set:
-            continue
-        musa_set.add(dispatch_name)
-        config["func_name"] = dispatch_name
-
-        mu_path = jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu"
-        with open(mu_path, "w") as f:
-            f.write(TVM_HEADER + kern_fwd.render(config) + EXPORT_FUNC.render(config))
-
-        musa_instances.append(mu_path)
-
-    if not musa_instances:
-        return 0
-
-    if dry_run:
-        return len(musa_instances)
-
-    print(f"MATE AOT Building {len(musa_instances)} fmha_fwd...", flush=True)
-    tvm_ffi.cpp.build(
-        name="fmha_fwd_aot",
-        cuda_files=musa_instances,
-        extra_include_paths=[
-            jit_env.MATE_INCLUDE_DIR.as_posix(),
-            jit_env.MATE_CSRC_DIR.as_posix(),
-            jit_env.MUTLASS_INCLUDE_DIR.as_posix(),
-        ],
-        extra_cuda_cflags=[
-            "-Od3",
-            "-DNDEBUG",
-            "-fno-strict-aliasing",
-            "-fno-signed-zeros",
-            "-mllvm",
-            "-mtgpu-load-cluster-mutation=1",
-            "-mllvm",
-            "--num-dwords-of-load-in-mutation=64",
-        ],
-        extra_ldflags=["-lmusa"],
-        build_directory=jit_env.MATE_AOT_DIR.as_posix(),
-    )
-    print(
-        f"MATE AOT fmha_fwd Done -> {(jit_env.MATE_AOT_DIR / 'fmha_fwd_aot.so').as_posix()}."
-    )
-    return len(musa_instances)
+def gen_fmha_fwd_aot(config_level: int = 0) -> list[JitSpec]:
+    return gen_fmha_fwd_specs(get_fmha_fwd_aot_configs(config_level))

@@ -4,22 +4,22 @@
 #include <musa_fp16.h>
 #include <musa_runtime.h>
 #include <mutlass/fast_math.h>
-#include <torch/torch.h>
-#include <torch_musa/csrc/core/MUSAGuard.h>
 
+#include <array>
+#include <cmath>
+#include <initializer_list>
 #include <optional>
 
 #include "asm_common.hpp"
-#include "mate_utils.muh"
 #include "mubin/mp31/mp31_flash_atten_registry.hpp"
-#include "torch_utils.hpp"
+#include "op_utils.hpp"
 
 namespace mate::flash_attention {
 
 struct FlashAttenASMArgs {
   bool is_causal{};
 
-  at::ScalarType data_type;
+  DLDataType data_type;
 
   int32_t num_mp{};
 
@@ -75,7 +75,7 @@ struct FlashAttenASMArgs {
 struct FlashAttenVarlenASMArgs {
   bool is_causal{};
 
-  at::ScalarType data_type;
+  DLDataType data_type;
 
   int32_t num_mp{};
 
@@ -170,7 +170,7 @@ struct FlashAttenASMDispatcher {
     id.is_causal  = static_cast<int>(args.is_causal);
     id.is_varlen  = static_cast<int>(is_varlen);
     id.headdim_qk = headdim_qk == 128 ? 0 : 1;
-    id.dtype      = args.data_type == at::kBFloat16 ? 0 : 1;
+    id.dtype      = dtype_equal(args.data_type, dl_bfloat16) ? 0 : 1;
 
     // checking if we have this kernel
     auto res = kernel_map.find(id);
@@ -306,15 +306,15 @@ class FlashAttentionAsmKernel {
     TmeDesc tensor_desc_q(mute::make_tuple(args.headdim_qk, args.seqlen_q, args.nr_heads, args.batch),
                           mute::make_tuple(args.seq_stride_q, args.head_stride_q, args.batch_stride_q),
                           args.p_q,
-                          torch_type_to_tme_type(args.data_type));
+                          dl_dtype_to_tme_type(args.data_type));
     TmeDesc tensor_desc_v(mute::make_tuple(args.headdim_v, args.seqlen_kv, args.nr_heads_kv, args.batch),
                           mute::make_tuple(args.seq_stride_v, args.head_stride_v, args.batch_stride_v),
                           args.p_v,
-                          torch_type_to_tme_type(args.data_type));
+                          dl_dtype_to_tme_type(args.data_type));
     TmeDesc tensor_desc_out(mute::make_tuple(args.headdim_v, args.seqlen_q, args.nr_heads, args.batch),
                             mute::make_tuple(args.seq_stride_out, args.head_stride_out, args.batch_stride_out),
                             args.p_output,
-                            torch_type_to_tme_type(args.data_type));
+                            dl_dtype_to_tme_type(args.data_type));
 
     params.output_ptr  = args.p_output;
     params.out_lse_ptr = args.p_lse_output;
@@ -323,7 +323,7 @@ class FlashAttentionAsmKernel {
     params.v_desc   = tensor_desc_v.desc;
     params.out_desc = tensor_desc_out.desc;
 
-    if (args.data_type == at::kHalf) {
+    if (dtype_equal(args.data_type, dl_float16)) {
       params.robust_key = mute::make_robust_desc(static_cast<mutlass::half_t*>(args.p_k), args.nr_k).reg;
     } else {
       params.robust_key = mute::make_robust_desc(static_cast<mutlass::bfloat16_t*>(args.p_k), args.nr_k).reg;
@@ -510,18 +510,18 @@ class FlashAttentionVarlenAsmKernel {
     TmeDesc tensor_desc_q(mute::make_tuple(args.headdim_qk, args.nr_heads, args.total_seqlen_q),
                           mute::make_tuple(args.head_stride_q, args.total_seqlen_stride_q),
                           args.p_q,
-                          torch_type_to_tme_type(args.data_type));
+                          dl_dtype_to_tme_type(args.data_type));
     TmeDesc tensor_desc_v(mute::make_tuple(args.headdim_v, args.nr_heads_kv, args.total_seqlen_kv),
                           mute::make_tuple(args.head_stride_v, args.total_seqlen_stride_v),
                           args.p_v,
-                          torch_type_to_tme_type(args.data_type));
+                          dl_dtype_to_tme_type(args.data_type));
 
     params.output_ptr  = args.p_output;
     params.out_lse_ptr = args.p_lse_output;
 
     params.q_desc = tensor_desc_q.desc;
     params.v_desc = tensor_desc_v.desc;
-    if (args.data_type == at::kHalf) {
+    if (dtype_equal(args.data_type, dl_float16)) {
       params.robust_key = mute::make_robust_desc(static_cast<mutlass::half_t*>(args.p_k), args.nr_k).reg;
     } else {
       params.robust_key = mute::make_robust_desc(static_cast<mutlass::bfloat16_t*>(args.p_k), args.nr_k).reg;
@@ -613,294 +613,270 @@ class FlashAttentionVarlenAsmKernel {
 
 }  // namespace mate::flash_attention
 
-std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_asm(const at::Tensor& q,
-                                                            const at::Tensor& k,
-                                                            const at::Tensor& v,
-                                                            const double      softmax_scale,
-                                                            at::Tensor&       out,
-                                                            at::Tensor&       out_lse,
-                                                            const bool        is_causal) {
-  CHECK_MP31("dispatch_flash_atten_asm");
-  at::TensorArg targs[]{{q, "q", 0}, {k, "k", 1}, {v, "v", 2}, {out, "out", 3}, {out_lse, "out_lse", 4}};
-  at::checkAllSameGPU(__func__, targs);
+void dispatch_flash_atten_asm(ffi::TensorView q,
+                              ffi::TensorView k,
+                              ffi::TensorView v,
+                              double          softmax_scale,
+                              ffi::TensorView out,
+                              ffi::TensorView out_lse,
+                              bool            is_causal) {
+  check_mp31(q.device(), "dispatch_flash_atten_asm");
 
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(q, 4);
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(k, 4);
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(v, 4);
-  CHECK_TENSOR_AND_CONTIGUOUS(out, 4);
-  CHECK_TENSOR_AND_CONTIGUOUS(out_lse, 3);
-
-  TORCH_CHECK(
-      q.scalar_type() == k.scalar_type() && k.scalar_type() == v.scalar_type() && out.scalar_type() == q.scalar_type(),
-      "dispatch_flash_atten_asm() qkv and out must have same data type!")
+  CHECK_MUSA(q);
+  CHECK_MUSA(k);
+  CHECK_MUSA(v);
+  CHECK_MUSA(out);
+  CHECK_MUSA(out_lse);
+  CHECK_DEVICE(q, k);
+  CHECK_DEVICE(q, v);
+  CHECK_DEVICE(q, out);
+  CHECK_DEVICE(q, out_lse);
+  CHECK_DIM(4, q);
+  CHECK_DIM(4, k);
+  CHECK_DIM(4, v);
+  CHECK_DIM(4, out);
+  CHECK_DIM(3, out_lse);
+  TVM_FFI_ICHECK_EQ(q.stride(-1), 1) << "q must have contiguous last dimension";
+  TVM_FFI_ICHECK_EQ(k.stride(-1), 1) << "k must have contiguous last dimension";
+  TVM_FFI_ICHECK_EQ(v.stride(-1), 1) << "v must have contiguous last dimension";
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(out_lse);
+  TVM_FFI_ICHECK(dtype_equal(q.dtype(), k.dtype()) && dtype_equal(q.dtype(), v.dtype()) &&
+                 dtype_equal(q.dtype(), out.dtype()))
+      << "q, k, v and out must have the same dtype";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(q.dtype())) << "q, k, v and out must be fp16 or bf16";
+  TVM_FFI_ICHECK(dtype_equal(out_lse.dtype(), dl_float32)) << "out_lse must be float32";
 
   using Args = mate::flash_attention::FlashAttenASMArgs;
-  Args args;
-
+  Args args{};
   args.is_causal = is_causal;
+  args.data_type = q.dtype();
 
-  args.data_type = q.scalar_type();
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(q.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(k.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(v.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(out.scalar_type()), "dispatch_flash_atten_asm() out must be half or bf16!");
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+  musaDeviceProp       dprops{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q.device().device_id));
+  args.num_mp = dprops.multiProcessorCount;
 
-  auto dprops = at::musa::getCurrentDeviceProperties();
-  args.num_mp = dprops->multiProcessorCount;
+  args.batch       = static_cast<int32_t>(q.size(0));
+  args.seqlen_q    = static_cast<int32_t>(q.size(1));
+  args.nr_heads    = static_cast<int32_t>(q.size(2));
+  args.headdim_qk  = static_cast<int32_t>(q.size(3));
+  args.seqlen_kv   = static_cast<int32_t>(k.size(1));
+  args.nr_heads_kv = static_cast<int32_t>(k.size(2));
+  args.headdim_v   = static_cast<int32_t>(v.size(3));
 
-  // shape
-  // bshd
-  args.batch      = q.size(0);
-  args.seqlen_q   = q.size(1);
-  args.nr_heads   = q.size(2);
-  args.headdim_qk = q.size(3);
+  const bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
+  const bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
+  TVM_FFI_ICHECK(is_192_128 || is_128_128_or_less) << "HeadDim unsupported";
 
-  args.seqlen_kv   = k.size(1);
-  args.nr_heads_kv = k.size(2);
+  expect_shape(q, {args.batch, args.seqlen_q, args.nr_heads, args.headdim_qk}, "q");
+  expect_shape(k, {args.batch, args.seqlen_kv, args.nr_heads_kv, args.headdim_qk}, "k");
+  expect_shape(v, {args.batch, args.seqlen_kv, args.nr_heads_kv, args.headdim_v}, "v");
+  expect_shape(out, {args.batch, args.seqlen_q, args.nr_heads, args.headdim_v}, "out");
+  expect_shape(out_lse, {args.batch, args.nr_heads, args.seqlen_q}, "out_lse");
 
-  args.headdim_v = v.size(3);
+  args.batch_stride_q   = static_cast<int32_t>(q.stride(0));
+  args.head_stride_q    = static_cast<int32_t>(q.stride(2));
+  args.seq_stride_q     = static_cast<int32_t>(q.stride(1));
+  args.batch_stride_k   = static_cast<int32_t>(k.stride(0));
+  args.head_stride_k    = static_cast<int32_t>(k.stride(2));
+  args.seq_stride_k     = static_cast<int32_t>(k.stride(1));
+  args.batch_stride_v   = static_cast<int32_t>(v.stride(0));
+  args.head_stride_v    = static_cast<int32_t>(v.stride(2));
+  args.seq_stride_v     = static_cast<int32_t>(v.stride(1));
+  args.batch_stride_out = static_cast<int32_t>(out.stride(0));
+  args.head_stride_out  = static_cast<int32_t>(out.stride(2));
+  args.seq_stride_out   = static_cast<int32_t>(out.stride(1));
 
-  bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
-  bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
-  TORCH_CHECK(is_192_128 || is_128_128_or_less, "HeadDim unsupported!");
-
-  CHECK_SHAPE(q, args.batch, args.seqlen_q, args.nr_heads, args.headdim_qk);
-  CHECK_SHAPE(k, args.batch, args.seqlen_kv, args.nr_heads_kv, args.headdim_qk);
-  CHECK_SHAPE(v, args.batch, args.seqlen_kv, args.nr_heads_kv, args.headdim_v);
-  CHECK_SHAPE(out, args.batch, args.seqlen_q, args.nr_heads, args.headdim_v);
-  CHECK_SHAPE(out_lse, args.batch, args.nr_heads, args.seqlen_q);
-
-  // stride
-  // bshd
-  args.batch_stride_q = q.stride(0);
-  args.head_stride_q  = q.stride(2);
-  args.seq_stride_q   = q.stride(1);
-
-  args.batch_stride_k = k.stride(0);
-  args.head_stride_k  = k.stride(2);
-  args.seq_stride_k   = k.stride(1);
-
-  args.batch_stride_v = v.stride(0);
-  args.head_stride_v  = v.stride(2);
-  args.seq_stride_v   = v.stride(1);
-
-  args.batch_stride_out = out.stride(0);
-  args.head_stride_out  = out.stride(2);
-  args.seq_stride_out   = out.stride(1);
-
-  args.nr_k          = k.numel();
+  args.nr_k          = static_cast<int32_t>(k.numel());
   args.softmax_scale = softmax_scale;
+  args.p_q           = q.data_ptr();
+  args.p_k           = k.data_ptr();
+  args.p_v           = v.data_ptr();
+  args.p_output      = out.data_ptr();
+  args.p_lse_output  = out_lse.data_ptr();
 
-  args.p_q = q.data_ptr();
-  args.p_k = k.data_ptr();
-  args.p_v = v.data_ptr();
-
-  args.p_output     = out.data_ptr();
-  args.p_lse_output = out_lse.data_ptr();
-
-  musaStream_t stream         = at::musa::getCurrentMUSAStream().stream();
-  int          current_device = at::musa::current_device();
-
+  musaStream_t stream                 = get_stream(q.device());
   using Kernel                        = mate::flash_attention::mubin::FlashAttentionAsmKernel<Args>;
   auto [param, config, launch_config] = Kernel::to_underlying_arguments(args, stream);
   auto kernel                         = Kernel(param, config, launch_config);
   kernel.run();
-
-  return std::make_tuple(out, out_lse);
 }
 
-std::tuple<at::Tensor, at::Tensor> dispatch_flash_atten_varlen_asm(const at::Tensor& q,
-                                                                   const at::Tensor& k,
-                                                                   const at::Tensor& v,
-                                                                   const at::Tensor& input_cu_seqlen_q,
-                                                                   const at::Tensor& input_cu_seqlen_k,
-                                                                   const int64_t     max_seqlen_q,
-                                                                   const int64_t     max_seqlen_kv,
-                                                                   const double      softmax_scale,
-                                                                   at::Tensor&       out,
-                                                                   at::Tensor&       out_lse,
-                                                                   const bool        is_causal) {
-  at::TensorArg targs[]{{q, "q", 0},
-                        {k, "k", 1},
-                        {v, "v", 2},
-                        {input_cu_seqlen_q, "input_cu_seqlen_q", 3},
-                        {input_cu_seqlen_k, "input_cu_seqlen_k", 4},
-                        {out, "out", 5},
-                        {out_lse, "out_lse", 6}};
-  at::checkAllSameGPU(__func__, targs);
-
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(q, 3);
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(k, 3);
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(v, 3);
-  CHECK_TENSOR_AND_CONTIGUOUS(out, 3);
-  CHECK_TENSOR_AND_CONTIGUOUS(out_lse, 2);
-  CHECK_TENSOR_AND_CONTIGUOUS(input_cu_seqlen_q, 1);
-  CHECK_TENSOR_AND_CONTIGUOUS(input_cu_seqlen_k, 1);
-  TORCH_CHECK(input_cu_seqlen_q.scalar_type() == at::kInt,
-              "dispatch_flash_atten_varlen_asm() input_cu_seqlen_q must be int!");
-  TORCH_CHECK(input_cu_seqlen_k.scalar_type() == at::kInt,
-              "dispatch_flash_atten_varlen_asm() input_cu_seqlen_k must be int!");
-  TORCH_CHECK(input_cu_seqlen_k.size(0) == input_cu_seqlen_q.size(0),
-              "dispatch_flash_atten_varlen_asm() input_cu_seqlen_k and input_cu_seqlen_q must have "
-              "same size!");
-  TORCH_CHECK(input_cu_seqlen_k.size(0) > 0,
-              "dispatch_flash_atten_varlen_asm() input_cu_seqlen_k len must be greater than 0!");
+void dispatch_flash_atten_varlen_asm(ffi::TensorView q,
+                                     ffi::TensorView k,
+                                     ffi::TensorView v,
+                                     ffi::TensorView input_cu_seqlen_q,
+                                     ffi::TensorView input_cu_seqlen_k,
+                                     int64_t         max_seqlen_q,
+                                     int64_t         max_seqlen_kv,
+                                     double          softmax_scale,
+                                     ffi::TensorView out,
+                                     ffi::TensorView out_lse,
+                                     bool            is_causal) {
+  CHECK_MUSA(q);
+  CHECK_MUSA(k);
+  CHECK_MUSA(v);
+  CHECK_MUSA(input_cu_seqlen_q);
+  CHECK_MUSA(input_cu_seqlen_k);
+  CHECK_MUSA(out);
+  CHECK_MUSA(out_lse);
+  CHECK_DEVICE(q, k);
+  CHECK_DEVICE(q, v);
+  CHECK_DEVICE(q, input_cu_seqlen_q);
+  CHECK_DEVICE(q, input_cu_seqlen_k);
+  CHECK_DEVICE(q, out);
+  CHECK_DEVICE(q, out_lse);
+  CHECK_DIM(3, q);
+  CHECK_DIM(3, k);
+  CHECK_DIM(3, v);
+  CHECK_DIM(1, input_cu_seqlen_q);
+  CHECK_DIM(1, input_cu_seqlen_k);
+  CHECK_DIM(3, out);
+  CHECK_DIM(2, out_lse);
+  TVM_FFI_ICHECK_EQ(q.stride(-1), 1) << "q must have contiguous last dimension";
+  TVM_FFI_ICHECK_EQ(k.stride(-1), 1) << "k must have contiguous last dimension";
+  TVM_FFI_ICHECK_EQ(v.stride(-1), 1) << "v must have contiguous last dimension";
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(out_lse);
+  CHECK_CONTIGUOUS(input_cu_seqlen_q);
+  CHECK_CONTIGUOUS(input_cu_seqlen_k);
+  TVM_FFI_ICHECK(dtype_equal(input_cu_seqlen_q.dtype(), dl_int32)) << "input_cu_seqlen_q must be int32";
+  TVM_FFI_ICHECK(dtype_equal(input_cu_seqlen_k.dtype(), dl_int32)) << "input_cu_seqlen_k must be int32";
+  TVM_FFI_ICHECK(dtype_equal(out_lse.dtype(), dl_float32)) << "out_lse must be float32";
+  TVM_FFI_ICHECK(dtype_equal(q.dtype(), k.dtype()) && dtype_equal(q.dtype(), v.dtype()) &&
+                 dtype_equal(q.dtype(), out.dtype()))
+      << "q, k, v and out must have the same dtype";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(q.dtype())) << "q, k, v and out must be fp16 or bf16";
+  TVM_FFI_ICHECK_EQ(input_cu_seqlen_k.size(0), input_cu_seqlen_q.size(0))
+      << "input_cu_seqlen_q and input_cu_seqlen_k must have the same size";
+  TVM_FFI_ICHECK_GT(input_cu_seqlen_k.size(0), 0) << "input_cu_seqlen_k must be non-empty";
+  TVM_FFI_ICHECK_GT(max_seqlen_q, 0) << "max_seqlen_q must be positive";
+  TVM_FFI_ICHECK_GT(max_seqlen_kv, 0) << "max_seqlen_kv must be positive";
 
   using Args = mate::flash_attention::FlashAttenVarlenASMArgs;
-  Args args;
-
+  Args args{};
   args.is_causal = is_causal;
+  args.data_type = q.dtype();
+  args.batch     = static_cast<int32_t>(input_cu_seqlen_q.size(0) - 1);
 
-  args.data_type = q.scalar_type();
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(q.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(k.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(v.scalar_type()), "dispatch_flash_atten_asm() qkv must be half or bf16!");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(out.scalar_type()), "dispatch_flash_atten_asm() out must be half or bf16!");
-
-  args.batch = input_cu_seqlen_q.size(0) - 1;
-
-  // bypass bs=1
   if (args.batch == 1) {
-    auto q_view       = q.unsqueeze(0);
-    auto k_view       = k.unsqueeze(0);
-    auto v_view       = v.unsqueeze(0);
-    auto out_view     = out.unsqueeze(0);
-    auto out_lse_view = out_lse.unsqueeze(0);
-    dispatch_flash_atten_asm(q_view, k_view, v_view, softmax_scale, out_view, out_lse_view, is_causal);
-    return std::make_tuple(out, out_lse);
+    std::array<int64_t, 4> q_shape{1, q.size(0), q.size(1), q.size(2)};
+    std::array<int64_t, 4> q_strides{q.size(0) * q.stride(0), q.stride(0), q.stride(1), q.stride(2)};
+    std::array<int64_t, 4> k_shape{1, k.size(0), k.size(1), k.size(2)};
+    std::array<int64_t, 4> k_strides{k.size(0) * k.stride(0), k.stride(0), k.stride(1), k.stride(2)};
+    std::array<int64_t, 4> v_shape{1, v.size(0), v.size(1), v.size(2)};
+    std::array<int64_t, 4> v_strides{v.size(0) * v.stride(0), v.stride(0), v.stride(1), v.stride(2)};
+    std::array<int64_t, 4> out_shape{1, out.size(0), out.size(1), out.size(2)};
+    std::array<int64_t, 4> out_strides{out.size(0) * out.stride(0), out.stride(0), out.stride(1), out.stride(2)};
+    std::array<int64_t, 3> out_lse_shape{1, out_lse.size(0), out_lse.size(1)};
+    std::array<int64_t, 3> out_lse_strides{out_lse.size(0) * out_lse.stride(0), out_lse.stride(0), out_lse.stride(1)};
+    dispatch_flash_atten_asm(q.as_strided(ffi::ShapeView(q_shape.data(), q_shape.size()),
+                                          ffi::ShapeView(q_strides.data(), q_strides.size())),
+                             k.as_strided(ffi::ShapeView(k_shape.data(), k_shape.size()),
+                                          ffi::ShapeView(k_strides.data(), k_strides.size())),
+                             v.as_strided(ffi::ShapeView(v_shape.data(), v_shape.size()),
+                                          ffi::ShapeView(v_strides.data(), v_strides.size())),
+                             softmax_scale,
+                             out.as_strided(ffi::ShapeView(out_shape.data(), out_shape.size()),
+                                            ffi::ShapeView(out_strides.data(), out_strides.size())),
+                             out_lse.as_strided(ffi::ShapeView(out_lse_shape.data(), out_lse_shape.size()),
+                                                ffi::ShapeView(out_lse_strides.data(), out_lse_strides.size())),
+                             is_causal);
+    return;
   }
 
-  auto dprops = at::musa::getCurrentDeviceProperties();
-  args.num_mp = dprops->multiProcessorCount;
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
+  musaDeviceProp       dprops{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, q.device().device_id));
+  args.num_mp = dprops.multiProcessorCount;
 
-  // shape
-  args.total_seqlen_q = q.size(0);
-  args.nr_heads       = q.size(1);
-  args.headdim_qk     = q.size(2);
+  args.total_seqlen_q  = static_cast<int32_t>(q.size(0));
+  args.nr_heads        = static_cast<int32_t>(q.size(1));
+  args.headdim_qk      = static_cast<int32_t>(q.size(2));
+  args.total_seqlen_kv = static_cast<int32_t>(k.size(0));
+  args.nr_heads_kv     = static_cast<int32_t>(k.size(1));
+  args.headdim_v       = static_cast<int32_t>(v.size(2));
 
-  args.total_seqlen_kv = k.size(0);
-  args.nr_heads_kv     = k.size(1);
+  const bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
+  const bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
+  TVM_FFI_ICHECK(is_192_128 || is_128_128_or_less) << "HeadDim unsupported";
+  TVM_FFI_ICHECK_GE(args.nr_heads, args.nr_heads_kv) << "nr_heads must be >= nr_heads_kv";
+  TVM_FFI_ICHECK_EQ(args.nr_heads % args.nr_heads_kv, 0) << "nr_heads must be divisible by nr_heads_kv";
 
-  args.headdim_v = v.size(2);
+  expect_shape(q, {args.total_seqlen_q, args.nr_heads, args.headdim_qk}, "q");
+  expect_shape(k, {args.total_seqlen_kv, args.nr_heads_kv, args.headdim_qk}, "k");
+  expect_shape(v, {args.total_seqlen_kv, args.nr_heads_kv, args.headdim_v}, "v");
+  expect_shape(out, {args.total_seqlen_q, args.nr_heads, args.headdim_v}, "out");
+  expect_shape(out_lse, {args.nr_heads, args.total_seqlen_q}, "out_lse");
 
-  bool is_192_128         = args.headdim_qk == 192 && args.headdim_v == 128;
-  bool is_128_128_or_less = args.headdim_qk == args.headdim_v && args.headdim_qk <= 128;
-  TORCH_CHECK(is_192_128 || is_128_128_or_less, "HeadDim unsupported!");
-  TORCH_CHECK(args.nr_heads >= args.nr_heads_kv,
-              "dispatch_flash_atten_varlen_asm() nr_heads must be greater than nr_heads_kv!")
-  TORCH_CHECK(args.nr_heads % args.nr_heads_kv == 0,
-              "dispatch_flash_atten_varlen_asm() nr_heads must be divisible by nr_heads_kv!")
+  args.total_seqlen_stride_q   = static_cast<int32_t>(q.stride(0));
+  args.head_stride_q           = static_cast<int32_t>(q.stride(1));
+  args.total_seqlen_stride_k   = static_cast<int32_t>(k.stride(0));
+  args.head_stride_k           = static_cast<int32_t>(k.stride(1));
+  args.total_seqlen_stride_v   = static_cast<int32_t>(v.stride(0));
+  args.head_stride_v           = static_cast<int32_t>(v.stride(1));
+  args.total_seqlen_stride_out = static_cast<int32_t>(out.stride(0));
+  args.head_stride_out         = static_cast<int32_t>(out.stride(1));
 
-  CHECK_SHAPE(q, args.total_seqlen_q, args.nr_heads, args.headdim_qk);
-  CHECK_SHAPE(k, args.total_seqlen_kv, args.nr_heads_kv, args.headdim_qk);
-  CHECK_SHAPE(v, args.total_seqlen_kv, args.nr_heads_kv, args.headdim_v);
-  CHECK_SHAPE(out, args.total_seqlen_q, args.nr_heads, args.headdim_v);
-  CHECK_SHAPE(out_lse, args.nr_heads, args.total_seqlen_q);
-
-  // stride
-  args.total_seqlen_stride_q = q.stride(0);
-  args.head_stride_q         = q.stride(1);
-
-  args.total_seqlen_stride_k = k.stride(0);
-  args.head_stride_k         = k.stride(1);
-
-  args.total_seqlen_stride_v = v.stride(0);
-  args.head_stride_v         = v.stride(1);
-
-  args.total_seqlen_stride_out = out.stride(0);
-  args.head_stride_out         = out.stride(1);
-
-  args.nr_k          = k.numel();
-  args.max_seqlen_q  = max_seqlen_q;
-  args.max_seqlen_kv = max_seqlen_kv;
-
-  args.p_q = q.data_ptr();
-  args.p_k = k.data_ptr();
-  args.p_v = v.data_ptr();
-
-  args.softmax_scale = softmax_scale;
-
+  args.nr_k                = static_cast<int32_t>(k.numel());
+  args.max_seqlen_q        = static_cast<int32_t>(max_seqlen_q);
+  args.max_seqlen_kv       = static_cast<int32_t>(max_seqlen_kv);
+  args.p_q                 = q.data_ptr();
+  args.p_k                 = k.data_ptr();
+  args.p_v                 = v.data_ptr();
+  args.softmax_scale       = softmax_scale;
   args.p_input_cu_seqlen_q = input_cu_seqlen_q.data_ptr();
   args.p_input_cu_seqlen_k = input_cu_seqlen_k.data_ptr();
+  args.p_output            = out.data_ptr();
+  args.p_lse_output        = out_lse.data_ptr();
 
-  args.p_output     = out.data_ptr();
-  args.p_lse_output = out_lse.data_ptr();
-
-  musaStream_t stream         = at::musa::getCurrentMUSAStream().stream();
-  int          current_device = at::musa::current_device();
-
+  musaStream_t stream                 = get_stream(q.device());
   using Kernel                        = mate::flash_attention::mubin::FlashAttentionVarlenAsmKernel<Args>;
   auto [param, config, launch_config] = Kernel::to_underlying_arguments(args, stream);
   auto kernel                         = Kernel(param, config, launch_config);
   kernel.run();
-
-  return std::make_tuple(out, out_lse);
 }
 
-std::tuple<at::Tensor, at::Tensor> flash_atten_varlen_asm(const at::Tensor&         q,
-                                                          const at::Tensor&         k,
-                                                          const at::Tensor&         v,
-                                                          const double              softmax_scale,
-                                                          at::Tensor&               out,
-                                                          at::Tensor&               out_lse,
-                                                          const bool                is_causal,
-                                                          std::optional<at::Tensor> input_cu_seqlen_q,
-                                                          std::optional<at::Tensor> input_cu_seqlen_k,
-                                                          std::optional<int64_t>    max_seqlen_q,
-                                                          std::optional<int64_t>    max_seqlen_kv) {
-  CHECK_MP31("flash_atten_varlen_asm");
+void flash_atten_varlen_asm(ffi::TensorView                q,
+                            ffi::TensorView                k,
+                            ffi::TensorView                v,
+                            double                         softmax_scale,
+                            ffi::TensorView                out,
+                            ffi::TensorView                out_lse,
+                            bool                           is_causal,
+                            ffi::Optional<ffi::TensorView> input_cu_seqlen_q,
+                            ffi::Optional<ffi::TensorView> input_cu_seqlen_k,
+                            ffi::Optional<int64_t>         max_seqlen_q,
+                            ffi::Optional<int64_t>         max_seqlen_kv) {
+  check_mp31(q.device(), "flash_atten_varlen_asm");
+  TVM_FFI_ICHECK(dtype_equal(q.dtype(), k.dtype()) && dtype_equal(q.dtype(), v.dtype()) &&
+                 dtype_equal(q.dtype(), out.dtype()))
+      << "q, k, v and out must have the same dtype";
 
-  TORCH_CHECK(
-      q.scalar_type() == k.scalar_type() && k.scalar_type() == v.scalar_type() && out.scalar_type() == q.scalar_type(),
-      "flash_atten_varlen_asm() qkv & out must have same data type!")
+  ffi::MUSADeviceGuard device_guard(q.device().device_id);
 
-  c10::musa::OptionalMUSAGuard guard(q.device());
-
-  bool is_varlen = input_cu_seqlen_q.has_value() || input_cu_seqlen_k.has_value();
-
+  const bool is_varlen = input_cu_seqlen_q.has_value() || input_cu_seqlen_k.has_value();
   if (is_varlen) {
-    TORCH_CHECK(input_cu_seqlen_q.has_value(),
-                "flash_atten_varlen_asm() is_varlen is true! input_cu_seqlen_q must be provided!");
-    TORCH_CHECK(input_cu_seqlen_k.has_value(),
-                "flash_atten_varlen_asm() is_varlen is true! input_cu_seqlen_k must be provided!");
-    TORCH_CHECK(max_seqlen_q.has_value(), "flash_atten_varlen_asm() is_varlen is true! max_seqlen_q must be provided!");
-    TORCH_CHECK(max_seqlen_kv.has_value(),
-                "flash_atten_varlen_asm() is_varlen is true! max_seqlen_kv must be provided!");
-    return dispatch_flash_atten_varlen_asm(q,
-                                           k,
-                                           v,
-                                           input_cu_seqlen_q.value(),
-                                           input_cu_seqlen_k.value(),
-                                           max_seqlen_q.value(),
-                                           max_seqlen_kv.value(),
-                                           softmax_scale,
-                                           out,
-                                           out_lse,
-                                           is_causal);
-  } else {
-    // is NOT varlen
-    return dispatch_flash_atten_asm(q, k, v, softmax_scale, out, out_lse, is_causal);
+    CHECK_HAS_VALUE_WITH_MSG(input_cu_seqlen_q, "input_cu_seqlen_q must be provided for varlen flash attention");
+    CHECK_HAS_VALUE_WITH_MSG(input_cu_seqlen_k, "input_cu_seqlen_k must be provided for varlen flash attention");
+    CHECK_HAS_VALUE_WITH_MSG(max_seqlen_q, "max_seqlen_q must be provided for varlen flash attention");
+    CHECK_HAS_VALUE_WITH_MSG(max_seqlen_kv, "max_seqlen_kv must be provided for varlen flash attention");
+    dispatch_flash_atten_varlen_asm(q,
+                                    k,
+                                    v,
+                                    input_cu_seqlen_q.value(),
+                                    input_cu_seqlen_k.value(),
+                                    max_seqlen_q.value(),
+                                    max_seqlen_kv.value(),
+                                    softmax_scale,
+                                    out,
+                                    out_lse,
+                                    is_causal);
+    return;
   }
+
+  dispatch_flash_atten_asm(q, k, v, softmax_scale, out, out_lse, is_causal);
 }
 
-TORCH_LIBRARY_FRAGMENT(mate, m) {
-  m.def(
-      "flash_atten_varlen_asm("
-      "Tensor q,"
-      "Tensor k,"
-      "Tensor v,"
-      "float softmax_scale,"
-      "Tensor out,"
-      "Tensor out_lse,"
-      "bool is_causal,"
-      "Tensor? input_cu_seqlen_q = None,"
-      "Tensor? input_cu_seqlen_k = None,"
-      "int? max_seqlen_q = None,"
-      "int? max_seqlen_kv = None"
-      ")"
-      "-> (Tensor, Tensor)");
-}
-
-TORCH_LIBRARY_IMPL(mate, PrivateUse1, m) {
-  m.impl("flash_atten_varlen_asm", &flash_atten_varlen_asm);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flash_atten_varlen_asm, flash_atten_varlen_asm);

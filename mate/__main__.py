@@ -14,9 +14,18 @@ Requirements:
 import os
 import sys
 import json
+import importlib
 from pathlib import Path
 
 import click
+
+TVM_FFI_PACKAGE_NAME = "apache-tvm-ffi"
+TVM_FFI_INSTALL_HINT = (
+    "Install/build apache-tvm-ffi from the MooreThreads MUSA fork: "
+    "https://github.com/MooreThreads/tvm-ffi. Use a release tag "
+    "containing 'musa' (for example v0.1.9.post2+musa.1); the upstream "
+    "public build is not compatible with MATE."
+)
 
 
 # Version - try multiple sources
@@ -72,17 +81,142 @@ ENV_VARS = {
     "MATE_DUMP_SAFETENSORS": "Use safetensors format (0/1)",
     "MATE_DUMP_INCLUDE": "Include patterns for dumping",
     "MATE_DUMP_EXCLUDE": "Exclude patterns for dumping",
-    "TVM_FFI_MUSA_ARCH_LIST": "MUSA architecture list for JIT compilation",
-    "MATE_AOT_BUILD": "AOT build mode flag",
+    "MATE_MUSA_ARCH_LIST": "MUSA architecture list for JIT/AOT compilation",
+    "MATE_WORKSPACE_BASE": "Base directory for the MATE cache workspace",
+    "MATE_DISABLE_JIT": "Disable runtime JIT and require matching AOT modules",
+    "MATE_JIT_VERBOSE": "Show verbose ninja output for runtime JIT builds",
 }
+
+
+def _read_installed_package_version(package_name: str) -> str | None:
+    try:
+        from importlib.metadata import version as package_version
+
+        resolved = package_version(package_name)
+        return resolved if resolved else None
+    except Exception:
+        return None
+
+
+def _read_tvm_ffi_module_version() -> str | None:
+    try:
+        import tvm_ffi
+    except Exception:
+        return None
+
+    version = getattr(tvm_ffi, "__version__", None)
+    return version if isinstance(version, str) and version else None
+
+
+def _is_musa_enabled_tvm_ffi(version: str | None) -> bool:
+    return bool(version) and "musa" in version.lower()
+
+
+def _get_tvm_ffi_status():
+    version = _read_installed_package_version(TVM_FFI_PACKAGE_NAME)
+    version_source = "package metadata"
+    if not version:
+        version = _read_tvm_ffi_module_version()
+        version_source = "tvm_ffi.__version__" if version else None
+
+    if not version:
+        return {
+            "package_name": TVM_FFI_PACKAGE_NAME,
+            "version": "Not installed",
+            "installed": False,
+            "musa_enabled": False,
+            "version_source": version_source,
+            "status_message": (
+                f"{TVM_FFI_PACKAGE_NAME} is not installed in the current environment."
+            ),
+            "install_hint": TVM_FFI_INSTALL_HINT,
+        }
+
+    if _is_musa_enabled_tvm_ffi(version):
+        return {
+            "package_name": TVM_FFI_PACKAGE_NAME,
+            "version": version,
+            "installed": True,
+            "musa_enabled": True,
+            "version_source": version_source,
+            "status_message": (
+                f"Detected MUSA-enabled {TVM_FFI_PACKAGE_NAME} build: {version}"
+            ),
+            "install_hint": None,
+        }
+
+    return {
+        "package_name": TVM_FFI_PACKAGE_NAME,
+        "version": version,
+        "installed": True,
+        "musa_enabled": False,
+        "version_source": version_source,
+        "status_message": (
+            f"Detected {TVM_FFI_PACKAGE_NAME} {version}, but it is not a "
+            "MUSA-enabled build."
+        ),
+        "install_hint": TVM_FFI_INSTALL_HINT,
+    }
+
+
+def _resolve_musa_arch_source() -> str:
+    return "env" if "MATE_MUSA_ARCH_LIST" in os.environ else "auto-detected"
+
+
+def _describe_musa_arch_source(source: str) -> str:
+    if source == "env":
+        return "MATE_MUSA_ARCH_LIST"
+    return "auto-detected from visible MUSA devices"
+
+
+def _get_musa_arch_status():
+    source = _resolve_musa_arch_source()
+
+    try:
+        jit_env = importlib.import_module("mate.jit.env")
+    except Exception as exc:
+        return {
+            "musa_arch_list": None,
+            "musa_arch_key": None,
+            "musa_arch_source": source,
+            "musa_arch_available": False,
+            "musa_arch_status": "Unavailable",
+            "musa_arch_error": str(exc),
+        }
+
+    return {
+        "musa_arch_list": list(jit_env.MATE_MUSA_ARCH_LIST),
+        "musa_arch_key": jit_env.MATE_MUSA_ARCH_KEY,
+        "musa_arch_source": source,
+        "musa_arch_available": True,
+        "musa_arch_status": (
+            "Resolved from MATE_MUSA_ARCH_LIST"
+            if source == "env"
+            else "Auto-detected from visible MUSA devices"
+        ),
+        "musa_arch_error": None,
+    }
 
 
 def get_system_info():
     """Gather system information."""
+    tvm_ffi_status = _get_tvm_ffi_status()
+    musa_arch_status = _get_musa_arch_status()
     info = {
         "mate_version": __version__,
         "git_version": __git_version__,
         "python_version": sys.version.split()[0],
+        "tvm_ffi_version": tvm_ffi_status["version"],
+        "tvm_ffi_installed": tvm_ffi_status["installed"],
+        "tvm_ffi_musa_enabled": tvm_ffi_status["musa_enabled"],
+        "tvm_ffi_status": tvm_ffi_status["status_message"],
+        "tvm_ffi_install_hint": tvm_ffi_status["install_hint"],
+        "musa_arch_list": musa_arch_status["musa_arch_list"],
+        "musa_arch_key": musa_arch_status["musa_arch_key"],
+        "musa_arch_source": musa_arch_status["musa_arch_source"],
+        "musa_arch_available": musa_arch_status["musa_arch_available"],
+        "musa_arch_status": musa_arch_status["musa_arch_status"],
+        "musa_arch_error": musa_arch_status["musa_arch_error"],
     }
 
     # PyTorch info
@@ -172,6 +306,44 @@ def show_config(output_json: bool):
         click.secho("MUSA available: ", fg="magenta", nl=False)
         click.secho("No", fg="red")
 
+    # JIT Architecture Info
+    print_header("JIT Architecture")
+    arch_source = info["musa_arch_source"]
+    print_kv("Source", _describe_musa_arch_source(arch_source))
+    print_kv(
+        "Architecture list",
+        ", ".join(info["musa_arch_list"]) if info["musa_arch_list"] else "N/A",
+        value_color="cyan" if info["musa_arch_available"] else "yellow",
+    )
+    print_kv(
+        "Arch key",
+        info["musa_arch_key"] or "N/A",
+        value_color="cyan" if info["musa_arch_available"] else "yellow",
+    )
+    click.secho("Status: ", fg="magenta", nl=False)
+    click.secho(
+        info["musa_arch_status"],
+        fg="green" if info["musa_arch_available"] else "yellow",
+        bold=not info["musa_arch_available"],
+    )
+    if info["musa_arch_error"]:
+        click.secho("Reason: ", fg="magenta", nl=False)
+        click.secho(info["musa_arch_error"], fg="yellow", bold=True)
+
+    # TVM-FFI Info
+    print_header("TVM-FFI")
+    version_color = "cyan" if info["tvm_ffi_musa_enabled"] else "red"
+    print_kv(TVM_FFI_PACKAGE_NAME, info["tvm_ffi_version"], value_color=version_color)
+    click.secho("Status: ", fg="magenta", nl=False)
+    click.secho(
+        info["tvm_ffi_status"],
+        fg="green" if info["tvm_ffi_musa_enabled"] else "red",
+        bold=not info["tvm_ffi_musa_enabled"],
+    )
+    if info["tvm_ffi_install_hint"]:
+        click.secho("Install hint: ", fg="magenta", nl=False)
+        click.secho(info["tvm_ffi_install_hint"], fg="yellow", bold=True)
+
     # AOT Info
     print_header("AOT Libraries")
     try:
@@ -181,7 +353,7 @@ def show_config(output_json: bool):
         aot_dir = mate_path / "data" / "aot"
 
         if aot_dir.exists():
-            aot_files = list(aot_dir.glob("*.so"))
+            aot_files = list(aot_dir.rglob("*.so"))
             print_kv("AOT directory", str(aot_dir))
             print_kv("AOT libraries", str(len(aot_files)))
             for f in aot_files[:5]:
@@ -198,8 +370,12 @@ def show_config(output_json: bool):
     try:
         import importlib.metadata as metadata
 
-        packages = ["mate", "torch", "torch_musa"]
+        packages = ["mate", "torch", "torch_musa", TVM_FFI_PACKAGE_NAME]
         for pkg in packages:
+            if pkg == TVM_FFI_PACKAGE_NAME:
+                value_color = "cyan" if info["tvm_ffi_musa_enabled"] else "red"
+                print_kv(pkg, info["tvm_ffi_version"], value_color=value_color)
+                continue
             try:
                 version = metadata.version(pkg)
                 print_kv(pkg, version)
@@ -436,6 +612,16 @@ def check_cmd():
     else:
         click.secho("✓ Python version", fg="green")
 
+    tvm_ffi_status = _get_tvm_ffi_status()
+    if tvm_ffi_status["installed"] and tvm_ffi_status["musa_enabled"]:
+        click.secho("✓ MUSA-enabled apache-tvm-ffi installed", fg="green")
+        click.secho(f"  Version: {tvm_ffi_status['version']}", fg="cyan")
+    else:
+        click.secho("✗ TVM-FFI MUSA build check failed", fg="red", bold=True)
+        errors.append(
+            f"{tvm_ffi_status['status_message']} {tvm_ffi_status['install_hint']}"
+        )
+
     try:
         import torch  # noqa: F401
 
@@ -467,19 +653,19 @@ def check_cmd():
         else:
             warnings.append("AOT libraries not found (JIT mode only)")
 
-    except ImportError:
-        errors.append("MATE not installed")
+    except ImportError as exc:
+        errors.append(f"MATE import failed: {exc}")
 
     print_header("Summary")
     if errors:
         click.secho(f"❌ {len(errors)} errors:", fg="red")
-        for e in errors:
-            click.secho(f"  - {e}", fg="red")
+        for error in errors:
+            click.secho(f"  - {error}", fg="red")
 
     if warnings:
         click.secho(f"⚠️  {len(warnings)} warnings:", fg="yellow")
-        for w in warnings:
-            click.secho(f"  - {w}", fg="yellow")
+        for warning in warnings:
+            click.secho(f"  - {warning}", fg="yellow")
 
     if not errors and not warnings:
         click.secho("✅ All checks passed!", fg="green")

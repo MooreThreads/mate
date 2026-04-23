@@ -37,6 +37,14 @@ struct PagedKVManager {
       make_layout(make_shape(_1{}, Int<ElementsPerLoad>{}))));
   using ThrGmemTiledCopy                 = decltype(GmemTiledCopy{}.get_thread_slice(0));
 
+  using GmemLayoutAtom =
+      Layout<Shape<Int<NumThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>, Stride<Int<GmemThreadsPerRow>, _1>>;
+  using GmemTiledCopyKVStore =
+      decltype(make_tiled_copy(Copy_Atom<MP31_ROBUST_STORE<mute::uint128_t>, Element>{},
+                               GmemLayoutAtom{},
+                               Layout<Shape<_1, Int<ElementsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
+  using ThrGmemTiledCopyStore = decltype(GmemTiledCopyKVStore{}.get_thread_slice(0));
+
   using TensortKcK = decltype(GmemTiledCopy{}.get_thread_slice(0).partition_S(
       make_identity_tensor(Shape<Int<TileN>, Int<HeadDimQK>>{})));
   using TensortVcV = decltype(GmemTiledCopy{}.get_thread_slice(0).partition_S(
@@ -62,11 +70,13 @@ struct PagedKVManager {
 
   int                    bidb_kv_idx, bidb_kv_idx_prev, n_block_idx, n_block_idx_prev;
   int const              thread_idx;
+  int const              seqlen_k, leftpad_k;
   TensorKV               mK, mV;
   RobustDescriptor       desc_K, desc_V, desc_page_table;
   TensorPageOffset       tPrPageOffsetK, tPrPageOffsetV;
   ThrGmemTiledCopy const gmem_thr_copy_kv;
-  TensorKVPtr            tPrVPtr;
+
+  TensorKVPtr tPrVPtr;
 
   mutlass::FastDivmod const& page_size_divmod;
 
@@ -84,6 +94,8 @@ struct PagedKVManager {
                  StrideKV const&            stride_V,
                  RobustDescriptor const&    desc_V,
                  mutlass::FastDivmod const& page_size_divmod,
+                 int const                  seqlen_k,
+                 int const                  leftpad_k,
                  int const                  thread_idx,
                  int const                  bidb_kv,
                  int const                  bidh_kv,
@@ -95,6 +107,8 @@ struct PagedKVManager {
         desc_K(desc_K),
         desc_V(desc_V),
         gmem_thr_copy_kv(GmemTiledCopy{}.get_thread_slice(thread_idx)),
+        seqlen_k(seqlen_k),
+        leftpad_k(leftpad_k),
         thread_idx(thread_idx),
         page_size_divmod(page_size_divmod) {
     mPageTable   = make_tensor(make_gmem_ptr(ptr_page_table), shape_page_table, stride_page_table)(bidb_kv, _);
@@ -116,7 +130,7 @@ struct PagedKVManager {
     }
   }
 
-  template <bool FirstIter = false>
+  template <bool FirstIter = false, bool PermuteK = true>
   MUTLASS_DEVICE void load_page_table_for_lsu(int const n_block) {
     if constexpr (IsPagedKV) {
       MUTLASS_PRAGMA_UNROLL
@@ -133,7 +147,11 @@ struct PagedKVManager {
         // K
         {
           int32_t page_idx, page_offset;
-          page_idx = page_size_divmod.divmod(page_offset, permute_row_idx);
+          if constexpr (PermuteK) {
+            page_idx = page_size_divmod.divmod(page_offset, permute_row_idx + leftpad_k);
+          } else {
+            page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
+          }
           int32_t page;
           mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           tPrPageOffsetK(i) = {page, page_offset};
@@ -142,7 +160,7 @@ struct PagedKVManager {
         // V
         {
           int32_t page_idx, page_offset;
-          page_idx = page_size_divmod.divmod(page_offset, row_idx);
+          page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
           int32_t page;
           mute::MP31_ROBUST_LOAD<int32_t>::copy(mPageTable(page_idx), page, true, desc_page_table);
           tPrPageOffsetV(i) = {page, page_offset};
@@ -230,6 +248,79 @@ struct PagedKVManager {
         mute::copy(GmemTiledCopy{}.with(desc_V).with(true), mV_paged_cur_copy(_, j_idx), tVsV(_, i, j));
       }
     }
+    if constexpr (!IsKVSameIter) {
+      compute_V_ptr();
+    }
+  }
+
+  template <class TensorK>
+  MUTLASS_DEVICE void store_K(int const n_block, TensorK&& tKrK) {
+    Tensor tPrKPtr = compute_K_ptr();
+
+    auto gmem_thr0_copy_kv = GmemTiledCopyKVStore{}.get_thread_slice(_0{});
+
+    Tensor cK    = make_identity_tensor(Shape<Int<TileN>, Int<HeadDimQK>>{});
+    Tensor tKcK  = gmem_thr_copy_kv.partition_S(cK);
+    Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
+
+    GmemTiledCopyKVStore gmem_tiled_copy_kv_store;
+
+    int const seqlenk_row_limit = std::min(seqlen_k - n_block * TileN, TileN) - get<0>(tKcK(_0{}, _0{}, _0{}));
+
+    MUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<1>(tKrK); ++i) {
+      int const  row         = get<0>(t0KcK(_0{}, i, _0{}));
+      bool const should_load = row < seqlenk_row_limit;
+      // TODO: check use mutlass address space
+      Element* k_ptr = (Element*)__musa_ptr_gen_to_global(
+          (void*)(__shfl_sync(0xffffffff,
+                              reinterpret_cast<uint64_t>(tPrKPtr(i / GmemThreadsPerRow)),
+                              i % GmemThreadsPerRow,
+                              GmemThreadsPerRow)));
+
+      Tensor mK_paged_cur      = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<HeadDimQK>>{});
+      Tensor mK_paged_cur_copy = tiled_divide(mK_paged_cur, Shape<Int<ElementsPerLoad>>{});
+
+      MUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < size<2>(tKrK); ++j) {
+        int const j_idx = get<1>(tKcK(_0{}, _0{}, j)) / ElementsPerLoad;
+        copy(gmem_tiled_copy_kv_store.with(desc_K).with(should_load), tKrK(_, i, j), mK_paged_cur_copy(_, j_idx));
+      }
+    }
+  }
+
+  template <class TensorV>
+  MUTLASS_DEVICE void store_V(int const n_block, TensorV&& tVrV) {
+    if constexpr (IsKVSameIter) {
+      compute_V_ptr();
+    }
+
+    auto                 gmem_thr0_copy_kv = GmemTiledCopyKVStore{}.get_thread_slice(_0{});
+    Tensor               cV                = make_identity_tensor(Shape<Int<TileN>, Int<HeadDimVO>>{});
+    Tensor               tVcV              = gmem_thr_copy_kv.partition_S(cV);
+    Tensor               t0VcV             = gmem_thr0_copy_kv.partition_S(cV);
+    GmemTiledCopyKVStore gmem_tiled_copy_kv_store;
+    int const seqlenk_row_limit = std::min(seqlen_k - n_block * TileN, TileN) - get<0>(tVcV(_0{}, _0{}, _0{}));
+
+    MUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size<1>(tVrV); ++i) {
+      bool const should_load = get<0>(t0VcV(_0{}, i, _0{})) < seqlenk_row_limit;
+      // TODO: check use mutlass address space
+      Element* v_ptr = (Element*)__musa_ptr_gen_to_global(
+          (void*)(__shfl_sync(0xffffffff,
+                              reinterpret_cast<uint64_t>(tPrVPtr(i / GmemThreadsPerRow)),
+                              i % GmemThreadsPerRow,
+                              GmemThreadsPerRow)));
+      Tensor mV_paged_cur      = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<HeadDimVO>>{});
+      Tensor mV_paged_cur_copy = mute::tiled_divide(mV_paged_cur, Shape<Int<ElementsPerLoad>>{});
+
+      MUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < size<2>(tVrV); ++j) {
+        int const j_idx = get<1>(tVcV(_0{}, _0{}, j)) / ElementsPerLoad;
+        copy(gmem_tiled_copy_kv_store.with(desc_V).with(should_load), tVrV(_, i, j), mV_paged_cur_copy(_, j_idx));
+      }
+    }
+
     if constexpr (!IsKVSameIter) {
       compute_V_ptr();
     }

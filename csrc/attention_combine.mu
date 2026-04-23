@@ -2,28 +2,28 @@
 
 #include "attention_combine.hpp"
 #include "mate/attention/flash_mla/mpxx_mla_combine.hpp"
+#include "tvm/ffi/error.h"
 
-#define MLA_NUM_SPLITS_SWITCH(NUM_SPLITS, NAME, ...)           \
-  [&] {                                                        \
-    if (NUM_SPLITS <= 32) {                                    \
-      constexpr static int NAME = 32;                          \
-      return __VA_ARGS__();                                    \
-    } else if (NUM_SPLITS <= 64) {                             \
-      constexpr static int NAME = 64;                          \
-      return __VA_ARGS__();                                    \
-    } else if (NUM_SPLITS <= 96) {                             \
-      constexpr static int NAME = 96;                          \
-      return __VA_ARGS__();                                    \
-    } else if (NUM_SPLITS <= 128) {                            \
-      constexpr static int NAME = 128;                         \
-      return __VA_ARGS__();                                    \
-    } else if (NUM_SPLITS <= 160) {                            \
-      constexpr static int NAME = 160;                         \
-      return __VA_ARGS__();                                    \
-    } else {                                                   \
-      fprintf(stderr, "Invalid num_splits: %d\n", NUM_SPLITS); \
-      exit(1);                                                 \
-    }                                                          \
+#define MLA_NUM_SPLITS_SWITCH(NUM_SPLITS, NAME, ...)                     \
+  [&] {                                                                  \
+    if (NUM_SPLITS <= 32) {                                              \
+      constexpr static int NAME = 32;                                    \
+      return __VA_ARGS__();                                              \
+    } else if (NUM_SPLITS <= 64) {                                       \
+      constexpr static int NAME = 64;                                    \
+      return __VA_ARGS__();                                              \
+    } else if (NUM_SPLITS <= 96) {                                       \
+      constexpr static int NAME = 96;                                    \
+      return __VA_ARGS__();                                              \
+    } else if (NUM_SPLITS <= 128) {                                      \
+      constexpr static int NAME = 128;                                   \
+      return __VA_ARGS__();                                              \
+    } else if (NUM_SPLITS <= 160) {                                      \
+      constexpr static int NAME = 160;                                   \
+      return __VA_ARGS__();                                              \
+    } else {                                                             \
+      TVM_FFI_THROW(ValueError) << "Invalid num_splits: " << NUM_SPLITS; \
+    }                                                                    \
   }()
 
 template <typename T, bool VarlenQ>

@@ -17,6 +17,8 @@ struct FmhaFwdKernelWarpSpecialized {
   using CollectiveEpilogue = CollectiveEpilogue_;
   using TileScheduler      = TileScheduler_;
 
+  static constexpr bool IsAppendKV = CollectiveMainloop::IsAppendKV;
+
   static constexpr int NumLoadWarpSquads = CollectiveMainloop::NumLoadWarpSquads;
   static constexpr int NumMmaWarpSquads  = CollectiveMainloop::NumMmaWarpSquads;
 
@@ -34,18 +36,23 @@ struct FmhaFwdKernelWarpSpecialized {
   static constexpr bool UseLSULoadQ        = CollectiveMainloop::UseLSULoadQ;
   static constexpr bool SingleProducerWarp = CollectiveMainloop::NumProducerThreads == mutlass::NumThreadsPerWarp;
 
+  static constexpr int NumLoadWarps = !SingleProducerWarp ? NumLoadWarpSquads * mutlass::NumWarpsPerWarpSquad : 1;
+
   static constexpr bool UseLSULoadK = CollectiveMainloop::UseLSULoadK;
   static constexpr bool UseLSULoadV = CollectiveMainloop::UseLSULoadV;
 
-  using MainloopPipelineQ       = typename CollectiveMainloop::MainloopPipelineQ;
-  using MainloopPipelineK       = typename CollectiveMainloop::MainloopPipelineK;
-  using MainloopPipelineV       = typename CollectiveMainloop::MainloopPipelineV;
-  using MainloopPipelineQState  = typename CollectiveMainloop::PipelineQState;
-  using MainloopPipelineKState  = typename CollectiveMainloop::PipelineKState;
-  using MainloopPipelineVState  = typename CollectiveMainloop::PipelineVState;
-  using MainloopPipelineQParams = typename MainloopPipelineQ::Params;
-  using MainloopPipelineKParams = typename MainloopPipelineK::Params;
-  using MainloopPipelineVParams = typename MainloopPipelineV::Params;
+  using MainloopPipelineQ           = typename CollectiveMainloop::MainloopPipelineQ;
+  using MainloopPipelineK           = typename CollectiveMainloop::MainloopPipelineK;
+  using MainloopPipelineV           = typename CollectiveMainloop::MainloopPipelineV;
+  using MainloopPipelineKVNew       = typename CollectiveMainloop::MainloopPipelineKVNew;
+  using MainloopPipelineQState      = typename CollectiveMainloop::PipelineQState;
+  using MainloopPipelineKState      = typename CollectiveMainloop::PipelineKState;
+  using MainloopPipelineVState      = typename CollectiveMainloop::PipelineVState;
+  using MainloopPipelineKVNewState  = typename CollectiveMainloop::PipelineKVNewState;
+  using MainloopPipelineQParams     = typename MainloopPipelineQ::Params;
+  using MainloopPipelineKParams     = typename MainloopPipelineK::Params;
+  using MainloopPipelineVParams     = typename MainloopPipelineV::Params;
+  using MainloopPipelineKVNewParams = typename MainloopPipelineKVNew::Params;
 
   static constexpr int StagesQ = CollectiveMainloop::StagesQ;
   static constexpr int StagesK = CollectiveMainloop::StagesK;
@@ -60,6 +67,8 @@ struct FmhaFwdKernelWarpSpecialized {
     uint8_t PipelineQ[MainloopPipelineQ::NumBarriers];
     uint8_t PipelineK[MainloopPipelineK::NumBarriers];
     uint8_t PipelineV[MainloopPipelineV::NumBarriers];
+    uint8_t PipelineKNew[MainloopPipelineKVNew::NumBarriers];
+    uint8_t PipelineVNew[MainloopPipelineKVNew::NumBarriers];
     uint8_t ConsumerSync[1];
   };
 
@@ -163,9 +172,26 @@ struct FmhaFwdKernelWarpSpecialized {
     // MainloopPipelineVState mainloop_pipe_v_producer_state = mutlass::make_producer_start_state<MainloopPipelineV>();
     MainloopPipelineVState mainloop_pipe_v_consumer_state;
 
+    MainloopPipelineKVNewParams pipeline_params_k_new;
+    pipeline_params_k_new.transaction_bytes = CollectiveMainloop::TmeTransactionBytesK;
+    pipeline_params_k_new.num_consumers     = NumQKMmaWarps;
+    MainloopPipelineKVNew      pipeline_k_new(pipeline_params_k_new,
+                                         reinterpret_cast<uint64_t>(&barrier_storage->PipelineKNew));
+    MainloopPipelineKVNewState mainloop_pipe_write_new = mutlass::make_producer_start_state<MainloopPipelineKVNew>();
+    MainloopPipelineKVNewState mainloop_pipe_read_new;
+
+    MainloopPipelineKVNewParams pipeline_params_v_new;
+    pipeline_params_v_new.transaction_bytes = CollectiveMainloop::TmeTransactionBytesV;
+    pipeline_params_v_new.num_consumers     = NumPVMmaWarps;
+    MainloopPipelineKVNew pipeline_v_new(pipeline_params_v_new,
+                                         reinterpret_cast<uint64_t>(&barrier_storage->PipelineVNew));
+
     NamedBarrier consumer_sync(reinterpret_cast<uint64_t>(&barrier_storage->ConsumerSync));
+    NamedBarrier appendkv(
+        reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::AppendKV)]));
     if (warp_idx == 0) {
-      consumer_sync.init(NumQKMmaWarps);  // QK Warps == PV Warps
+      consumer_sync.init(NumQKMmaWarps);            // QK Warps == PV Warps
+      appendkv.init(NumLoadWarps + NumQKMmaWarps);  // QK Warps == PV Warps
     }
 
     CollectiveMainloop mainloop;
@@ -206,18 +232,38 @@ struct FmhaFwdKernelWarpSpecialized {
         auto block_coord = make_shape(block_idx, head_idx, batch_idx, split_idx);
 
         SeqlenInfo seqlen_info{
-            static_cast<uint32_t>(get<2>(block_coord)),
-            static_cast<uint32_t>(get<0>(params.mainloop.shape_Q)),
-            static_cast<uint32_t>(!CollectiveMainloop::IsPagedKV
+            static_cast<uint32_t>(get<2>(block_coord)) /* batch_idx */,
+            static_cast<uint32_t>(get<0>(params.mainloop.shape_Q)) /* seqlen_q_static */,
+            static_cast<uint32_t>(!CollectiveMainloop::IsPagedKV /* seqlen_k_static */
                                       ? size<0>(params.mainloop.shape_K)
                                       : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable)),
-            params.mainloop.cu_seqlens_q,
-            params.mainloop.cu_seqlens_k,
-            params.mainloop.seqused_q,
-            params.mainloop.seqused_k,
-            params.mainloop.cp_world_size,    // CP
-            params.mainloop.cp_rank,          // CP
-            params.mainloop.cp_tot_seqused_k};
+            static_cast<uint32_t>(get<0>(params.mainloop.shape_K_new)) /* shape_K_new_0 */,
+            params.mainloop.cu_seqlens_q /* cu_seqlens_q */,
+            params.mainloop.cu_seqlens_k /* cu_seqlens_k */,
+            params.mainloop.cu_seqlens_k_new /* cu_seqlens_k_new */,
+            params.mainloop.seqused_q /* seqused_q */,
+            params.mainloop.seqused_k /* seqused_k */,
+            // params.mainloop.ptr_leftpad_k /* ptr_leftpad_k */,
+            // params.mainloop.seqlens_rotary /* seqlens_rotary */,
+            params.mainloop.cp_world_size /* cp_world_size */,
+            params.mainloop.cp_rank /* cp_rank */,
+            params.mainloop.cp_tot_seqused_k /* cp_tot_seqused_k */};
+
+        if constexpr (IsAppendKV) {
+          bool is_valid_new = mainloop.load_kv_new(params.mainloop,
+                                                   pipeline_k_new,
+                                                   pipeline_v_new,
+                                                   mainloop_pipe_write_new,
+                                                   shared_storage,
+                                                   seqlen_info,
+                                                   block_coord,
+                                                   warp_idx_in_warp_squad,
+                                                   work_idx,
+                                                   num_splits);
+          if (is_valid_new) {
+            named_barrier_sync(static_cast<uint32_t>(FwdNamedBarriers::AppendKV));
+          }
+        }
 
         mainloop.load(params.mainloop,
                       pipeline_q,
@@ -278,18 +324,37 @@ struct FmhaFwdKernelWarpSpecialized {
         auto block_coord = make_shape(block_idx, head_idx, batch_idx, split_idx);
 
         SeqlenInfo seqlen_info{
-            static_cast<uint32_t>(get<2>(block_coord)),
-            static_cast<uint32_t>(get<0>(params.mainloop.shape_Q)),
-            static_cast<uint32_t>(!CollectiveMainloop::IsPagedKV
+            static_cast<uint32_t>(get<2>(block_coord)) /* batch_idx */,
+            static_cast<uint32_t>(get<0>(params.mainloop.shape_Q)) /* seqlen_q_static */,
+            static_cast<uint32_t>(!CollectiveMainloop::IsPagedKV /* seqlen_k_static */
                                       ? size<0>(params.mainloop.shape_K)
                                       : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable)),
-            params.mainloop.cu_seqlens_q,
-            params.mainloop.cu_seqlens_k,
-            params.mainloop.seqused_q,
-            params.mainloop.seqused_k,
-            params.mainloop.cp_world_size,    // CP
-            params.mainloop.cp_rank,          // CP
-            params.mainloop.cp_tot_seqused_k};
+            static_cast<uint32_t>(get<0>(params.mainloop.shape_K_new)) /* shape_K_new_0 */,
+            params.mainloop.cu_seqlens_q /* cu_seqlens_q */,
+            params.mainloop.cu_seqlens_k /* cu_seqlens_k */,
+            params.mainloop.cu_seqlens_k_new /* cu_seqlens_k_new */,
+            params.mainloop.seqused_q /* seqused_q */,
+            params.mainloop.seqused_k /* seqused_k */,
+            // params.mainloop.ptr_leftpad_k /* ptr_leftpad_k */,
+            // params.mainloop.seqlens_rotary /* seqlens_rotary */,
+            params.mainloop.cp_world_size /* cp_world_size */,
+            params.mainloop.cp_rank /* cp_rank */,
+            params.mainloop.cp_tot_seqused_k /* cp_tot_seqused_k */};
+
+        if constexpr (IsAppendKV) {
+          bool is_valid_new = mainloop.store_kv_new(params.mainloop,
+                                                    pipeline_k_new,
+                                                    pipeline_v_new,
+                                                    mainloop_pipe_read_new,
+                                                    threadIdx.x - MmaThreadOffset,
+                                                    shared_storage,
+                                                    seqlen_info,
+                                                    block_coord,
+                                                    num_splits);
+          if (is_valid_new) {
+            named_barrier_arrive(static_cast<uint32_t>(FwdNamedBarriers::AppendKV));
+          }
+        }
 
         auto results = mainloop.mma(params.mainloop,
                                     pipeline_q,

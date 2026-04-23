@@ -1,8 +1,15 @@
+import functools
 import torch
-import mate._C  # noqa: F401
 from mate.api_logging import mate_api
+from mate._backend import resolve_backend
+from mate.jit.gemm_ops import get_gemm_ops_module
 from mate.testing.utils import ceil_div
 from typing import Tuple, Optional, Literal
+
+
+@functools.cache
+def _get_module():
+    return get_gemm_ops_module()
 
 
 @mate_api
@@ -11,7 +18,9 @@ def ragged_m_moe_gemm_16bit(
     input_b: torch.Tensor,
     ragged_tokens_info: torch.Tensor,
     out: torch.Tensor,
-    gemm_mode: Optional[Literal["per_token", "psum_expert", "per_expert"]] = "per_token",
+    gemm_mode: Optional[
+        Literal["per_token", "psum_expert", "per_expert"]
+    ] = "per_token",
     major_a_mode: Optional[Literal["M", "K"]] = "K",
     major_b_mode: Optional[Literal["N", "K"]] = "K",
     num_mp: Optional[int] = None,
@@ -41,10 +50,10 @@ def ragged_m_moe_gemm_16bit(
         Output tensor with shape ``(total_tokens, out_hidden_size)``.
     major_a_mode : Optional[str]
         Indicating major stride of A.
-        Default to `K`. 
+        Default to `K`.
     major_b_mode : Optional[str]
         Indicating major stride of B.
-        Default to `K`. 
+        Default to `K`.
     gemm_mode : Optional[str],
         Indicating different meaning of ragged_tokens_info.
     alignment_m : Optional[int]
@@ -52,7 +61,7 @@ def ragged_m_moe_gemm_16bit(
         Default is 128.
     num_mp : Optional[int]
         Suggest mp number.
-        If None, will be get from device info. 
+        If None, will be get from device info.
 
     Returns
     -------
@@ -65,7 +74,7 @@ def ragged_m_moe_gemm_16bit(
         alignment_m = 128
 
     if gemm_mode == "per_token":
-        torch.ops.mate.ragged_moe_gemm_16bit(
+        _get_module().get_function("ragged_moe_gemm_16bit")(
             input_a,
             input_b,
             ragged_tokens_info,
@@ -75,7 +84,7 @@ def ragged_m_moe_gemm_16bit(
             alignment_m,
         )
     elif gemm_mode == "per_expert":
-        torch.ops.mate.m_grouped_contig_gemm_16bit(
+        _get_module().get_function("m_grouped_contig_gemm_16bit")(
             input_a,
             input_b,
             ragged_tokens_info,
@@ -83,10 +92,9 @@ def ragged_m_moe_gemm_16bit(
             major_a_mode,
             major_b_mode,
             num_mp,
-    )
+        )
     else:
         assert False, "Not supported gemm mode."
-
 
     return out
 
@@ -156,7 +164,7 @@ def masked_moe_gemm_16bit(
             expert_sz * ceil_div(max_m, tile_signal), dtype=torch.int32, device=a.device
         )
 
-    res = torch.ops.mate.masked_moe_gemm_16bit(
+    res = _get_module().get_function("masked_moe_gemm_16bit")(
         a,
         b,
         masked_tokens_info,
@@ -174,7 +182,9 @@ def ragged_m_moe_gemm_8bit(
     input_b: Tuple[torch.Tensor, torch.Tensor],
     ragged_tokens_info: torch.Tensor,
     out: torch.Tensor,
-    gemm_mode: Optional[Literal["per_token", "psum_expert", "per_expert"]] = "per_token",
+    gemm_mode: Optional[
+        Literal["per_token", "psum_expert", "per_expert"]
+    ] = "per_token",
     major_a_mode: Optional[Literal["M", "K"]] = "K",
     major_b_mode: Optional[Literal["N", "K"]] = "K",
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
@@ -211,10 +221,10 @@ def ragged_m_moe_gemm_8bit(
         Output tensor with shape ``(total_tokens, out_hidden_size)``.
     major_a_mode : Optional[str]
         Indicating major stride of A.
-        Default to `K`. 
+        Default to `K`.
     major_b_mode : Optional[str]
         Indicating major stride of B.
-        Default to `K`. 
+        Default to `K`.
     gemm_mode : Optional[str],
         Indicating different meaning of ragged_tokens_info.
     scale_granularity_mnk : Optional[Tuple[int, int, int]]
@@ -225,7 +235,7 @@ def ragged_m_moe_gemm_8bit(
         Default is 128.
     num_mp : Optional[int]
         Suggest mp number.
-        If None, will be get from device info. 
+        If None, will be get from device info.
 
     Returns
     -------
@@ -239,13 +249,18 @@ def ragged_m_moe_gemm_8bit(
 
     if alignment_m is None:
         alignment_m = 128
-    
+
     if gemm_mode == "per_token":
-        torch.ops.mate.ragged_moe_gemm_8bit(
-            input_a, input_b, ragged_tokens_info, scale_granularity_mnk, out, alignment_m
+        _get_module().get_function("ragged_moe_gemm_8bit")(
+            input_a,
+            input_b,
+            ragged_tokens_info,
+            scale_granularity_mnk,
+            out,
+            alignment_m,
         )
     elif gemm_mode == "per_expert":
-        torch.ops.mate.m_grouped_contig_gemm_8bit(
+        _get_module().get_function("m_grouped_contig_gemm_8bit")(
             input_a,
             input_b,
             ragged_tokens_info,
@@ -253,7 +268,7 @@ def ragged_m_moe_gemm_8bit(
             out,
             major_a_mode,
             major_b_mode,
-            num_mp
+            num_mp,
         )
     else:
         assert False, "Not supported gemm mode"
@@ -337,7 +352,7 @@ def masked_moe_gemm_8bit(
             expert_sz * ceil_div(max_m, tile_signal), dtype=torch.int32, device=a.device
         )
 
-    res = torch.ops.mate.masked_moe_gemm_8bit(
+    res = _get_module().get_function("masked_moe_gemm_8bit")(
         input_a,
         input_b,
         masked_tokens_info,
@@ -348,6 +363,7 @@ def masked_moe_gemm_8bit(
     )
 
     return (out, signal, res[0], res[1]) if enable_overlap else out
+
 
 @mate_api
 def ragged_k_moe_gemm_8bit(
@@ -395,7 +411,7 @@ def ragged_k_moe_gemm_8bit(
         Kgroupgemm only support 1D1D scale, should be ``(1, 1, 128)``.
     num_mp : Optional[int]
         Suggest mp number.
-        If None, will be get from device info. 
+        If None, will be get from device info.
 
     Returns
     -------
@@ -406,17 +422,20 @@ def ragged_k_moe_gemm_8bit(
     if scale_granularity_mnk is None:
         scale_granularity_mnk = (1, 1, 128)
     else:
-        assert scale_granularity_mnk == (1, 1, 128), "k_grouped_contig_gemm_8bit only support 1D1D gemm"
+        assert scale_granularity_mnk == (1, 1, 128), (
+            "k_grouped_contig_gemm_8bit only support 1D1D gemm"
+        )
 
     if major_a_mode is None:
         major_a_mode = "M"
     if major_b_mode is None:
         major_b_mode = "N"
 
-    assert major_a_mode=='M' and major_b_mode=="N", "k_grouped_contig_gemm_8bit only support TN layout"
+    assert major_a_mode == "M" and major_b_mode == "N", (
+        "k_grouped_contig_gemm_8bit only support TN layout"
+    )
 
-
-    torch.ops.mate.k_grouped_contig_gemm_8bit(
+    _get_module().get_function("k_grouped_contig_gemm_8bit")(
         input_a,
         input_b,
         ragged_tokens_info,
@@ -426,6 +445,8 @@ def ragged_k_moe_gemm_8bit(
     )
 
     return out
+
+
 @mate_api
 def ragged_k_moe_gemm_16bit(
     input_a: Tuple[torch.Tensor, torch.Tensor],
@@ -464,7 +485,7 @@ def ragged_k_moe_gemm_16bit(
         Major mode of B, defult to `N`.
     num_mp : Optional[int]
         Suggest mp number.
-        If None, will be get from device info. 
+        If None, will be get from device info.
 
     Returns
     -------
@@ -478,10 +499,11 @@ def ragged_k_moe_gemm_16bit(
     if major_b_mode is None:
         major_b_mode = "N"
 
-    assert major_a_mode=='M' and major_b_mode=="N", "k_grouped_contig_gemm_8bit only support TN layout"
+    assert major_a_mode == "M" and major_b_mode == "N", (
+        "k_grouped_contig_gemm_8bit only support TN layout"
+    )
 
-
-    torch.ops.mate.k_grouped_contig_gemm_16bit(
+    _get_module().get_function("k_grouped_contig_gemm_16bit")(
         input_a,
         input_b,
         ragged_tokens_info,
@@ -491,6 +513,7 @@ def ragged_k_moe_gemm_16bit(
 
     return out
 
+
 @mate_api
 def bmm_fp8(
     a: torch.Tensor,
@@ -499,7 +522,7 @@ def bmm_fp8(
     b_scale: torch.Tensor,
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["mudnn", "auto"] = "auto",
+    backend: str = "auto",
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
 ):
     """
@@ -542,8 +565,9 @@ def bmm_fp8(
     Tensor
         Result tensor with shape ``(batch, m, n)`` in the specified output data type.
     """
-    if backend not in ["mudnn", "auto"]:
-        raise ValueError("backend must be one of ['mudnn', 'auto']")
+    backend = resolve_backend(
+        backend, supported=("mudnn",), allow_auto=True, default="auto"
+    )
 
     if scale_granularity_mnk is None:
         scale_granularity_mnk = (-1, -1, -1)
@@ -558,9 +582,10 @@ def bmm_fp8(
 
         out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
 
-    return torch.ops.mate.bmm_fp8(
+    _get_module().get_function("bmm_fp8")(
         a, b, a_scale, b_scale, out, scale_granularity_mnk, backend
     )
+    return out
 
 
 @mate_api
@@ -569,8 +594,11 @@ def bmm_fp16(
     b: torch.Tensor,
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["mudnn", "auto"] = "auto",
+    backend: str = "auto",
 ):
+    backend = resolve_backend(
+        backend, supported=("mudnn",), allow_auto=True, default="auto"
+    )
     if out is None:
         batch = a.size(0)
         m = a.size(1)
@@ -580,7 +608,8 @@ def bmm_fp16(
             raise ValueError("Only bf16 and fp16 are supported for out_type!")
 
         out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
-    return torch.ops.mate.bmm_fp16(a, b, out, backend)
+    _get_module().get_function("bmm_fp16")(a, b, out, backend)
+    return out
 
 
 @mate_api
@@ -594,7 +623,7 @@ def gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["mudnn"] = "mudnn",
+    backend: str = "auto",
 ):
     """
     Perform groupwise FP8 GEMM operation with scaling.
@@ -638,6 +667,10 @@ def gemm_fp8_nt_groupwise(
     Tensor
         Result tensor with shape ``(m, n)`` in the specified output data type (bf16).
     """
+    backend = resolve_backend(
+        backend, supported=("mudnn",), allow_auto=True, default="auto"
+    )
+
     if scale_major_mode is None:
         scale_major_mode = "K"
 
@@ -663,7 +696,7 @@ def gemm_fp8_nt_groupwise(
 
         out = torch.empty((m, n), dtype=out_dtype, device=a.device)
 
-    return torch.ops.mate.gemm_fp8_nt_groupwise(
+    _get_module().get_function("gemm_fp8_nt_groupwise")(
         a,
         b,
         a_scale,
@@ -674,3 +707,4 @@ def gemm_fp8_nt_groupwise(
         out,
         backend,
     )
+    return out

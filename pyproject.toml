@@ -2,9 +2,20 @@
 name = "mate"
 description = "MATE: MUSA AI Tensor Engine - A centralized library for Generative AI"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.9,<4.0"
 authors = [
     { name = "MooreThreads GPU Computing Team" }
+]
+keywords = ["musa", "ai", "attention", "gemm", "pytorch"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
 dependencies = [
@@ -54,9 +65,8 @@ include=["mate*"]
 
 [tool.setuptools.package-data]
 "mate" = ["_build_meta.py"]
-"mate.jit" = ["aot-levels.json"]
-"mate.data" = ["csrc/**", "include/**", "aot/*.so"]
-"mate.data.mutlass" = ["include/**"]
+"mate.data" = ["csrc/**", "include/**", "aot/**"]
+"mate.data.mutlass" = ["include/**", "experimental/**", "tools/**"]
 
 [project.optional-dependencies]
 # Full functionality including safetensors support
@@ -70,6 +80,11 @@ dev = [
     "safetensors>=0.4.0",
     "pytest>=7.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/MooreThreads/mate"
+Repository = "https://github.com/MooreThreads/mate"
+Documentation = "https://github.com/MooreThreads/mate/tree/main/docs"
 
 [project.scripts]
 mate = "mate.__main__:cli"

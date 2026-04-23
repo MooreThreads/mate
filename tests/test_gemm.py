@@ -53,7 +53,7 @@ def test_ragged_moe_gemm_16bit(
                 b,
                 m_indices,
                 d,
-                gemm_mode = 'per_token',
+                gemm_mode="per_token",
                 alignment_m=alignment_m,
             )
 
@@ -81,7 +81,7 @@ def test_ragged_moe_gemm_16bit(
             b,
             m_indices,
             d,
-            gemm_mode = 'per_token',
+            gemm_mode="per_token",
             alignment_m=alignment_m,
         )
 
@@ -411,6 +411,7 @@ def test_masked_moe_gemm_8bit(
         threshold = res[3]
         check_gemm_sbo_signal(num_expert, max_m, block_m, threshold, signal, masked_m)
 
+
 def k_grouped_contig_cases():
     return [
         [128, 128],
@@ -423,7 +424,8 @@ def k_grouped_contig_cases():
         [0, 0, 0, 0, 111, 0, 0, 0, 0],
     ]
 
-@pytest.mark.parametrize("ks_per_group",k_grouped_contig_cases())
+
+@pytest.mark.parametrize("ks_per_group", k_grouped_contig_cases())
 @pytest.mark.parametrize("m", [2048, 4096, 7168])
 @pytest.mark.parametrize("n", [2048, 4096, 7168])
 @pytest.mark.parametrize("a_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -438,9 +440,7 @@ def test_k_grouped_contig_gemm_8bit(
     out_dtype,
 ):
     quant_tile = 128
-    scale_granularity_mnk = (1, 1, quant_tile)
 
-    k = sum(ks_per_group)
     num_expert = len(ks_per_group)
     a_ = []
     b_ = []
@@ -449,13 +449,21 @@ def test_k_grouped_contig_gemm_8bit(
     d = torch.rand((num_expert, m, n), device="musa", dtype=out_dtype)
     d_ref = d.clone()
 
-    ceil_div = lambda m,n: (m + n - 1) // n
+    ceil_div = lambda m, n: (m + n - 1) // n
 
     for i in range(num_expert):
         if ks_per_group[i] == 0:
             continue
-        a = torch.rand((m, ceil_div(ks_per_group[i], quant_tile) * quant_tile), device="musa", dtype=torch.float)
-        b = torch.rand((n, ceil_div(ks_per_group[i], quant_tile) * quant_tile), device="musa", dtype=torch.float)
+        a = torch.rand(
+            (m, ceil_div(ks_per_group[i], quant_tile) * quant_tile),
+            device="musa",
+            dtype=torch.float,
+        )
+        b = torch.rand(
+            (n, ceil_div(ks_per_group[i], quant_tile) * quant_tile),
+            device="musa",
+            dtype=torch.float,
+        )
         quant_tile_shape_a = (1, quant_tile)
         quant_tile_shape_b = (1, quant_tile)
         scale_a_shape = (m, ceil_div(ks_per_group[i], quant_tile))
@@ -468,20 +476,20 @@ def test_k_grouped_contig_gemm_8bit(
         )
         dequant_a = group_dequantize_fp8(fp8_a, scale_a, "K")
         dequant_b = group_dequantize_fp8(fp8_b, scale_b, "K")
-        d_ref[i] += dequant_a[: , : ks_per_group[i]] @ dequant_b[: , : ks_per_group[i]].T
-        a_.append(fp8_a[: , : ks_per_group[i]].transpose(1, 0).contiguous())
-        b_.append(fp8_b[: , : ks_per_group[i]].transpose(1, 0).contiguous())
+        d_ref[i] += dequant_a[:, : ks_per_group[i]] @ dequant_b[:, : ks_per_group[i]].T
+        a_.append(fp8_a[:, : ks_per_group[i]].transpose(1, 0).contiguous())
+        b_.append(fp8_b[:, : ks_per_group[i]].transpose(1, 0).contiguous())
         scale_a_.append(scale_a.transpose(1, 0).contiguous())
         scale_b_.append(scale_b.transpose(1, 0).contiguous())
-    
+
     group_k_idx = torch.tensor(ks_per_group, device="musa", dtype=torch.int32)
-    
+
     fp8_a = torch.cat(a_, dim=0).contiguous()
     scale_a = torch.cat(scale_a_, dim=0).contiguous()
     fp8_b = torch.cat(b_, dim=0).contiguous()
     scale_b = torch.cat(scale_b_, dim=0).contiguous()
 
-    res = mate.gemm.ragged_k_moe_gemm_8bit(
+    mate.gemm.ragged_k_moe_gemm_8bit(
         (fp8_a, scale_a),
         (fp8_b, scale_b),
         group_k_idx,
@@ -497,7 +505,8 @@ def test_k_grouped_contig_gemm_8bit(
             atol=5e-3,
         )
 
-@pytest.mark.parametrize("ks_per_group",k_grouped_contig_cases())
+
+@pytest.mark.parametrize("ks_per_group", k_grouped_contig_cases())
 @pytest.mark.parametrize("m", [2048, 4096, 7168])
 @pytest.mark.parametrize("n", [2048, 4096, 7168])
 @pytest.mark.parametrize("a_type", [torch.bfloat16, torch.half])
@@ -529,16 +538,16 @@ def test_k_grouped_contig_gemm_16bit(
     start_k = 0
     for i in range(num_expert):
         nr_k = ks_per_group[i]
-        a_i = a_fp32[start_k: start_k + nr_k,]
-        b_i = b_fp32[start_k: start_k + nr_k,]
+        a_i = a_fp32[start_k : start_k + nr_k,]
+        b_i = b_fp32[start_k : start_k + nr_k,]
         start_k += nr_k
         d_ref[i] += a_i.T @ b_i
 
-    res = mate.gemm.ragged_k_moe_gemm_16bit(
+    mate.gemm.ragged_k_moe_gemm_16bit(
         a_bf16,
         b_bf16,
-        group_k_idx, 
-        d,   
+        group_k_idx,
+        d,
     )
     d = d.to(torch.float)
     for i in range(num_expert):
@@ -549,6 +558,7 @@ def test_k_grouped_contig_gemm_16bit(
             atol=5e-3,
         )
 
+
 @pytest.mark.parametrize("ms_per_group", get_ragged_moe_gemm_8bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
@@ -556,11 +566,16 @@ def test_k_grouped_contig_gemm_16bit(
 @pytest.mark.parametrize("b_fp8_type", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.half])
 def test_m_contig_gemm_8bit(
-    ms_per_group, n, k, a_fp8_type, b_fp8_type, out_dtype,
+    ms_per_group,
+    n,
+    k,
+    a_fp8_type,
+    b_fp8_type,
+    out_dtype,
 ):
     quant_tile = 128
     scale_granularity_mnk = (1, quant_tile, quant_tile)
-    ceil_div = lambda m,n: (m + n - 1) // n
+    ceil_div = lambda m, n: (m + n - 1) // n
 
     num_expert = len(ms_per_group)
     m = sum(ms_per_group)
@@ -574,8 +589,8 @@ def test_m_contig_gemm_8bit(
 
     quant_tile_shape_a = (1, quant_tile)
     quant_tile_shape_b = (1, quant_tile, quant_tile)
-    scale_a_shape = (m, ceil_div(k , quant_tile))
-    scale_b_shape = (num_expert, ceil_div(n , quant_tile), ceil_div(k , quant_tile))
+    scale_a_shape = (m, ceil_div(k, quant_tile))
+    scale_b_shape = (num_expert, ceil_div(n, quant_tile), ceil_div(k, quant_tile))
     fp8_a, scale_a = group_quantize_fp8(
         a, scale_a_shape, quant_tile_shape_a, a_fp8_type, "K"
     )
@@ -583,7 +598,6 @@ def test_m_contig_gemm_8bit(
         b, scale_b_shape, quant_tile_shape_b, b_fp8_type, "K"
     )
 
-    
     dequant_a = group_dequantize_fp8(fp8_a, scale_a, "K")
     dequant_b = group_dequantize_fp8(fp8_b, scale_b, "K")
     # calc ref
@@ -603,16 +617,21 @@ def test_m_contig_gemm_8bit(
         scale_granularity_mnk=scale_granularity_mnk,
     )
 
-    torch.testing.assert_close(d.to(torch.float), ref_d.to(torch.float), rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(
+        d.to(torch.float), ref_d.to(torch.float), rtol=5e-3, atol=5e-3
+    )
+
 
 @pytest.mark.parametrize("ms_per_group", get_ragged_moe_gemm_16bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.half])
 def test_m_contig_gemm_16bit(
-    ms_per_group, n, k, data_type, 
+    ms_per_group,
+    n,
+    k,
+    data_type,
 ):
-
     num_expert = len(ms_per_group)
     m = sum(ms_per_group)
 
@@ -640,4 +659,56 @@ def test_m_contig_gemm_16bit(
         major_b_mode="N",
     )
 
-    torch.testing.assert_close(d.to(data_type), ref_d.to(data_type), rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(
+        d.to(data_type), ref_d.to(data_type), rtol=5e-3, atol=5e-3
+    )
+
+
+def test_m_contig_gemm_8bit_zero_k_fills_output():
+    num_expert = 2
+    m = 8
+    n = 256
+    scale_granularity_mnk = (1, 128, 128)
+
+    fp8_a = torch.empty((m, 0), device="musa", dtype=torch.float8_e4m3fn)
+    scale_a = torch.empty((m, 0), device="musa", dtype=torch.float)
+    fp8_b = torch.empty((num_expert, n, 0), device="musa", dtype=torch.float8_e4m3fn)
+    scale_b = torch.empty((num_expert, n // 128, 0), device="musa", dtype=torch.float)
+    m_indices = torch.tensor([4, 4], device="musa", dtype=torch.int32)
+    out = torch.ones((m, n), device="musa", dtype=torch.bfloat16)
+
+    mate.gemm.ragged_m_moe_gemm_8bit(
+        (fp8_a, scale_a),
+        (fp8_b, scale_b),
+        m_indices,
+        out,
+        gemm_mode="per_expert",
+        major_a_mode="K",
+        major_b_mode="K",
+        scale_granularity_mnk=scale_granularity_mnk,
+    )
+
+    torch.testing.assert_close(out, torch.zeros_like(out))
+
+
+def test_m_contig_gemm_16bit_zero_k_fills_output():
+    num_expert = 2
+    m = 8
+    n = 256
+
+    a = torch.empty((m, 0), device="musa", dtype=torch.bfloat16)
+    b = torch.empty((num_expert, 0, n), device="musa", dtype=torch.bfloat16)
+    m_indices = torch.tensor([4, 4], device="musa", dtype=torch.int32)
+    out = torch.ones((m, n), device="musa", dtype=torch.bfloat16)
+
+    mate.gemm.ragged_m_moe_gemm_16bit(
+        a,
+        b,
+        m_indices,
+        out,
+        gemm_mode="per_expert",
+        major_a_mode="K",
+        major_b_mode="N",
+    )
+
+    torch.testing.assert_close(out, torch.zeros_like(out))

@@ -3,7 +3,7 @@
 
 #include <mute/arch/copy_mp31_desc.hpp>
 
-#include "mate_utils.muh"
+#include "mate_utils.hpp"
 #include "musa.h"
 
 struct MateAsmKernel {

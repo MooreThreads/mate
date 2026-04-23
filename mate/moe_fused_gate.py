@@ -1,6 +1,17 @@
+import functools
+
 import torch
-import mate._C  # noqa: F401
 from mate.api_logging import mate_api
+from mate.jit.moe_fused_gate import get_moe_fused_gate_module
+
+
+def _contiguous_or_none(x: torch.Tensor | None) -> torch.Tensor | None:
+    return None if x is None else x.contiguous()
+
+
+@functools.cache
+def _get_module():
+    return get_moe_fused_gate_module()
 
 
 @mate_api
@@ -66,14 +77,24 @@ def moe_fused_gate(
         - topk_weights: float tensor of shape ``(num_tokens, topk)``
         - topk_indices: int tensor of shape ``(num_tokens, topk)``
     """
-    if map_policy == 1:
-        assert static_index_map is not None
-    elif map_policy == 2:
-        assert dynamic_index_map is not None
-        assert dynamic_index_map_valid is not None
-        assert random_index is not None
+    input = input.contiguous()
+    bias = bias.contiguous()
+    topk_group = min(topk_group, num_expert_group)
+    static_index_map = _contiguous_or_none(static_index_map)
+    dynamic_index_map = _contiguous_or_none(dynamic_index_map)
+    dynamic_index_map_valid = _contiguous_or_none(dynamic_index_map_valid)
+    random_index = _contiguous_or_none(random_index)
 
-    return torch.ops.mate.moe_fused_gate(
+    output = torch.empty(
+        (input.shape[0], topk), dtype=torch.float32, device=input.device
+    )
+    indices = torch.empty(
+        (input.shape[0], topk), dtype=torch.int32, device=input.device
+    )
+
+    _get_module().run(
+        output,
+        indices,
         input,
         bias,
         num_expert_group,
@@ -91,3 +112,4 @@ def moe_fused_gate(
         num_physical_experts,
         map_policy,
     )
+    return output, indices

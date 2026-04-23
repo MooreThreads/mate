@@ -7,7 +7,12 @@ from mate.testing.utils import (
     make_deepgemm_contig_m_indices,
     make_deepgemm_masked_m,
 )
-from mate.deep_gemm import m_grouped_fp8_gemm_nt_contiguous, m_grouped_fp8_gemm_nt_masked, k_grouped_fp8_gemm_tn_contiguous, k_grouped_bf16_gemm_tn_contiguous
+from mate.deep_gemm import (
+    m_grouped_fp8_gemm_nt_contiguous,
+    m_grouped_fp8_gemm_nt_masked,
+    k_grouped_fp8_gemm_tn_contiguous,
+    k_grouped_bf16_gemm_tn_contiguous,
+)
 
 
 def bench_group_deepgemm_fp8_nt_groupwise(
@@ -140,14 +145,15 @@ def bench_batch_deepgemm_fp8_nt_groupwise(
 
     return tflops_per_second, memory_bandwidth_per_second
 
+
 def bench_k_grouped_contig_fp8_tn_groupwise(
     ks_per_group,
-    m, n,
+    m,
+    n,
     in_dtype,
     out_dtype,
     verbose=True,
 ):
-
     quant_tile = 128
     scale_granularity_mnk = (1, 1, quant_tile)
 
@@ -157,13 +163,21 @@ def bench_k_grouped_contig_fp8_tn_groupwise(
     b_ = []
     scale_a_ = []
     scale_b_ = []
-    ceil_div = lambda m,n: (m + n - 1) // n
+    ceil_div = lambda m, n: (m + n - 1) // n
     d = torch.rand((num_expert, m, n), device="musa", dtype=out_dtype)
     for i in range(num_expert):
         if ks_per_group[i] == 0:
             continue
-        a = torch.rand((m, ceil_div(ks_per_group[i], quant_tile) * quant_tile), device="musa", dtype=torch.float)
-        b = torch.rand((n, ceil_div(ks_per_group[i], quant_tile) * quant_tile), device="musa", dtype=torch.float)
+        a = torch.rand(
+            (m, ceil_div(ks_per_group[i], quant_tile) * quant_tile),
+            device="musa",
+            dtype=torch.float,
+        )
+        b = torch.rand(
+            (n, ceil_div(ks_per_group[i], quant_tile) * quant_tile),
+            device="musa",
+            dtype=torch.float,
+        )
         quant_tile_shape_a = (1, quant_tile)
         quant_tile_shape_b = (1, quant_tile)
         scale_a_shape = (m, ceil_div(ks_per_group[i], quant_tile))
@@ -174,13 +188,13 @@ def bench_k_grouped_contig_fp8_tn_groupwise(
         fp8_b, scale_b = group_quantize_fp8(
             b, scale_b_shape, quant_tile_shape_b, in_dtype, "K"
         )
-        a_.append(fp8_a[: , : ks_per_group[i]].transpose(1, 0).contiguous())
-        b_.append(fp8_b[: , : ks_per_group[i]].transpose(1, 0).contiguous())
+        a_.append(fp8_a[:, : ks_per_group[i]].transpose(1, 0).contiguous())
+        b_.append(fp8_b[:, : ks_per_group[i]].transpose(1, 0).contiguous())
         scale_a_.append(scale_a.transpose(1, 0).contiguous())
         scale_b_.append(scale_b.transpose(1, 0).contiguous())
-    
+
     group_k_idx = torch.tensor(ks_per_group, device="musa", dtype=torch.int32)
-    
+
     fp8_a = torch.cat(a_, dim=0).contiguous()
     scale_a = torch.cat(scale_a_, dim=0).contiguous()
     fp8_b = torch.cat(b_, dim=0).contiguous()
@@ -202,11 +216,9 @@ def bench_k_grouped_contig_fp8_tn_groupwise(
     ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
     total_bytes = m * k + n * k + num_expert * m * n * 2 * 4
-    total_bytes += (
-        scale_a.numel() + scale_b.numel() + group_k_idx.numel()
-    ) * 4
+    total_bytes += (scale_a.numel() + scale_b.numel() + group_k_idx.numel()) * 4
     memory_bandwidth_per_second = total_bytes * 1e-6 / ms
-    
+
     if verbose:
         print(
             f"bench_k_grouped_contig_fp8_tn_groupwise nr_group={num_expert} m={m} n={n} k={k}\n"
@@ -218,14 +230,15 @@ def bench_k_grouped_contig_fp8_tn_groupwise(
 
     return tflops_per_second, memory_bandwidth_per_second
 
+
 def bench_k_grouped_contig_bf16_tn_groupwise(
     ks_per_group,
-    m, n,
+    m,
+    n,
     in_dtype,
     out_dtype,
     verbose=True,
 ):
-
     k = sum(ks_per_group)
     num_expert = len(ks_per_group)
 
@@ -234,7 +247,6 @@ def bench_k_grouped_contig_bf16_tn_groupwise(
     group_k_idx = torch.tensor(ks_per_group, device="musa", dtype=torch.int32)
 
     d = torch.zeros((num_expert, m, n), device="musa", dtype=out_dtype)
-    d_ref = d.clone()
 
     a_bf16 = a_fp32.clone().to(in_dtype)
     b_bf16 = b_fp32.clone().to(in_dtype)
@@ -254,11 +266,9 @@ def bench_k_grouped_contig_bf16_tn_groupwise(
     ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms
     total_bytes = m * k + n * k + num_expert * m * n * 2 * 4
-    total_bytes += (
-        group_k_idx.numel()
-    ) * 4
+    total_bytes += (group_k_idx.numel()) * 4
     memory_bandwidth_per_second = total_bytes * 1e-6 / ms
-    
+
     if verbose:
         print(
             f"bench_k_grouped_contig_bf16_tn_groupwise nr_group={num_expert} m={m} n={n} k={k}\n"
@@ -269,8 +279,6 @@ def bench_k_grouped_contig_bf16_tn_groupwise(
         print()
 
     return tflops_per_second, memory_bandwidth_per_second
-
-
 
 
 def get_group_deepgemm_fp8_nt_groupwise_cases():
@@ -318,36 +326,132 @@ def get_batch_deepgemm_fp8_nt_groupwise_cases():
 
     return cases
 
+
 def k_grouped_contig_cases():
     k_list = [
-        [512, 768, 640, 384, 1152, 1536, 640, 640, 640, 768, 896, 640, 
-         640, 1152, 896, 896, 1280, 768, 640, 640, 1152, 512, 384, 768, 
-         768, 640, 896, 640, 1152, 768, 512, 1152, 768, 512, 512, 640, 
-         512, 768, 512, 896, 768, 896, 768, 640, 896, 768, 896, 896],
-        [403,  649,  628,  338, 1095, 1426,  589,  591,  626,  709,  871,  542,
-         586, 1072,  797,  811, 1176,  658,  611,  604, 1113,  505,  266,  741,
-         647,  587,  847,  628, 1051,  764,  436, 1047,  707,  476,  453,  535,
-         459,  687,  482,  808,  727,  803,  738,  583,  854,  690,  863,  886]
+        [
+            512,
+            768,
+            640,
+            384,
+            1152,
+            1536,
+            640,
+            640,
+            640,
+            768,
+            896,
+            640,
+            640,
+            1152,
+            896,
+            896,
+            1280,
+            768,
+            640,
+            640,
+            1152,
+            512,
+            384,
+            768,
+            768,
+            640,
+            896,
+            640,
+            1152,
+            768,
+            512,
+            1152,
+            768,
+            512,
+            512,
+            640,
+            512,
+            768,
+            512,
+            896,
+            768,
+            896,
+            768,
+            640,
+            896,
+            768,
+            896,
+            896,
+        ],
+        [
+            403,
+            649,
+            628,
+            338,
+            1095,
+            1426,
+            589,
+            591,
+            626,
+            709,
+            871,
+            542,
+            586,
+            1072,
+            797,
+            811,
+            1176,
+            658,
+            611,
+            604,
+            1113,
+            505,
+            266,
+            741,
+            647,
+            587,
+            847,
+            628,
+            1051,
+            764,
+            436,
+            1047,
+            707,
+            476,
+            453,
+            535,
+            459,
+            687,
+            482,
+            808,
+            727,
+            803,
+            738,
+            583,
+            854,
+            690,
+            863,
+            886,
+        ],
     ]
-    mn_list = [(2048,7168),(7168,2048),(4096,7168),(7168,4096)]
+    mn_list = [(2048, 7168), (7168, 2048), (4096, 7168), (7168, 4096)]
 
-    return [(m,n,ks) for (m,n) in mn_list for ks in k_list]
+    return [(m, n, ks) for (m, n) in mn_list for ks in k_list]
+
 
 if __name__ == "__main__":
     print("=== DeepGEMM Grouped FP8 GEMM Benchmark ===\n")
-    mn = [(2048,7168),(7168,2048),(4096,7168),(7168,4096)]
-    for (m, n, ks) in k_grouped_contig_cases():
+    mn = [(2048, 7168), (7168, 2048), (4096, 7168), (7168, 4096)]
+    for m, n, ks in k_grouped_contig_cases():
         bench_k_grouped_contig_fp8_tn_groupwise(
             ks,
-            m, n,
+            m,
+            n,
             torch.float8_e4m3fn,
             torch.float,
             verbose=True,
         )
-    for (m, n, ks) in k_grouped_contig_cases():
+    for m, n, ks in k_grouped_contig_cases():
         bench_k_grouped_contig_bf16_tn_groupwise(
             ks,
-            m, n,
+            m,
+            n,
             torch.bfloat16,
             torch.float,
             verbose=True,

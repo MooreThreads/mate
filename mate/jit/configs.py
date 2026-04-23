@@ -1,11 +1,25 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 
 Config = Dict[str, Any]
 DomainFn = Callable[[Config], Iterable[Any]]
 Domain = Union[Iterable[Any], DomainFn]
+CaseKey = TypeVar("CaseKey", bound=Hashable)
 
 
 @dataclass(frozen=True)
@@ -126,9 +140,13 @@ class KernelConfigGraph:
 
 
 def domain_by_case(
-    case, table: Dict[str, Dict[str, Any]], key: str, *, empty_ok: bool = False
-) -> Callable[[Dict[str, Any]], Iterable[Any]]:
-    def _domain(cfg: Dict[str, Any]) -> Iterable[Any]:
+    case: Callable[[Config], CaseKey],
+    table: Mapping[CaseKey, Mapping[str, Any]],
+    key: str,
+    *,
+    empty_ok: bool = False,
+) -> Callable[[Config], Iterable[Any]]:
+    def _domain(cfg: Config) -> Iterable[Any]:
         c = case(cfg)
         if c not in table or key not in table[c]:
             if empty_ok:
@@ -146,9 +164,13 @@ def domain_by_case(
 
 
 def value_by_case(
-    case, table: Dict[str, Dict[str, Any]], key: str, *, required: bool = True
-) -> Callable[[Dict[str, Any]], Any]:
-    def _compute(cfg: Dict[str, Any]) -> Any:
+    case: Callable[[Config], CaseKey],
+    table: Mapping[CaseKey, Mapping[str, Any]],
+    key: str,
+    *,
+    required: bool = True,
+) -> Callable[[Config], Any]:
+    def _compute(cfg: Config) -> Any:
         c = case(cfg)
         if c in table and key in table[c]:
             return table[c][key]

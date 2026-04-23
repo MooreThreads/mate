@@ -23,6 +23,6 @@ dist/
 
 # temporary files
 mate/jit/aot-levels.json
-aot-lib/
+aot-ops/
 temp/
-mate/jit/aot-levels.json
+*.so

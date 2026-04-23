@@ -1,6 +1,5 @@
 import torch
 import mate
-import math
 import pytest
 import random
 from mate.testing.utils import (
@@ -670,24 +669,6 @@ def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
 
         diff = calc_diff(logits_masked, ref_logits_masked)
         assert diff < 1e-3, f"{diff=}"
-
-        ref_cost_val = float(ref_cost)
-    else:
-        ref_cost = ref_fp8_mqa_logits(
-            q=q,
-            kv=kv,
-            weights=weights,
-            cu_seqlen_ks=ks,
-            cu_seqlen_ke=ke,
-            cost_only=True,
-        )
-        ref_cost_val = float(ref_cost)
-
-    tflops_nominal = 2.0 * ref_cost_val * num_heads * head_dim / 1e12
-    arith_bytes = (
-        count_bytes(q_fp8, kv_fp8, weights, ks, ke, kv_scale) + ref_cost_val * 4
-    )
-    clean_bytes = (seq_q * seq_kv - ref_cost_val) * 4 + count_bytes(ks, ke)
 
     if compressed_logits:
 

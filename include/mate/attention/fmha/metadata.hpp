@@ -1,5 +1,7 @@
 #include <mutlass/fast_math.h>
 
+#include <cub/cub.cuh>
+
 #include "fmha.hpp"
 
 template <typename T, typename Compare>
@@ -142,6 +144,11 @@ struct BlockMergeSortLike_1Item {
   }
 };
 
+__device__ __forceinline__ int split_removal_cost(int num_n_blocks, int num_splits) {
+  return num_splits > 1 ? mutlass::ceil_div(num_n_blocks, num_splits - 1) - mutlass::ceil_div(num_n_blocks, num_splits)
+                        : INT_MAX;
+}
+
 namespace mate::attention::fmha {
 // Sort in descending order
 template <typename T>
@@ -203,10 +210,34 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
   static constexpr int BATCH_PER_THREAD = 1;
   static constexpr int BLOCK_DIM_X      = NumWarps * mutlass::NumThreadsPerWarp;
   static_assert(BLOCK_DIM_X * BATCH_PER_THREAD == NumWarps * mutlass::NumThreadsPerWarp);
-  using BlockMergeSort = BlockMergeSortLike_1Item<int4, BLOCK_DIM_X>;
+  using LPT = BlockMergeSortLike_1Item<int4, BLOCK_DIM_X>;
+  // using LPT = cub::BlockMergeSort<int4, BLOCK_DIM_X, BATCH_PER_THREAD>;
+  using SplitReduce = cub::BlockReduce<int, BLOCK_DIM_X>;
 
-  __shared__ int                                  total_blocks_smem[1];
-  __shared__ typename BlockMergeSort::TempStorage temp_storage;
+  __shared__ int total_blocks_smem[1];
+
+  // Shared buffers for budget-aware split refinement.
+  __shared__ int total_splits_smem;
+  __shared__ int select_flags[BLOCK_DIM_X];
+
+  __shared__ typename SplitReduce::TempStorage splits_reduce_smem;
+
+  struct SplitReductionCandidate {
+    int          removal_cost;
+    unsigned int thread_idx;
+  };
+  struct SplitReductionCandidateAsc {
+    __device__ __forceinline__ bool operator()(SplitReductionCandidate const& lhs,
+                                               SplitReductionCandidate const& rhs) const {
+      return lhs.removal_cost < rhs.removal_cost ||
+             (lhs.removal_cost == rhs.removal_cost && lhs.thread_idx < rhs.thread_idx);
+    }
+  };
+  using SplitReductionSort = BlockMergeSortLike_1Item<SplitReductionCandidate, BLOCK_DIM_X>;
+  // using SplitReductionSort = cub::BlockMergeSort<SplitReductionCandidate, BLOCK_DIM_X, BATCH_PER_THREAD>;
+  __shared__ typename SplitReductionSort::TempStorage split_reduction_sort_storage;
+
+  __shared__ typename LPT::TempStorage lpt_storage;
 
   if (threadIdx.x == 0) {
     total_blocks_smem[0] = 0;
@@ -296,27 +327,50 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
 
     int blocks_per_mp =
         static_cast<int>(ceilf(static_cast<float>(total_blocks) * 1.1f * static_cast<float>(num_head) / num_mp));
-    num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_mp - 1) / blocks_per_mp, num_splits_static), 1);
-    int n_blocks_per_tile = mutlass::ceil_div(num_n_blocks, num_splits_dynamic);
-    int extra_n_blocks    = n_blocks_per_tile * num_splits_dynamic - num_n_blocks;
-    // if(threadIdx.x==0){
-    //   printf("n_blocks_per_tile: %d num_splits_dyn: %d num_n_blocks: %d\n",
-    //     n_blocks_per_tile, num_splits_dynamic, num_n_blocks);
-    //   printf("extra_n_blocks: %d\n", extra_n_blocks);
-    // }
-    while (extra_n_blocks >= n_blocks_per_tile) {
-      // if(threadIdx.x==0)
-      //   printf("n_blocks_per_tile: %d num_splits_dyn: %d \n", n_blocks_per_tile, num_splits_dynamic);
-      num_splits_dynamic--;
-      n_blocks_per_tile = mutlass::ceil_div(num_n_blocks, num_splits_dynamic);
-      extra_n_blocks    = n_blocks_per_tile * num_splits_dynamic - num_n_blocks;
-      // if(threadIdx.x==0)
-      //   printf("extra_n_blocks: %d\n", extra_n_blocks);
+    // if (threadIdx.x == 0) printf("total_block=%d, blocks_per_mp=%d\n", total_blocks, blocks_per_mp);
+    num_splits_dynamic = std::max(std::min(mutlass::ceil_div(num_n_blocks, blocks_per_mp), num_splits_static), 1);
+
+    int valid_thread = (lane < kNumBatchPerWarp && batch_idx < num_batch) ? 1 : 0;
+
+    // Start from the upstream-style base heuristic, then enforce the global
+    // SM budget by repeatedly removing one split from the cheapest requests.
+    int total_splits = SplitReduce(splits_reduce_smem).Sum(valid_thread ? num_splits_dynamic : 0);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      total_splits_smem = total_splits;
     }
-    // if(threadIdx.x==0){
-    // printf("new_num_n_blocks: %d num_splits_dyn: %d \n", n_blocks_per_tile, num_splits_dynamic);
-    // printf("extra_n_blocks: %d\n", extra_n_blocks);}
-    num_n_blocks = n_blocks_per_tile;
+    __syncthreads();
+
+    int overflow = max(total_splits_smem - num_mp, 0);
+    while (overflow > 0) {
+      SplitReductionCandidate items[BATCH_PER_THREAD];
+      items[0] = {valid_thread ? split_removal_cost(num_n_blocks, num_splits_dynamic) : INT_MAX,
+                  static_cast<unsigned int>(threadIdx.x)};
+
+      SplitReductionSort(split_reduction_sort_storage).Sort(items, SplitReductionCandidateAsc());
+      __syncthreads();
+
+      select_flags[threadIdx.x] = 0;
+      if (threadIdx.x < overflow && items[0].removal_cost != INT_MAX) {
+        select_flags[items[0].thread_idx] = 1;
+      }
+      __syncthreads();
+
+      int reduced_this_round = valid_thread && select_flags[threadIdx.x] && num_splits_dynamic > 1 ? 1 : 0;
+      if (reduced_this_round) --num_splits_dynamic;
+      int total_reduced = SplitReduce(splits_reduce_smem).Sum(reduced_this_round);
+      __syncthreads();
+
+      if (threadIdx.x == 0) {
+        total_splits_smem = total_reduced;
+      }
+      __syncthreads();
+
+      if (total_splits_smem == 0) break;
+      overflow -= total_splits_smem;
+    }
+    num_n_blocks = mutlass::ceil_div(num_n_blocks, num_splits_dynamic);
   }
 
   if constexpr (Sort) {
@@ -330,7 +384,7 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
     int4 batch_coords[BATCH_PER_THREAD];
     batch_coords[0] = make_int4(num_n_blocks, num_m_blocks, num_splits_dynamic, batch_idx);
     // Sort
-    BlockMergeSort(temp_storage).Sort(batch_coords, PrepareSortOp<int4>());
+    LPT(lpt_storage).Sort(batch_coords, PrepareSortOp<int4>());
 
     if constexpr (Causal) {
       batch_coords[0].x =

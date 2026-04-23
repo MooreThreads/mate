@@ -2,11 +2,11 @@
 
 #include <mutlass/mutlass.h>
 
-#include <collective/fmha_common.hpp>
 #include <mute/tensor.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
 
 #include "../../common/mma_mp31_sqmma.hpp"
+#include "mate/attention/fmha/utils.hpp"
 
 namespace mate::deep_gemm {
 
@@ -609,7 +609,7 @@ struct Mp31Fp8NonPagedMqaLogits {
       TiledMma tiled_mma;
       auto     thr_mma = tiled_mma.get_thread_slice(thread_idx_in_warp_squad);
 
-      constexpr int reduction_target = size(mutlass::fmha::collective::reduction_target_n(tiled_mma));
+      constexpr int reduction_target = size(mate::attention::fmha::reduction_target_n(tiled_mma));
       Tensor        weights          = make_tensor<float>(Shape<Int<kBlockQ>, Int<kNumHeads / reduction_target>>{});
 
       Tensor sW   = make_tensor(make_smem_ptr(shared_storage.smem_weights.data()), SmemLayoutWView{});
@@ -656,9 +656,8 @@ struct Mp31Fp8NonPagedMqaLogits {
           pipeline_k.consumer_wait(pipe_k_read);
           const uint32_t kv_stage_idx = pipe_k_read.index();
 
-          Tensor accum = partition_fragment_C(TiledMma{}, take<0, 2>(TileShape{}));
-          Tensor accum_mn =
-              make_tensor(accum.data(), mutlass::fmha::collective::layout_acc_mn(tiled_mma, accum.layout()));
+          Tensor accum    = partition_fragment_C(TiledMma{}, take<0, 2>(TileShape{}));
+          Tensor accum_mn = make_tensor(accum.data(), mate::attention::fmha::layout_acc_mn(tiled_mma, accum.layout()));
           clear(accum);
 
           mute::gemm(tiled_mma, tKrK(_, _, _, kv_stage_idx), tQrQ(_, _, _, q_stage), accum);
@@ -667,9 +666,9 @@ struct Mp31Fp8NonPagedMqaLogits {
           using LayoutC_TV = typename TiledMma::LayoutC_TV;
 
           constexpr auto separated =
-              mutlass::fmha::collective::layout_separate(get<0>(typename TiledMma::Shape_MNK{}),
-                                                         mute::make_layout(mute::shape<0>(LayoutC_TV{})),
-                                                         mute::stride<0>(LayoutC_TV{}));
+              mate::attention::fmha::layout_separate(get<0>(typename TiledMma::Shape_MNK{}),
+                                                     mute::make_layout(mute::shape<0>(LayoutC_TV{})),
+                                                     mute::stride<0>(LayoutC_TV{}));
           constexpr int lanes_per_pos = mute::size(get<1>(separated));
 
           constexpr int kSubWarpStride = mutlass::NumThreadsPerWarp / lanes_per_pos;

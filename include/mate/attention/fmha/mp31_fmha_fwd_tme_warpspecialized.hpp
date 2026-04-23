@@ -35,6 +35,8 @@ template <class Element_,
           int  NumQKConsumers_,
           bool HasCuseqlensQ_,
           bool HasCuseqlensK_,
+          bool HasCuseqlensKNew_,
+          bool HasKvBatchIdx_,
           bool HasSequsedQ_,
           bool HasSequsedK_,
           bool IsPagedKV_,
@@ -43,6 +45,7 @@ template <class Element_,
           bool IsLocal_,
           bool HasLearnableSink_,
           bool HasSoftcap_,
+          bool IsAppendKV_,
           int  HeadRatio_,
           bool IsPackGQA_,
           bool Split_,
@@ -56,6 +59,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using TileShape                    = TileShape_;
   static constexpr int TileM         = get<0>(TileShape{});
   static constexpr int TileN         = get<1>(TileShape{});
+  static constexpr int TileK         = get<2>(TileShape{});  // Entry for future headdim tiling
   static constexpr int HeadDimQK     = get<2>(TileShape{});
   static constexpr int HeadDimVO     = HeadDimV_;
   static constexpr int HeadRatio     = HeadRatio_;
@@ -71,10 +75,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static_assert(TileM % NumQKConsumers == 0);
   static_assert(TileM % NumPVConsumers == 0);
 
-  static constexpr bool HasCuseqlensQ = HasCuseqlensQ_;
-  static constexpr bool HasCuseqlensK = HasCuseqlensK_;
-  static constexpr bool HasSequsedQ   = HasSequsedQ_;
-  static constexpr bool HasSequsedK   = HasSequsedK_;
+  static constexpr bool HasCuseqlensQ    = HasCuseqlensQ_;
+  static constexpr bool HasCuseqlensK    = HasCuseqlensK_;
+  static constexpr bool HasCuseqlensKNew = HasCuseqlensKNew_;
+  static constexpr bool HasKvBatchIdx    = HasKvBatchIdx_;
+  static constexpr bool HasSequsedQ      = HasSequsedQ_;
+  static constexpr bool HasSequsedK      = HasSequsedK_;
 
   static constexpr bool IsPackGQA = IsPackGQA_;
   static constexpr bool IsPagedKV = IsPagedKV_;
@@ -85,10 +91,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool HasLearnableSink = HasLearnableSink_;
   static constexpr bool HasSoftcap       = HasSoftcap_;
 
-  static constexpr bool EnableCP = EnableCP_;
+  static constexpr bool EnableCP   = EnableCP_;
+  static constexpr bool IsAppendKV = IsAppendKV_;
+
+  static constexpr bool SameHeadDim = HeadDimQK == HeadDimVO;
 
   static constexpr int UsePackGQATMELoad =
-      IsPackGQA_ && mutlass::is_pow2<TileHeadRatio>::value && TileM % HeadRatio == 0;
+      IsPackGQA_ && mutlass::is_pow2<TileHeadRatio>::value && TileM % TileHeadRatio == 0;
   static constexpr bool UseTMELoadQ = !IsPackGQA_ || UsePackGQATMELoad;
   static constexpr bool UseLSULoadQ = !UseTMELoadQ;
 
@@ -135,8 +144,18 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
   using StrideDescale = Stride<int64_t, int64_t>;
 
-  using SeqlenInfo = SeqlenInfoQK<HasCuseqlensQ, HasSequsedQ, HasCuseqlensK, HasSequsedK, EnableCP>;
+  using SeqlenInfo = SeqlenInfoQK<HasCuseqlensQ,
+                                  HasSequsedQ,
+                                  HasCuseqlensK,
+                                  HasSequsedK,
+                                  false /* HasLeftpadK */,
+                                  IsAppendKV,
+                                  HasCuseqlensKNew,
+                                  EnableCP>;
   using BlockInfo  = BlockInfo<SeqlenInfo, TileM, TileN, HeadRatio, IsCausal, IsLocal, IsPackGQA, Split, EnableCP>;
+
+  // NOTE: RoPE not implemented yet.
+  // using Rotary = Rotary<TileN, TileK, NumMmaThreads, Element>;
 
   using PackGQAManager   = PackGQAManager<Element, HeadRatio, TileM, HeadDimQK, NumProducerThreads>;
   using TileMPack        = Shape<Int<TileHeadRatio>, Int<TileM / TileHeadRatio>>;
@@ -201,14 +220,20 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using SmemLayoutVLsu = decltype(tile_to_shape(
       SmemAtomLayoutVLsu{}, make_shape(shape<2>(TileShapePDV{}), shape<1>(TileShapePDV{}), Int<StagesV>{})));
 
-  static constexpr TME::CacheHint TmeQInnerHint = TME::CacheHint::CACHE_NORMAL;
-  static constexpr TME::CacheHint TmeQOuterHint = TME::CacheHint::CACHE_NORMAL;
-  static constexpr TME::CacheHint TmeKInnerHint = TME::CacheHint::CACHE_NORMAL;
-  static constexpr TME::CacheHint TmeKOuterHint = TME::CacheHint::CACHE_NORMAL;
-  static constexpr TME::CacheHint TmeVInnerHint = TME::CacheHint::CACHE_NORMAL;
-  static constexpr TME::CacheHint TmeVOuterHint = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeQInnerHint    = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeQOuterHint    = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeKInnerHint    = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeKOuterHint    = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeVInnerHint    = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeVOuterHint    = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeKNewInnerHint = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeKNewOuterHint = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeVNewInnerHint = TME::CacheHint::CACHE_NORMAL;
+  static constexpr TME::CacheHint TmeVNewOuterHint = TME::CacheHint::CACHE_NORMAL;
 
   using TmeLoadKeyBuilder = Mp31FmhaTmeLoadKeyBuilder<Element, SmemLayoutK, StrideQKV, TmeKInnerHint, TmeKOuterHint>;
+  using TmeLoadKeyNewBuilder =
+      Mp31FmhaTmeLoadKeyBuilderNoPermute<Element, SmemLayoutK, StrideQKV, TmeKNewInnerHint, TmeKNewOuterHint>;
 
   static constexpr int FragmentSize = TmeLoadKeyBuilder::Fragment;
 
@@ -231,6 +256,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       SmemLayoutTMELoadQ{},
       TileShapeQ{}));
   using TME_K      = typename TmeLoadKeyBuilder::TME_K;
+  using TME_KNew   = typename TmeLoadKeyNewBuilder::TME_K;
   using TME_V      = decltype(make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
@@ -249,19 +275,29 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using PermuteTileK   = Tile<Underscore, typename LsuLoadKeyBuilder::PermuteTileN, Underscore>;
   using FragmentTypeK  = typename LsuLoadKeyBuilder::FragmentType;
 
-  using MainloopPipelineQ = std::conditional_t<!UseTMELoadQ,
-                                               mutlass::Mp31PipelineAsyncWarpsepcialized<StagesQ>,
-                                               mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesQ>>;
-  using MainloopPipelineK = std::conditional_t<UseLSULoadK,
-                                               mutlass::Mp31PipelineAsyncWarpsepcialized<StagesK>,
-                                               mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesK>>;
-  using MainloopPipelineV = std::conditional_t<UseLSULoadV,
-                                               mutlass::Mp31PipelineAsyncWarpsepcialized<StagesV>,
-                                               mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesV>>;
+  static constexpr int GmemElemsPerLoad  = 128 / sizeof_bits_v<Element>;
+  static constexpr int GmemThreadsPerRow = 8;
+  using GmemCopyAtomAppedKV              = mute::Copy_Atom<MP31_ROBUST_STORE<mute::uint128_t>, Element>;
+  using GmemLayoutAtomAppedKV =
+      Layout<Shape<Int<NumMmaThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>, Stride<Int<GmemThreadsPerRow>, _1>>;
+  using GmemTiledCopyAppendKV = decltype(make_tiled_copy(
+      GmemCopyAtomAppedKV{}, GmemLayoutAtomAppedKV{}, Layout<Shape<_1, Int<GmemElemsPerLoad>>>{}));
 
-  using PipelineQState = typename MainloopPipelineQ::PipelineState;
-  using PipelineKState = typename MainloopPipelineK::PipelineState;
-  using PipelineVState = typename MainloopPipelineV::PipelineState;
+  using MainloopPipelineQ     = std::conditional_t<!UseTMELoadQ,
+                                                   mutlass::Mp31PipelineAsyncWarpsepcialized<StagesQ>,
+                                                   mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesQ>>;
+  using MainloopPipelineK     = std::conditional_t<UseLSULoadK,
+                                                   mutlass::Mp31PipelineAsyncWarpsepcialized<StagesK>,
+                                                   mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesK>>;
+  using MainloopPipelineV     = std::conditional_t<UseLSULoadV,
+                                                   mutlass::Mp31PipelineAsyncWarpsepcialized<StagesV>,
+                                                   mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesV>>;
+  using MainloopPipelineKVNew = mutlass::Mp31PipelineTmeAsync<StagesK>;  // Always use TME for new KV
+
+  using PipelineQState     = typename MainloopPipelineQ::PipelineState;
+  using PipelineKState     = typename MainloopPipelineK::PipelineState;
+  using PipelineVState     = typename MainloopPipelineV::PipelineState;
+  using PipelineKVNewState = typename MainloopPipelineKVNew::PipelineState;
 
   struct SharedStorage {
     mute::array_aligned<Element, cosize_v<SmemLayoutQ>> smem_q;
@@ -294,12 +330,17 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Element const* const ptr_V_new;
     StrideQKV const      stride_V_new;
 
+    // Qv
+    // Element const* const ptr_Qv;
+    // StrideQK const stride_Qv;
+
     // Rotary
     Element const* const ptr_rotary_cos;
     ShapeRotary const    shape_rotary;
     StrideRotary const   stride_rotary_cos;
     Element const* const ptr_rotary_sin;
     StrideRotary const   stride_rotary_sin;
+    // bool const is_rotary_interleaved;
 
     // PageTable
     int const* const      ptr_pagetable;
@@ -319,6 +360,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int const window_size_left  = -1;
     int const window_size_right = -1;
 
+    // Chunk
+    // int const attention_chunk = 0;
+
     // Learnable Sink
     ElementSink const* ptr_learnable_sink;
 
@@ -334,7 +378,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     uint32_t const* const cu_seqlens_k_new = nullptr;
     uint32_t const* const seqused_q        = nullptr;
     uint32_t const* const seqused_k        = nullptr;
-    uint32_t const* const seqlens_rotary   = nullptr;
+    // uint32_t const* const leftpad_k        = nullptr;
+    uint32_t const* const seqlens_rotary = nullptr;
 
     // CP
     int             cp_world_size    = 1;
@@ -364,12 +409,19 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Element const* const ptr_V_new;
     StrideQKV const      stride_V_new;
 
+    // Qv
+    // Element const* const ptr_Qv;
+    // StrideV const stride_Qv;
+    // ShapeQPacked const shape_Qv_packed;
+    // StrideQPacked const stride_Qv_packed;
+
     // Rotary
     Element const* const ptr_rotary_cos;
     ShapeRotary const    shape_rotary;
     StrideRotary const   stride_rotary_cos;
     Element const* const ptr_rotary_sin;
     StrideRotary const   stride_rotary_sin;
+    // bool const is_rotary_interleaved;
 
     // PageTable
     int const* const      ptr_pagetable;
@@ -377,17 +429,24 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     StridePageTable const stride_pagetable;
 
     mutlass::FastDivmod const page_size_divmod;
+    // mutlass::FastDivmod const blockN_per_page_size_divmod;
+    // mutlass::FastDivmod const qhead_per_khead_divmod;
 
     // TiledCopy
-    TME_Q tme_load_Q;
-    TME_K tme_load_K;
-    TME_V tme_load_V;
+    TME_Q    tme_load_Q;
+    TME_K    tme_load_K;
+    TME_V    tme_load_V;
+    TME_KNew tme_load_K_new;
+    TME_V    tme_load_V_new;
+    // TME_Qv tme_load_Qv;
 
     // Robust Desc
     RobustDescriptor const desc_Q;
     RobustDescriptor const desc_K;
     RobustDescriptor const desc_V;
     RobustDescriptor const desc_page_table;
+    RobustDescriptor const desc_K_new;
+    RobustDescriptor const desc_V_new;
 
     // Scale
     float const         softmax_scale;
@@ -412,6 +471,9 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     float const softcap_val = 0.f;
 
+    // Chunk
+    // mutlass::FastDivmod attention_chunk_divmod;
+
     // Aux tensors
     uint32_t const* const kv_batch_idx     = nullptr;
     uint32_t const* const cu_seqlens_q     = nullptr;
@@ -419,7 +481,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     uint32_t const* const cu_seqlens_k_new = nullptr;
     uint32_t const* const seqused_q        = nullptr;
     uint32_t const* const seqused_k        = nullptr;
-    uint32_t const* const seqlens_rotary   = nullptr;
+    // uint32_t const* const leftpad_k        = nullptr;
+    uint32_t const* const seqlens_rotary = nullptr;
 
     // CP
     int             cp_world_size    = 1;
@@ -475,6 +538,24 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     // print(tme_load_V);
     // print("\n");
 
+    // AppendKV
+    Tensor   mKnew          = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
+    TME_KNew tme_load_K_new = TmeLoadKeyNewBuilder::make_tme_copy(conditional_return<IsAppendKV>(mKnew, mK));
+    int cosize_k_new = get<0>(args.shape_K_new) == 0 ? 0 : cosize(make_layout(args.shape_K_new, args.stride_K_new));
+
+    RobustDescriptor desc_K_new = make_robust_desc(args.ptr_K_new, cosize_k_new);
+
+    Tensor mVnew = make_tensor(
+        make_gmem_ptr(args.ptr_V_new),
+        make_shape(args.headdim_V, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new)),
+        select<1, 0, 2, 3>(args.stride_V_new));
+    TME_V tme_load_V_new = make_tme_copy<TmeVNewInnerHint, TmeVNewOuterHint>(
+        MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mVnew, mV), take<0, 2>(SmemLayoutV{}));
+
+    RobustDescriptor desc_V_new = make_robust_desc(args.ptr_V_new, cosize_k_new);
+
+    // Qv
+
     float const log2e = std::log2(std::exp(1.0f));
 
     int const page_size = IsPagedKV ? get<0>(args.shape_K) : 1;
@@ -516,19 +597,37 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .headdim_V        = args.headdim_V,
         .stride_V         = args.stride_V,
 
+        // AppendKV
+        .ptr_K_new    = args.ptr_K_new,
+        .shape_K_new  = args.shape_K_new,
+        .stride_K_new = args.stride_K_new,
+        .ptr_V_new    = args.ptr_V_new,
+        .stride_V_new = args.stride_V_new,
+
+        // QV
+
+        // Rotary
+
+        // PageTable
         .ptr_pagetable    = args.ptr_pagetable,
         .shape_pagetable  = args.shape_pagetable,
         .stride_pagetable = args.stride_pagetable,
         .page_size_divmod = mutlass::FastDivmod(page_size),
 
-        .tme_load_Q = tme_load_Q,
-        .tme_load_K = tme_load_K,
-        .tme_load_V = tme_load_V,
+        // TiledCopy
+        .tme_load_Q     = tme_load_Q,
+        .tme_load_K     = tme_load_K,
+        .tme_load_V     = tme_load_V,
+        .tme_load_K_new = tme_load_K_new,
+        .tme_load_V_new = tme_load_V_new,
+        //.tme_load_Qv = tme_load_Qv,
 
         .desc_Q          = desc_Q,
         .desc_K          = desc_K,
         .desc_V          = desc_V,
         .desc_page_table = desc_page_table,
+        .desc_K_new      = desc_K_new,
+        .desc_V_new      = desc_V_new,
 
         .softmax_scale      = args.softmax_scale,
         .softmax_scale_log2 = args.softmax_scale * log2e,
@@ -540,11 +639,19 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
         .softcap_val = args.softcap_val,
 
-        .cu_seqlens_q = args.cu_seqlens_q,
-        .cu_seqlens_k = args.cu_seqlens_k,
-        .seqused_q    = args.seqused_q,
-        .seqused_k    = args.seqused_k,
+        // Chunk
 
+        // Aux tensors
+        .kv_batch_idx     = args.kv_batch_idx,
+        .cu_seqlens_q     = args.cu_seqlens_q,
+        .cu_seqlens_k     = args.cu_seqlens_k,
+        .cu_seqlens_k_new = args.cu_seqlens_k_new,
+        .seqused_q        = args.seqused_q,
+        .seqused_k        = args.seqused_k,
+        //.leftpad_k    = args.leftpad_k,
+        //.seqlens_rotary = args.seqlens_rotary,
+
+        // CP
         .cp_world_size    = args.cp_world_size,
         .cp_rank          = args.cp_rank,
         .cp_tot_seqused_k = args.cp_tot_seqused_k,
@@ -589,9 +696,10 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     int const thread_idx             = threadIdx.x % NumProducerThreads;
     int const bidh_kv                = !IsPackGQA ? bidh / HeadRatio : bidh;
-    int const bidb_kv                = bidb;
+    int const bidb_kv                = !HasKvBatchIdx ? bidb : params.kv_batch_idx[bidb];
     int const warp_idx               = mutlass::canonical_warp_idx();
     int const warp_idx_in_warp_squad = warp_idx % mutlass::NumWarpsPerWarpSquad;
+    int const seqlen_k               = seqlen_info.seqlen_k;
 
     auto offset_coord_q = [&]() {
       if constexpr (!IsPackGQA) {
@@ -648,6 +756,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                params.stride_V,
                                params.desc_V,
                                params.page_size_divmod,
+                               seqlen_k,
+                               0,  // seqlen_info.leftpad_k,
                                thread_idx,
                                bidb_kv,
                                bidh_kv,
@@ -896,7 +1006,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     // constexpr int                   Rows = size<0>(layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
     // Softmax<Rows, HasLearnableSink> softmax{params.softmax_scale, params.softmax_scale_log2};
-    Mask<PermuteTiledMmaQK, SeqlenInfo, TileM, TileN, TileHeadRatio, IsPackGQA, IsCausal, IsLocal, EnableCP> mask(
+    Mask<PermuteTiledMmaQK, SeqlenInfo, TileM, TileN, HeadRatio, IsPackGQA, IsCausal, IsLocal, EnableCP> mask(
         thread_idx, seqlen_info, params.window_size_left, params.window_size_right, params.sink_token_length);
 
     int const seqlen_q = seqlen_info.seqlen_q;
@@ -1155,6 +1265,272 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Tensor lse = softmax.tail(acc_pv, tiled_mma_pv, sink_vals);
 
     return mute::make_tuple(true, mute::make_tuple(acc_pv, lse));
+  }
+
+  template <class BlockCoord>
+  MUTE_DEVICE bool load_kv_new(Params const&          params,
+                               MainloopPipelineKVNew& pipeline_k_new,
+                               MainloopPipelineKVNew& pipeline_v_new,
+                               PipelineKVNewState&    smem_pipe_write_kv_new,
+                               SharedStorage&         shared_storage,
+                               SeqlenInfo const&      seqlen_info,
+                               BlockCoord             blk_coord,
+                               int const              warp_idx_in_warp_squad,
+                               int&                   work_idx,
+                               int const              num_splits) {
+    int const m_block   = get<0>(blk_coord);
+    int const bidh      = get<1>(blk_coord);
+    int const bidb      = get<2>(blk_coord);
+    int const split_idx = get<3>(blk_coord);
+
+    auto [n_block_new_min, n_block_new_max] = BlockInfo::get_n_block_k_new_min_max(
+        seqlen_info, m_block, bidb, split_idx, num_splits, params.window_size_left, params.window_size_right);
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    //   printf("MP=%d, bidm=%d, bidb=%d, bidh=%d, bids=%d, num_splits=%d, n_block_new_min=%d, n_block_new_max=%d\n",
+    //          blockIdx.x,
+    //          m_block,
+    //          bidb,
+    //          bidh,
+    //          split_idx,
+    //          num_splits,
+    //          n_block_new_min,
+    //          n_block_new_max);
+    // }
+    if (n_block_new_max <= n_block_new_min) {
+      return false;
+    }
+
+    Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
+    Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{});
+
+    int const bidh_kv = !IsPackGQA ? bidh / HeadRatio : bidh;
+
+    Tensor mKnew =
+        params.tme_load_K_new.get_tme_tensor(params.shape_K_new)(_, _, bidh_kv, !HasCuseqlensKNew ? bidb : 0);
+    auto shape_Vnew = make_shape(
+        params.headdim_V, get<0>(params.shape_K_new), get<2>(params.shape_K_new), get<3>(params.shape_K_new));
+    Tensor mVnew = params.tme_load_V_new.get_tme_tensor(shape_Vnew)(_, _, bidh_kv, !HasCuseqlensKNew ? bidb : 0);
+
+    Tensor gKnew = local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mKnew),
+                              select<1, 2>(TileShapeQKD{}),
+                              make_coord(_, _0{}));  // (N, K, _)
+    Tensor gVnew = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k_new), mVnew),
+                              select<1, 2>(TileShapePDV{}),
+                              make_coord(_0{}, _));  // (K, N, _)
+
+    auto   cta_tme_K_new = params.tme_load_K_new.get_slice(0);
+    Tensor tKgKnew       = group_modes<0, 3>(cta_tme_K_new.partition_S(gKnew));  // (TME, k)
+    Tensor tKsKnew       = group_modes<0, 3>(cta_tme_K_new.partition_D(sK));     // (TME, pipe)
+
+    auto   cta_tme_V_new = params.tme_load_V_new.get_slice(0);
+    Tensor tVgVnew       = group_modes<0, 3>(cta_tme_V_new.partition_S(gVnew));  // (TME, k)
+    Tensor tVsVnew       = group_modes<0, 3>(cta_tme_V_new.partition_D(sV));     // (TME, pipe)
+
+    auto load_K_new = [&](int const n_block, auto const& smem_pipe_write) {
+      pipeline_k_new.producer_acquire(smem_pipe_write);
+      auto bar_id = pipeline_k_new.producer_get_barrier_id(smem_pipe_write);
+      copy(params.tme_load_K_new.with(bar_id), tKgKnew(_, n_block), tKsKnew(_, smem_pipe_write.index()));
+    };
+
+    auto load_V_new = [&](int const n_block, auto const& smem_pipe_write) {
+      pipeline_v_new.producer_acquire(smem_pipe_write);
+      auto bar_id = pipeline_v_new.producer_get_barrier_id(smem_pipe_write);
+      copy(params.tme_load_V_new.with(bar_id), tVgVnew(_, n_block), tVsVnew(_, smem_pipe_write.index()));
+    };
+
+    bool should_load_kv = SingleProducerWarp || warp_idx_in_warp_squad == 0;
+
+    // pipeline_kv_guard.producer_acquire(smem_pipe_write_kv_guard);
+
+    int n_block = n_block_new_max - 1;
+    // Unlike the Hopper kernel, we don't need barrier_O here.
+    // This kernel doesn't have the async O-side epilogue / cluster handoff that keeps
+    // shared memory alive across stages, so load_kv_new doesn't need an extra recycle
+    // barrier before reusing smem_k and smem_v.
+    // Note: TME copies are issued by a producer warp, not a single elected thread,
+    // so we intentionally don't use elect_one_sync() here.
+    if (should_load_kv) {
+      load_K_new(n_block, smem_pipe_write_kv_new);
+      load_V_new(n_block, smem_pipe_write_kv_new);
+    }
+    ++smem_pipe_write_kv_new;
+    --n_block;
+    for (; n_block >= n_block_new_min; --n_block) {
+      if (should_load_kv) {
+        load_K_new(n_block, smem_pipe_write_kv_new);
+        load_V_new(n_block, smem_pipe_write_kv_new);
+      }
+      ++smem_pipe_write_kv_new;
+    }
+
+    return true;
+  }
+
+  template <class BlockCoord>
+  MUTLASS_DEVICE bool store_kv_new(Params const&          params,
+                                   MainloopPipelineKVNew& pipeline_k_new,
+                                   MainloopPipelineKVNew& pipeline_v_new,
+                                   PipelineKVNewState&    smem_pipe_read_kv_new,
+                                   int const              thread_idx,
+                                   SharedStorage&         shared_storage,
+                                   SeqlenInfo const&      seqlen_info,
+                                   BlockCoord             blk_coord,
+                                   int const              num_splits) {
+    int const m_block                       = get<0>(blk_coord);
+    int const bidh                          = get<1>(blk_coord);
+    int const bidb                          = get<2>(blk_coord);
+    int const split_idx                     = get<3>(blk_coord);
+    auto [n_block_new_min, n_block_new_max] = BlockInfo::get_n_block_k_new_min_max(
+        seqlen_info, m_block, bidb, split_idx, num_splits, params.window_size_left, params.window_size_right);
+
+    if (n_block_new_max <= n_block_new_min) {
+      return false;
+    }
+
+    Tensor sK = mute::as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{}));
+    // We want to use SmemLayoutVt to have shape (TileN, kHeadDim) instead of (kHeadDim, TileN)
+    Tensor sV = mute::as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{}));
+
+    int const bidh_kv = !IsPackGQA ? bidh / HeadRatio : bidh;
+    int const bidb_kv = !HasKvBatchIdx ? bidb : params.kv_batch_idx[bidb];
+
+    Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(
+        _, _, bidh_kv, !HasCuseqlensKNew ? bidb_kv : 0);
+    auto shape_V = make_shape(params.headdim_V, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
+    Tensor mV    = make_tensor(make_gmem_ptr(params.ptr_V), shape_V, params.stride_V)(
+        _, _, bidh_kv, !HasCuseqlensKNew ? bidb_kv : 0);
+
+    int const offset_k = seqlen_info.offset_k + seqlen_info.seqlen_k_og;
+
+    Tensor gK = local_tile(
+        domain_offset(make_coord(offset_k, _0{}), mK), select<1, 2>(TileShapeQKD{}), make_coord(_, _0{}));  // (N, K, _)
+    Tensor gV = local_tile(domain_offset(make_coord(offset_k, _0{}), mV),
+                           select<2, 1>(TileShapePDV{}),
+                           make_coord(_, _0{}));  // (N, K_v, _)
+
+    int const seqlen_k_new = seqlen_info.seqlen_k_new;
+
+    // Rope not implemented yet.
+    // Rotary rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
+    //               params.ptr_rotary_sin, params.stride_rotary_sin,
+    //               params.is_rotary_interleaved, thread_idx, seqlen_k_new,
+    //               seqlen_info.seqlen_rotary);
+
+    // This is used to index into the batch dimension of mK and mV
+    int const bidb_kv_idx = !HasCuseqlensKNew && !IsPagedKV ? bidb_kv : 0;
+
+    using KVManager =
+        PagedKVManager<IsPagedKV, Element, NumMmaThreads, TileN, HeadDimQK, HeadDimVO, true /* IsKVSameIter */>;
+
+    // passing offset_k instead of leftpad_k will move the PageTable pointer to the right position
+    KVManager paged_kv_manager{params.ptr_pagetable,
+                               params.shape_pagetable,
+                               params.stride_pagetable,
+                               params.desc_page_table,
+                               params.ptr_K,
+                               params.shape_K,
+                               params.stride_K,
+                               params.desc_K,
+                               params.ptr_V,
+                               params.headdim_V,
+                               params.stride_V,
+                               params.desc_V,
+                               params.page_size_divmod,
+                               seqlen_k_new,
+                               offset_k,  // seqlen_info.offset_k + seqlen_info.seqlen_k_og
+                               thread_idx,
+                               bidb_kv,
+                               bidh_kv,
+                               bidb_kv_idx};
+
+    GmemTiledCopyAppendKV gmem_tiled_copy_kv;
+
+    auto gmem_thr_copy_kv = gmem_tiled_copy_kv.get_thread_slice(thread_idx);
+
+    Tensor tKsK = gmem_thr_copy_kv.partition_S(sK);  // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tKgK = gmem_thr_copy_kv.partition_D(gK);
+    Tensor tVsV = gmem_thr_copy_kv.partition_S(sV);  // ((Atom,AtomNum),ATOM_M,ATOM_N)
+    Tensor tVgV = gmem_thr_copy_kv.partition_D(gV);
+
+    Tensor cK   = make_identity_tensor(select<1, 2>(TileShapeQKD{}));  // (BLK_N,BLK_K) -> (blk_n,blk_k)
+    Tensor tKcK = gmem_thr_copy_kv.partition_D(cK);
+    Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
+    MUTLASS_PRAGMA_UNROLL
+    for (int k = 0; k < size(tKpK); ++k) {
+      tKpK(k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(params.shape_K);
+    }
+
+    Tensor cV    = make_identity_tensor(select<2, 1>(TileShapePDV{}));  // (BLK_N,BLK_K_V) -> (blk_n,blk_k_v)
+    Tensor tVcV  = conditional_return<SameHeadDim>(tKcK, gmem_thr_copy_kv.partition_D(cV));
+    Tensor tVpV_ = make_tensor<bool>(make_shape(size<2>(tVsV)));
+    MUTLASS_PRAGMA_UNROLL
+    for (int k = 0; k < size(tVpV_); ++k) {
+      tVpV_(k) = get<1>(tVcV(_0{}, _0{}, k)) < params.headdim_V;
+    }
+    Tensor tVpV = conditional_return<SameHeadDim>(tKpK, tVpV_);
+
+    auto store_K = [&](int const n_block, auto const& smem_pipe_read) {
+      int const n_limit = std::min(seqlen_k_new - n_block * TileN, TileN);
+
+      pipeline_k_new.consumer_wait(smem_pipe_read);
+      Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_read.index());
+      Tensor tKrK     = make_fragment_like(tKsK_cur);  // ((_8,_1),_4,_2):((_1,_0),_8,_32)
+      Tensor tKrK_src = gmem_thr_copy_kv.retile_S(tKrK);
+      copy(tKsK_cur, tKrK);
+      if constexpr (!IsPagedKV) {
+        Tensor tKgK_cur = tKgK(_, _, _, n_block);
+        MUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < size<2>(tKgK_cur); ++k) {
+          copy(gmem_tiled_copy_kv.with(params.desc_K_new).with(tKpK(k)), tKrK_src(_, _, k), tKgK_cur(_, _, k));
+        }
+      } else {
+        paged_kv_manager.store_K(n_block, tKrK_src);
+      }
+      pipeline_k_new.consumer_release(smem_pipe_read);
+    };
+
+    auto store_V = [&](int const n_block, auto const& smem_pipe_read) {
+      int const n_limit = std::min(seqlen_k_new - n_block * TileN, TileN);
+
+      pipeline_v_new.consumer_wait(smem_pipe_read);
+      Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_read.index());
+      Tensor tVrV     = make_fragment_like(tVsV_cur);
+      Tensor tVrV_src = gmem_thr_copy_kv.retile_S(tVrV);
+      copy(tVsV_cur, tVrV);
+      if constexpr (!IsPagedKV) {
+        Tensor tVgV_cur = tVgV(_, _, _, n_block);
+        MUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < size<2>(tVgV_cur); ++k) {
+          copy(gmem_tiled_copy_kv.with(params.desc_V_new).with(tVpV(k)), tVrV_src(_, _, k), tVgV_cur(_, _, k));
+        }
+      } else {
+        paged_kv_manager.store_V(n_block, tVrV_src);
+      }
+      pipeline_v_new.consumer_release(smem_pipe_read);
+    };
+
+    // int n_block = 0;  // DEBUG ONLY
+    int n_block = n_block_new_max - 1;
+    if constexpr (IsPagedKV) {
+      paged_kv_manager.template load_page_table_for_lsu<true /* FirstIter */, false /* PermuteK */>(n_block);
+    }
+    store_K(n_block, smem_pipe_read_kv_new);
+    store_V(n_block, smem_pipe_read_kv_new);
+    ++smem_pipe_read_kv_new;
+    --n_block;
+
+    for (; n_block >= n_block_new_min; --n_block) {
+      if constexpr (IsPagedKV) {
+        paged_kv_manager.template load_page_table_for_lsu<false /* FirstIter */, false /* PermuteK */>(n_block);
+      }
+      store_K(n_block, smem_pipe_read_kv_new);
+      store_V(n_block, smem_pipe_read_kv_new);
+      ++smem_pipe_read_kv_new;
+    }
+
+    return true;
   }
 };
 

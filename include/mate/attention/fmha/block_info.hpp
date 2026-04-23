@@ -73,6 +73,25 @@ struct BlockInfo {
     return {n_block_min, n_block_max};
   }
 
+  static MUTLASS_DEVICE mute::tuple<int, int> get_n_block_k_new_min_max(SeqlenInfo const& seqlen_info,
+                                                                        int const         m_block,
+                                                                        int const         bidb,
+                                                                        int const         split_idx,
+                                                                        int const         num_splits,
+                                                                        int const         window_size_left,
+                                                                        int const         window_size_right) {
+    auto [n_block_min, n_block_max] =
+        get_n_block_min_max(seqlen_info, m_block, split_idx, num_splits, window_size_left, window_size_right);
+    int const seqlen_k_og     = static_cast<int>(seqlen_info.seqlen_k_og);
+    int const seqlen_k_new    = static_cast<int>(seqlen_info.seqlen_k_new);
+    int const idx_k_new_min   = std::max(n_block_min * TileN - seqlen_k_og, 0);
+    int const idx_k_new_max   = std::min(n_block_max * TileN - seqlen_k_og, seqlen_k_new);
+    int const n_block_new_min = idx_k_new_min / TileN;
+    int const n_block_new_max = idx_k_new_max > idx_k_new_min ? mute::ceil_div(idx_k_new_max, TileN) : n_block_new_min;
+
+    return {n_block_new_min, n_block_new_max};
+  }
+
   // Returns the first n_block that needs per-element causal/local masking
   // (tiles before this index are fully attended and can skip masking).
   static MUTLASS_DEVICE int get_n_block_min_causal_local_mask(SeqlenInfo const& seqlen_info,

@@ -1,41 +1,45 @@
-import json
+import functools
 import math
-import pathlib
-import torch
-from typing import Optional, Dict, Any
-from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence
 
-import tvm_ffi.cpp
+import torch
 
 from ... import env as jit_env
-from .fmha_utils import fmha_template_env
-from .fmha_utils import _get_fwd_kernel_config as _get_metadata_kernel_config
-from ...utils import TVM_HEADER, EXPORT_FUNC, update_aot_mod
+from ...core import JitSpec, gen_jit_spec
+from ...utils import EXPORT_FUNC, TVM_HEADER
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
+from .fmha_utils import (
+    FMHA_EXTRA_CUDA_CFLAGS,
+    _get_fwd_kernel_config as _get_metadata_kernel_config,
+    fmha_extra_include_paths,
+    get_fmha_template,
+)
 
 
-kern_metadata = fmha_template_env.get_template("metadata_kern.j2")
-
-
-@lru_cache()
-def _fmha_get_metadata_encode(config_tuple: tuple) -> str:
-    config = dict(config_tuple)
+def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
     name_list = ["fmha_get_metadata"]
-    head_ratio, num_warps = config["head_ratio"], config["num_warps"]
+    head_ratio = config["head_ratio"]
+    num_warps = config["num_warps"]
     name_list.append(f"{head_ratio}x{num_warps}")
-    if config["has_cu_seqlens_q"]:
-        mode_q = "ragged_q"
-        name_list.append(mode_q)
-    elif config["has_seqused_q"]:
+
+    if config["has_seqused_q"]:
         mode_q = "padded_q"
         name_list.append(mode_q)
+    elif config["has_cu_seqlens_q"]:
+        mode_q = "ragged_q"
+        name_list.append(mode_q)
 
-    if config["has_cu_seqlens_k"]:
-        mode_k = "ragged_k"
-        name_list.append(mode_k)
-    elif config["has_seqused_k"]:
+    if config["has_seqused_k"]:
         mode_k = "padded_k"
         name_list.append(mode_k)
+    elif config["has_cu_seqlens_k"]:
+        mode_k = "ragged_k"
+        name_list.append(mode_k)
+    
+    if config["has_cu_seqlens_k_new"]:
+        mode_k_new = "ragged_knew"
+        name_list.append(mode_k_new)
 
     if config["is_causal"]:
         mode_causal = "causal"
@@ -44,13 +48,29 @@ def _fmha_get_metadata_encode(config_tuple: tuple) -> str:
         mode_packgqa = "packgqa"
         name_list.append(mode_packgqa)
 
-    name = "_".join(name_list)
-
-    return name
+    return "_".join(name_list)
 
 
-# module cache: dispatch_name -> compiled module
-_FMHA_METADATA_MOD_CACHE: Dict[str, Any] = {}
+def _render_fmha_metadata_source(config: Mapping[str, object]) -> str:
+    render_config = dict(config)
+    render_config["func_name"] = str(
+        render_config.get("func_name") or _fmha_get_metadata_encode(render_config)
+    )
+    return (
+        TVM_HEADER
+        + get_fmha_template("metadata_kern.j2").render(render_config)
+        + EXPORT_FUNC.render(render_config)
+    )
+
+
+def _fmha_metadata_module(config: Mapping[str, object]):
+    dispatch_name = _fmha_get_metadata_encode(config)
+    return dispatch_name, _load_fmha_metadata_module(tuple(sorted(config.items())))
+
+
+@functools.cache
+def _load_fmha_metadata_module(frozen_config: tuple[tuple[str, object], ...]):
+    return gen_fmha_metadata_spec(dict(frozen_config)).build_and_load()
 
 
 def config_selector(cfg):
@@ -114,12 +134,12 @@ mode_k = [
         depends_on=("mode_k",),
         sweep=False,
     ),
-    ParamSpec(  # NOTE:  Change me when supported.
+    ParamSpec(
         name="has_cu_seqlens_k_new",
         domain=[False],
         default=False,
     ),
-    ParamSpec(  # NOTE:  Change me when supported.
+    ParamSpec(
         name="has_leftpad_k",
         domain=[False],
         default=False,
@@ -140,12 +160,6 @@ mode_mask = [
         sweep=False,
     ),
 ]
-score_mode = [
-    ParamSpec(  # NOTE:  Change me when supported.
-        name="has_softcap",
-        domain=[False],
-    ),
-]
 specs_attn = [
     ParamSpec(
         name="is_packgqa",
@@ -164,14 +178,13 @@ specs_metadata = [
     ),
     ParamSpec(
         name="num_warps",
-        domain=list(range(1, 6)),  # batch 1 - 31 * 5
+        domain=list(range(1, 6)),
         default=1,
     ),
 ]
 base_specs.extend(mode_q)
 base_specs.extend(mode_k)
 base_specs.extend(mode_mask)
-base_specs.extend(score_mode)
 base_specs.extend(specs_attn)
 base_specs.extend(specs_metadata)
 
@@ -185,56 +198,52 @@ def _gen_specs_from_config(cfg_level: int):
             export=False,
         ),
     ]
-
-    specs = []
-    specs.extend(base_specs)
-    specs.extend(config)
-
-    config_graph = KernelConfigGraph(specs)
-    aot_fwd_configs = config_graph.resolve_and_expand()
-
-    return aot_fwd_configs
+    config_graph = KernelConfigGraph(base_specs + config)
+    return config_graph.resolve_and_expand()
 
 
-def _get_aot_configs():
-    cfg_level_key = "attention.fmha.metadata".split(".")
-    try:
-        aot_level_file = pathlib.Path(__file__).parents[2] / "aot-levels.json"
-        with open(aot_level_file.resolve(), "r") as f:
-            config_level = json.load(f)
-        for key in cfg_level_key:
-            config_level = config_level[key]
-    except FileNotFoundError:
-        # Default to 0 if file doesn't exist
-        config_level = 0
-
+def get_fmha_metadata_aot_configs(config_level: int) -> list[dict[str, object]]:
     if config_level == 0:
         return []
+    if config_level not in _CONFIG_TABLE:
+        raise ValueError(f"Unsupported FMHA metadata AOT level: {config_level}")
+    return _gen_specs_from_config(config_level)
 
-    configs = _gen_specs_from_config(config_level)
 
-    return configs
+def gen_fmha_metadata_spec(config: Mapping[str, object]) -> JitSpec:
+    dispatch_name = _fmha_get_metadata_encode(config)
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        name=dispatch_name,
+        sources=[source_file],
+        generated_sources={source_file: _render_fmha_metadata_source(config)},
+        extra_cuda_cflags=list(FMHA_EXTRA_CUDA_CFLAGS),
+        extra_include_paths=fmha_extra_include_paths(),
+    )
 
 
-aot_metadata_configs = _get_aot_configs()
-update_aot_mod(
-    aot_metadata_configs,
-    _fmha_get_metadata_encode,
-    jit_env.MATE_AOT_DIR / "fmha_get_metadata_aot.so",
-    _FMHA_METADATA_MOD_CACHE,
-)
+def gen_fmha_metadata_specs(
+    configs: Sequence[Mapping[str, object]],
+) -> list[JitSpec]:
+    return [gen_fmha_metadata_spec(config) for config in configs]
+
+
+def gen_fmha_metadata_aot(config_level: int = 0) -> list[JitSpec]:
+    return gen_fmha_metadata_specs(get_fmha_metadata_aot_configs(config_level))
 
 
 def _fmha_get_metadata(
     batch_size: int,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    max_seqlen_k_new: int,
     num_heads_q: int,
     num_heads_kv: int,
     headdim: int,
     headdim_v: Optional[int],
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     causal: bool = False,
@@ -261,18 +270,18 @@ def _fmha_get_metadata(
         "seqused_k must have shape (batch_size,)"
     )
 
-    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
-        if t is not None:
-            assert t.dtype == torch.int32, (
+    for tensor in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+        if tensor is not None:
+            assert tensor.dtype == torch.int32, (
                 "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
             )
-            assert t.stride(0) == 1, (
+            assert tensor.stride(0) == 1, (
                 "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
             )
 
     assert all(
-        t is None or t.is_musa
-        for t in (
+        tensor is None or tensor.is_musa
+        for tensor in (
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
@@ -286,7 +295,6 @@ def _fmha_get_metadata(
 
     qhead_per_kvhead = num_heads_q // num_heads_kv
 
-    # Metadata
     metadata = torch.empty((batch_size * 4), dtype=torch.int32, device="musa")
     (
         num_splits_dynamic,
@@ -314,54 +322,24 @@ def _fmha_get_metadata(
     )
 
     packgqa = enable_packgqa if packgqa is None else packgqa
-
+    # num_warps = 1 << (math.ceil(batch_size / 31) - 1).bit_length()
+    num_warps = min(math.ceil(batch_size / 31), 32)
     constexpr_dict = {
         "has_cu_seqlens_q": cu_seqlens_q is not None,
         "has_cu_seqlens_k": cu_seqlens_k is not None,
         "has_seqused_q": seqused_q is not None,
         "has_seqused_k": seqused_k is not None,
-        "has_cu_seqlens_k_new": False,
+        "has_cu_seqlens_k_new": cu_seqlens_k_new is not None,
         "has_leftpad_k": False,
         "is_causal": causal,
         "is_packgqa": packgqa,
         "head_ratio": qhead_per_kvhead,
         "sort": True,
-        "num_warps": math.ceil(batch_size / 31),
+        "num_warps": num_warps,
     }
 
-    dispatch_name = _fmha_get_metadata_encode(tuple(constexpr_dict.items()))
-
-    if dispatch_name in _FMHA_METADATA_MOD_CACHE:
-        mod = _FMHA_METADATA_MOD_CACHE[dispatch_name]
-    else:
-        constexpr_dict["func_name"] = dispatch_name
-        # print("Compiling metadata kernel JIT...", flush=True)
-        mod = tvm_ffi.cpp.load_inline(
-            name="fmha_get_metadata",
-            cuda_sources=kern_metadata.render(constexpr_dict),
-            functions=[dispatch_name],
-            extra_include_paths=[
-                jit_env.MATE_INCLUDE_DIR.as_posix(),
-                jit_env.MATE_CSRC_DIR.as_posix(),
-                jit_env.MUTLASS_INCLUDE_DIR.as_posix(),
-            ],
-            extra_ldflags=["-lmusa"],
-            extra_cuda_cflags=[
-                "-Od3",
-                "-DNDEBUG",
-                "-fno-strict-aliasing",
-                "-fno-signed-zeros",
-                "-mllvm",
-                "-mtgpu-load-cluster-mutation=1",
-                "-mllvm",
-                "--num-dwords-of-load-in-mutation=64",
-            ],
-        )
-        _FMHA_METADATA_MOD_CACHE[dispatch_name] = mod
-        # print("Done.")
-
+    dispatch_name, mod = _fmha_metadata_module(constexpr_dict)
     fmha_metadata_impl = mod.get_function(dispatch_name)
-
     fmha_metadata_impl(
         batch_size,
         num_heads_q,
@@ -370,10 +348,12 @@ def _fmha_get_metadata(
         headdim_v,
         max_seqlen_q,
         max_seqlen_k,
+        max_seqlen_k_new,
         cu_seqlens_q,
         cu_seqlens_k,
         seqused_q,
         seqused_k,
+        cu_seqlens_k_new,
         num_splits_dynamic,
         batch_table,
         num_m_blocks,
@@ -384,57 +364,3 @@ def _fmha_get_metadata(
         mp_margin,
     )
     return metadata
-
-
-def gen_fmha_metadata_aot(dry_run: bool = False) -> int:
-    configs = _get_aot_configs()
-
-    musa_instances = []
-    musa_set = set()
-
-    for config in configs:
-        dispatch_name = _fmha_get_metadata_encode(tuple(config.items()))
-        if dispatch_name in musa_set:
-            continue
-        musa_set.add(dispatch_name)
-        config["func_name"] = dispatch_name
-
-        mu_path = jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu"
-        with open(mu_path, "w") as f:
-            f.write(
-                TVM_HEADER + kern_metadata.render(config) + EXPORT_FUNC.render(config)
-            )
-        musa_instances.append(mu_path)
-
-    if not musa_instances:
-        return 0
-
-    if dry_run:
-        return len(musa_instances)
-    print(f"MATE AOT Building {len(musa_instances)} fmha_get_metadata...")
-    tvm_ffi.cpp.build(
-        name="fmha_get_metadata_aot",
-        cuda_files=musa_instances,
-        extra_include_paths=[
-            jit_env.MATE_INCLUDE_DIR.as_posix(),
-            jit_env.MATE_CSRC_DIR.as_posix(),
-            jit_env.MUTLASS_INCLUDE_DIR.as_posix(),
-        ],
-        extra_cuda_cflags=[
-            "-Od3",
-            "-DNDEBUG",
-            "-fno-strict-aliasing",
-            "-fno-signed-zeros",
-            "-mllvm",
-            "-mtgpu-load-cluster-mutation=1",
-            "-mllvm",
-            "--num-dwords-of-load-in-mutation=64",
-        ],
-        extra_ldflags=["-lmusa"],
-        build_directory=jit_env.MATE_AOT_DIR.as_posix(),
-    )
-    print(
-        f"MATE AOT fmha_get_metadata Done -> {(jit_env.MATE_AOT_DIR / 'fmha_get_metadata_aot.so').as_posix()}."
-    )
-
-    return len(musa_instances)

@@ -72,8 +72,19 @@ def biased_grouped_topk_impl(
 @pytest.mark.parametrize(
     "seq_length",
     list(range(1, 10))
-    + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, #32768
-      ],
+    + [
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,  # 32768
+    ],
 )
 @pytest.mark.parametrize(
     "params",

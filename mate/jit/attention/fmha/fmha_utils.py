@@ -1,15 +1,42 @@
 from functools import lru_cache
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from ..attention_utils import attention_template_dir
+from ... import env as jit_env
 
-fmha_template_dir = attention_template_dir / "fmha"
-fmha_template_env = Environment(
-    loader=FileSystemLoader(fmha_template_dir.as_posix()),
-    undefined=StrictUndefined,
-    trim_blocks=True,
-    lstrip_blocks=True,
-)
+
+@lru_cache
+def _get_fmha_template_env(template_dir: str) -> Environment:
+    return Environment(
+        loader=FileSystemLoader(template_dir),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+
+FMHA_EXTRA_CUDA_CFLAGS = [
+    "-Od3",
+    "-DNDEBUG",
+    "-fno-strict-aliasing",
+    "-fno-signed-zeros",
+    "-mllvm",
+    "-mtgpu-load-cluster-mutation=1",
+    "-mllvm",
+    "--num-dwords-of-load-in-mutation=64",
+]
+
+
+def get_fmha_template(template_name: str):
+    template_dir = (jit_env.MATE_TEMPLATE_DIR / "attention" / "fmha").as_posix()
+    return _get_fmha_template_env(template_dir).get_template(template_name)
+
+
+def fmha_extra_include_paths():
+    return [
+        jit_env.MATE_INCLUDE_DIR,
+        jit_env.MATE_CSRC_DIR,
+        jit_env.MUTLASS_INCLUDE_DIR,
+    ]
 
 
 def ceil_div(x, y):
@@ -108,6 +135,11 @@ def _get_fwd_kernel_config(
         stages_k = 2
         stages_v = 2
     elif headdim == 192 and headdim_v == 128:
+        tile_m = candidate_tile_m
+        tile_n = 64
+        stages_k = 1
+        stages_v = 1
+    elif headdim == 192 and headdim_v == 192:
         tile_m = candidate_tile_m
         tile_n = 64
         stages_k = 1

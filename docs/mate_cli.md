@@ -25,7 +25,7 @@ pip install "mate[cli]"
 If you only have a local wheel, use the standard direct-reference syntax instead of `./wheel.whl[cli]`:
 
 ```bash
-python -m pip install "mate[cli] @ file:///abs/path/mate-0.1.3+mu436torch2.7-cp310-cp310-linux_x86_64.whl"
+python -m pip install "mate[cli] @ file:///abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl"
 ```
 
 Notes:
@@ -33,6 +33,7 @@ Notes:
 - The `name[extra] @ file:///...` form is the recommended pip syntax for extras with a local wheel
 - If your environment cannot access a package index, the extra dependency must also be available locally. For `mate[cli]`, that means `safetensors`
 - Installing only the MATE wheel without resolving `safetensors` is still valid, but replaying `*.safetensors` dumps will fail until `safetensors` is installed
+- MATE also requires a MUSA-enabled `apache-tvm-ffi` build. Install or build it from the MooreThreads MUSA fork at `https://github.com/MooreThreads/tvm-ffi` using a release tag that contains `musa` (for example `v0.1.9.post2+musa.1`); a plain upstream TVM-FFI package is treated as an invalid runtime dependency by `mate check`
 
 ## Quick Reference
 
@@ -66,9 +67,14 @@ The command reports:
 - Python version
 - PyTorch version
 - `torch_musa` version and whether MUSA is available
+- Resolved JIT MUSA architecture list, cache key, and whether the value came from `MATE_MUSA_ARCH_LIST` or auto-detection
+- `apache-tvm-ffi` version and whether it is a MUSA-enabled build
 - MUSA device count and device names
 - AOT library directory and a short sample of detected `.so` files
 - Installed package versions for `mate`, `torch`, and `torch_musa`
+
+If `apache-tvm-ffi` is missing or is not a MUSA-enabled build, `mate show-config` highlights the status in red and prints an installation hint.
+If JIT architecture resolution is unavailable, `mate show-config` still succeeds and reports the reason in yellow; the JSON output includes `musa_arch_available=false` plus the error text.
 
 Use `--json` when the output will be consumed by scripts.
 
@@ -81,6 +87,10 @@ mate env
 ```
 
 This command is a read-only view of the current process environment. It is useful for checking whether shell exports are in place before launching a workload.
+
+Runtime JIT cache files are isolated by MATE base version and normalized MUSA target architecture list. They are not split by Torch version.
+When a matching AOT library exists, runtime loading prefers AOT. `MATE_DISABLE_JIT=1` switches to AOT-only behavior and causes a hard error if no matching AOT module exists.
+If `MATE_MUSA_ARCH_LIST` is unset, `mate show-config` reports either the auto-detected visible-device architectures or why auto-detection was unavailable.
 
 ### `check`
 
@@ -96,12 +106,14 @@ The command checks:
 - PyTorch importability
 - `torch_musa` importability
 - MUSA device availability
+- `apache-tvm-ffi` presence and whether its version is MUSA-enabled
 - MATE importability
 - Presence of AOT libraries
 
 Behavior:
 
 - Hard errors cause exit code `1`
+- Missing `apache-tvm-ffi` or installing a non-MUSA TVM-FFI build is a hard error
 - Warnings such as "MUSA not available" or "AOT libraries not found" do not fail the command
 
 ### `replay`
@@ -223,8 +235,10 @@ The logging and dumping configuration is read when `mate.api_logging` is importe
 | `MATE_DUMP_SAFETENSORS` | `0` | Save dumps as `safetensors` instead of `torch.save` |
 | `MATE_DUMP_INCLUDE` | empty | Comma-separated `fnmatch` patterns to include |
 | `MATE_DUMP_EXCLUDE` | empty | Comma-separated `fnmatch` patterns to exclude |
-| `TVM_FFI_MUSA_ARCH_LIST` | unset | MUSA architecture list used by JIT-related workflows |
-| `MATE_AOT_BUILD` | unset | AOT build mode flag |
+| `MATE_MUSA_ARCH_LIST` | auto-detect visible devices | MUSA architecture list used by JIT/AOT workflows; accepts space-separated `major.minor` values such as `3.1` or `3.1 4.0` |
+| `MATE_WORKSPACE_BASE` | home directory | Base directory for the MATE cache workspace |
+| `MATE_DISABLE_JIT` | `0` | Disable runtime JIT and require matching AOT modules |
+| `MATE_JIT_VERBOSE` | `0` | Show verbose ninja output for runtime JIT builds |
 
 Log-level meaning:
 
@@ -235,6 +249,7 @@ Log-level meaning:
 - `10`: level 5 plus on-disk tensor dumping for replay
 
 `MATE_LOGDEST` also supports `%i` in file paths, which is replaced with the current process id.
+MATE does not provide an environment variable to bypass AOT and force runtime JIT when matching AOT modules are present.
 
 ## Usage Examples
 
@@ -297,6 +312,7 @@ Command exit behavior is not identical across all subcommands:
 
 - `Failed to load MATE API logging module`: ensure the installed MATE package is complete and importable in the current Python environment
 - `safetensors not installed`: install `safetensors`, or reinstall from a package index with `pip install "mate[cli]"`, or reinstall from a local wheel with `python -m pip install "mate[cli] @ file:///abs/path/your-mate.whl"`
+- `apache-tvm-ffi ... is not a MUSA-enabled build`: reinstall or rebuild `apache-tvm-ffi` from `https://github.com/MooreThreads/tvm-ffi` and use a release tag that contains `musa`, such as `v0.1.9.post2+musa.1`; the upstream public build is not compatible with MATE
 - `No dumps found`: `mate list-dumps` and batch replay only scan immediate child directories, not nested trees recursively
 - `compare_outputs=True but no output file found`: the dump is incomplete, often because the original process crashed after saving inputs
 - `AOT libraries not found`: MATE may still work in JIT mode, but startup behavior can differ from an AOT-enabled installation

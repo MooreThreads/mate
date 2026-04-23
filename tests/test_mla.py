@@ -6,6 +6,7 @@ import torch
 import torch_musa  # noqa: F401
 import math
 import mate
+from mate.jit.runtime import ffi_to_torch
 from mate.mha_interface import flash_attn_with_kvcache
 
 
@@ -303,6 +304,41 @@ def test_flashmla_interface(
     atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(o, o_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
+
+
+@torch.inference_mode()
+def test_mla_metadata_prealloc_return():
+    device = torch.device("musa")
+    kv_lens = torch.tensor([33, 97, 129], dtype=torch.int32, device=device)
+    num_q_tokens_per_head_k = 96
+    num_heads_k = 1
+
+    meta_ref, splits_ref = mate.flashmla.get_mla_metadata(
+        kv_lens, num_q_tokens_per_head_k, num_heads_k
+    )
+    meta = torch.full_like(meta_ref, -1)
+    splits = torch.full_like(splits_ref, -1)
+
+    meta_out, splits_out = ffi_to_torch(
+        mate.flashmla._get_module().get_function("get_mla_decoding_metadata")(
+            kv_lens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            None,
+            False,
+            None,
+            meta,
+            splits,
+            None,
+            None,
+        )
+    )
+
+    assert meta_out.data_ptr() == meta.data_ptr()
+    assert splits_out.data_ptr() == splits.data_ptr()
+    # The metadata kernel only materializes the populated prefix of each row.
+    torch.testing.assert_close(meta_out[:, :5], meta_ref[:, :5])
+    torch.testing.assert_close(splits_out, splits_ref)
 
 
 @pytest.mark.parametrize("num_heads_q", [8, 16, 32, 64, 128])

@@ -92,7 +92,7 @@ def ref_attn(
     ],
 )
 @pytest.mark.parametrize("num_heads", [(40, 40)])
-@pytest.mark.parametrize("head_size", [(128, 128)])
+@pytest.mark.parametrize("head_size", [(128, 128), (192, 128)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_causal", [True, False])
 @pytest.mark.parametrize("is_varlen", [True])
@@ -105,6 +105,8 @@ def test_varlen_fast_attn(
     is_varlen: bool,
 ) -> None:
     torch.set_default_device("musa")
+    torch.manual_seed(0)
+    torch.musa.manual_seed(0)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads = num_heads[0]

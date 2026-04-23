@@ -4,6 +4,7 @@
 
 #include <mutlass/fast_math.h>
 
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 

@@ -3,45 +3,18 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/musa/device_guard.h>
+#include <tvm/ffi/extra/stl.h>
 #include <tvm/ffi/function.h>
 
+#include <initializer_list>
+
 #include "dlpack/dlpack.h"
+#include "dtype_utils.hpp"
 
 using tvm::ffi::Tensor;
 using tvm::ffi::TensorView;
 namespace ffi = tvm::ffi;
-
-inline constexpr int64_t encode_dlpack_dtype(DLDataType dtype) {
-  return (dtype.code << 16) | (dtype.bits << 8) | dtype.lanes;
-}
-
-constexpr DLDataType dl_uint8            = DLDataType{kDLUInt, 8, 1};
-constexpr DLDataType dl_uint16           = DLDataType{kDLUInt, 16, 1};
-constexpr DLDataType dl_uint32           = DLDataType{kDLUInt, 32, 1};
-constexpr DLDataType dl_uint64           = DLDataType{kDLUInt, 64, 1};
-constexpr DLDataType dl_int8             = DLDataType{kDLInt, 8, 1};
-constexpr DLDataType dl_int16            = DLDataType{kDLInt, 16, 1};
-constexpr DLDataType dl_int32            = DLDataType{kDLInt, 32, 1};
-constexpr DLDataType dl_int64            = DLDataType{kDLInt, 64, 1};
-constexpr DLDataType dl_float16          = DLDataType{kDLFloat, 16, 1};
-constexpr DLDataType dl_float32          = DLDataType{kDLFloat, 32, 1};
-constexpr DLDataType dl_float64          = DLDataType{kDLFloat, 64, 1};
-constexpr DLDataType dl_float8_e4m3fn    = DLDataType{kDLFloat8_e4m3fn, 8, 1};
-constexpr DLDataType dl_float8_e5m2      = DLDataType{kDLFloat8_e5m2, 8, 1};
-constexpr DLDataType dl_float4_e2m1fn    = DLDataType{kDLFloat4_e2m1fn, 4, 1};
-constexpr DLDataType dl_float4_e2m1fn_x2 = DLDataType{kDLFloat4_e2m1fn, 4, 2};
-constexpr DLDataType dl_bfloat16         = DLDataType{kDLBfloat, 16, 1};
-constexpr DLDataType dl_bool             = DLDataType{kDLBool, 8, 1};
-
-constexpr int64_t float16_code       = encode_dlpack_dtype(dl_float16);
-constexpr int64_t bfloat16_code      = encode_dlpack_dtype(dl_bfloat16);
-constexpr int64_t float32_code       = encode_dlpack_dtype(dl_float32);
-constexpr int64_t uint8_code         = encode_dlpack_dtype(dl_uint8);
-constexpr int64_t int32_code         = encode_dlpack_dtype(dl_int32);
-constexpr int64_t int64_code         = encode_dlpack_dtype(dl_int64);
-constexpr int64_t float8_e4m3fn_code = encode_dlpack_dtype(dl_float8_e4m3fn);
-constexpr int64_t float8_e5m2_code   = encode_dlpack_dtype(dl_float8_e5m2);
-constexpr int64_t float4_e2m1fn_code = encode_dlpack_dtype(dl_float4_e2m1fn);
 
 #define FFI_CHECK(expr, msg) TVM_FFI_ICHECK(expr) << msg;
 #define CHECK_MUSA(x) TVM_FFI_ICHECK(x.device().device_type == kDLExtDev) << #x " must be a MUSA tensor";
@@ -100,3 +73,79 @@ inline int64_t get_element_size(ffi::TensorView x) {
 inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
   return ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, shape, dtype, device);
 }
+
+inline void expect_shape(ffi::TensorView tensor, std::initializer_list<int64_t> expected, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), static_cast<int32_t>(expected.size())) << name << " has unexpected rank";
+  int32_t dim = 0;
+  for (int64_t value : expected) {
+    TVM_FFI_ICHECK_EQ(tensor.size(dim), value) << name << " has unexpected shape at dim " << dim;
+    ++dim;
+  }
+}
+
+struct StridedTensorView {
+  ffi::Shape      shape;
+  ffi::Shape      strides;
+  DLTensor        prototype;
+  ffi::TensorView view;
+
+  static DLTensor make_prototype(ffi::TensorView           base,
+                                 ffi::ShapeView            shape,
+                                 ffi::ShapeView            strides,
+                                 std::optional<DLDataType> dtype_override,
+                                 std::optional<int64_t>    byte_offset) {
+    TVMFFIAny any{};
+    ffi::TypeTraits<ffi::TensorView>::CopyToAnyView(base, &any);
+    auto prototype    = *static_cast<DLTensor*>(any.v_ptr);
+    prototype.shape   = const_cast<int64_t*>(shape.data());
+    prototype.ndim    = static_cast<int>(shape.size());
+    prototype.strides = const_cast<int64_t*>(strides.data());
+    TVM_FFI_ICHECK_EQ(shape.size(), strides.size());
+    if (dtype_override.has_value()) {
+      prototype.dtype = dtype_override.value();
+    }
+
+    const int64_t byte_offset_i64 = byte_offset.value_or(0);
+    TVM_FFI_ICHECK_GE(byte_offset_i64, 0);
+    if (byte_offset_i64 != 0) {
+      prototype.data        = reinterpret_cast<void*>(reinterpret_cast<char*>(prototype.data) + byte_offset_i64);
+      prototype.byte_offset = 0;
+    }
+    return prototype;
+  }
+
+  StridedTensorView(ffi::TensorView        base,
+                    ffi::Shape             shape_,
+                    ffi::Shape             strides_,
+                    ffi::Optional<int64_t> element_offset = ffi::Optional<int64_t>())  // NOLINT(*)
+      : shape(std::move(shape_)),
+        strides(std::move(strides_)),
+        prototype(make_prototype(base,
+                                 shape,
+                                 strides,
+                                 std::nullopt,
+                                 element_offset.has_value()
+                                     ? std::optional<int64_t>(element_offset.value() * get_element_size(base))
+                                     : std::nullopt)),
+        view(&prototype) {
+  }
+
+  StridedTensorView(ffi::TensorView        base,
+                    ffi::Shape             shape_,
+                    ffi::Shape             strides_,
+                    DLDataType             dtype_override,
+                    ffi::Optional<int64_t> byte_offset = ffi::Optional<int64_t>())  // NOLINT(*)
+      : shape(std::move(shape_)),
+        strides(std::move(strides_)),
+        prototype(make_prototype(base,
+                                 shape,
+                                 strides,
+                                 std::optional<DLDataType>(dtype_override),
+                                 byte_offset.has_value() ? std::optional<int64_t>(byte_offset.value()) : std::nullopt)),
+        view(&prototype) {
+  }
+
+  operator ffi::TensorView() const {
+    return view;
+  }  // NOLINT(*)
+};

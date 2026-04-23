@@ -1,15 +1,13 @@
-
-#include <musa.h>
 #include <mudnn_xmma.h>
+#include <musa.h>
+#include <musa_bf16.h>
+#include <musa_fp16.h>
 #include <musa_runtime.h>
-#include <torch/torch.h>
-#include <torch_musa/csrc/core/MUSAGuard.h>
 
 #include <string>
+#include <tuple>
 
-#include "mate_utils.muh"
-#include "mudnn_utils.hpp"
-#include "torch_utils.hpp"
+#include "gemm_mudnn_utils.hpp"
 
 struct BatchMatMulScaledParam {
   static constexpr int DIM_ABD = 3;
@@ -19,9 +17,9 @@ struct BatchMatMulScaledParam {
 
   MatMulScalingMode scale_mode;
 
-  at::ScalarType type_a;
-  at::ScalarType type_b;
-  at::ScalarType type_d;
+  DLDataType type_a;
+  DLDataType type_b;
+  DLDataType type_d;
 
   int m;
   int n;
@@ -40,292 +38,237 @@ struct BatchMatMulScaledParam {
   void* p_scale_a;
   void* p_scale_b;
   void* p_d;
-
-};  // struct BatchMatMulScaledParam
+};
 
 namespace {
 
+namespace gemm_common = mate::gemm::common;
+namespace gemm_mudnn  = mate::gemm::mudnn;
+
 MatMulScalingMode get_scaling_mode_bmm_fp8(const std::tuple<int64_t, int64_t, int64_t>& scale_granularity_mnk) {
-  int scale_granularity_m = std::get<0>(scale_granularity_mnk);
-  int scale_granularity_n = std::get<1>(scale_granularity_mnk);
-  int scale_granularity_k = std::get<2>(scale_granularity_mnk);
+  const int scale_granularity_m = static_cast<int>(std::get<0>(scale_granularity_mnk));
+  const int scale_granularity_n = static_cast<int>(std::get<1>(scale_granularity_mnk));
+  const int scale_granularity_k = static_cast<int>(std::get<2>(scale_granularity_mnk));
 
   if (scale_granularity_k == -1) {
     if (scale_granularity_m == -1 && scale_granularity_n == -1) {
       return MatMulScalingMode::TENSOR_TENSOR;
-
-    } else if (scale_granularity_m == 1 && scale_granularity_n == -1) {
+    }
+    if (scale_granularity_m == 1 && scale_granularity_n == -1) {
       return MatMulScalingMode::CHANNEL_TENSOR;
     }
   }
 
-  TORCH_CHECK(false, "bmm_fp8 get unsupported scale_granularity_mnk!");
+  TVM_FFI_THROW(ValueError) << "bmm_fp8 got unsupported scale_granularity_mnk";
+}
+
+void run_bmm_mudnn_lt(const BatchMatMulScaledParam&   param,
+                      musa::dnn::Handle&              handle,
+                      const musa::dnn::MatMulLtParam& lt_param) {
+  const int64_t a_dim0 = param.major_a == TensorMajor::K ? param.m : param.k;
+  const int64_t a_dim1 = param.major_a == TensorMajor::K ? param.k : param.m;
+  const int64_t b_dim0 = param.major_b == TensorMajor::K ? param.n : param.k;
+  const int64_t b_dim1 = param.major_b == TensorMajor::K ? param.k : param.n;
+  auto          a      = make_mudnn_tensor(param.p_a,
+                             param.type_a,
+                                           {param.nr_batch, a_dim0, a_dim1},
+                                           {param.stride_a[0], param.stride_a[1], param.stride_a[2]});
+  auto          b      = make_mudnn_tensor(param.p_b,
+                             param.type_b,
+                                           {param.nr_batch, b_dim0, b_dim1},
+                                           {param.stride_b[0], param.stride_b[1], param.stride_b[2]});
+  auto          d      = make_mudnn_tensor(param.p_d,
+                             param.type_d,
+                                           {param.nr_batch, param.m, param.n},
+                                           {param.stride_d[0], param.stride_d[1], param.stride_d[2]});
+  gemm_mudnn::run_mudnn_lt_matmul(handle, d, a, b, param.major_a, param.major_b, lt_param);
 }
 
 void bmm_fp8_run(const BatchMatMulScaledParam& param, musa::dnn::Handle& handle) {
-  musa::dnn::Tensor a;
-  if (param.major_a == TensorMajor::K) {
-    a = make_mudnn_tensor(param.p_a,
-                          param.type_a,
-                          {param.nr_batch, param.m, param.k},
-                          {param.stride_a[0], param.stride_a[1], param.stride_a[2]});
-  } else {
-    a = make_mudnn_tensor(param.p_a,
-                          param.type_a,
-                          {param.nr_batch, param.k, param.m},
-                          {param.stride_a[0], param.stride_a[1], param.stride_a[2]});
-  }
-
-  musa::dnn::Tensor b;
-  if (param.major_b == TensorMajor::K) {
-    b = make_mudnn_tensor(param.p_b,
-                          param.type_b,
-                          {param.nr_batch, param.n, param.k},
-                          {param.stride_b[0], param.stride_b[1], param.stride_b[2]});
-  } else {
-    b = make_mudnn_tensor(param.p_b,
-                          param.type_b,
-                          {param.nr_batch, param.k, param.n},
-                          {param.stride_b[0], param.stride_b[1], param.stride_b[2]});
-  }
-
-  musa::dnn::Tensor d = make_mudnn_tensor(param.p_d,
-                                          param.type_d,
-                                          {param.nr_batch, param.m, param.n},
-                                          {param.stride_d[0], param.stride_d[1], param.stride_d[2]});
-
   musa::dnn::Tensor scale_a;
   if (param.scale_mode == MatMulScalingMode::CHANNEL_TENSOR) {
     scale_a = make_mudnn_tensor(param.p_scale_a,
-                                at::kFloat,
+                                dl_float32,
                                 {param.nr_batch, param.m, 1},
                                 {param.stride_scale_a[0], param.stride_scale_a[1], param.stride_scale_a[2]});
   } else {
-    // TENSOR_TENSOR
-    scale_a = make_mudnn_scalar_tensor(param.p_scale_a, at::kFloat);
+    scale_a = make_mudnn_scalar_tensor(param.p_scale_a, dl_float32);
   }
-  musa::dnn::Tensor scale_b = make_mudnn_scalar_tensor(param.p_scale_b, at::kFloat);
+  musa::dnn::Tensor scale_b = make_mudnn_scalar_tensor(param.p_scale_b, dl_float32);
 
   musa::dnn::MatMulLtParam lt_param;
   MATE_MUDNN_STATUS_CHECK(lt_param.SetScale(scale_a, scale_b, musa::dnn::Tensor{}, musa::dnn::Tensor{}));
-
-  musa::dnn::BatchMatMul bmm;
-  MATE_MUDNN_STATUS_CHECK(bmm.SetComputeMode(musa::dnn::BatchMatMul::ComputeMode::TENSOR));
-  MATE_MUDNN_STATUS_CHECK(
-      bmm.SetTranspose(param.major_a == TensorMajor::K ? false : true, param.major_b == TensorMajor::K ? true : false));
-
-  MATE_MUDNN_STATUS_CHECK(bmm.RunLt(handle, d, a, b, musa::dnn::Tensor{}, musa::dnn::Tensor{}, lt_param, nullptr));
+  run_bmm_mudnn_lt(param, handle, lt_param);
 }
 
 void bmm_fp16_run(const BatchMatMulScaledParam& param, musa::dnn::Handle& handle) {
-  musa::dnn::Tensor a;
-  if (param.major_a == TensorMajor::K) {
-    a = make_mudnn_tensor(param.p_a,
-                          param.type_a,
-                          {param.nr_batch, param.m, param.k},
-                          {param.stride_a[0], param.stride_a[1], param.stride_a[2]});
-  } else {
-    a = make_mudnn_tensor(param.p_a,
-                          param.type_a,
-                          {param.nr_batch, param.k, param.m},
-                          {param.stride_a[0], param.stride_a[1], param.stride_a[2]});
-  }
-
-  musa::dnn::Tensor b;
-  if (param.major_b == TensorMajor::K) {
-    b = make_mudnn_tensor(param.p_b,
-                          param.type_b,
-                          {param.nr_batch, param.n, param.k},
-                          {param.stride_b[0], param.stride_b[1], param.stride_b[2]});
-  } else {
-    b = make_mudnn_tensor(param.p_b,
-                          param.type_b,
-                          {param.nr_batch, param.k, param.n},
-                          {param.stride_b[0], param.stride_b[1], param.stride_b[2]});
-  }
-
-  musa::dnn::Tensor d = make_mudnn_tensor(param.p_d,
-                                          param.type_d,
-                                          {param.nr_batch, param.m, param.n},
-                                          {param.stride_d[0], param.stride_d[1], param.stride_d[2]});
-
   musa::dnn::MatMulLtParam lt_param;
-  musa::dnn::BatchMatMul   bmm;
-  MATE_MUDNN_STATUS_CHECK(bmm.SetComputeMode(musa::dnn::BatchMatMul::ComputeMode::TENSOR));
-  MATE_MUDNN_STATUS_CHECK(
-      bmm.SetTranspose(param.major_a == TensorMajor::K ? false : true, param.major_b == TensorMajor::K ? true : false));
-  MATE_MUDNN_STATUS_CHECK(bmm.RunLt(handle, d, a, b, musa::dnn::Tensor{}, musa::dnn::Tensor{}, lt_param, nullptr));
+  run_bmm_mudnn_lt(param, handle, lt_param);
+}
+
+void dispatch_bmm_backend(
+    const BatchMatMulScaledParam& param, const std::string& backend, int device_id, musaStream_t stream, bool is_fp8) {
+  gemm_mudnn::validate_mudnn_backend(backend, is_fp8 ? "bmm_fp8" : "bmm_fp16");
+  musa::dnn::Handle handle(device_id);
+  gemm_mudnn::init_mudnn_handle(handle, stream);
+  if (is_fp8) {
+    bmm_fp8_run(param, handle);
+  } else {
+    bmm_fp16_run(param, handle);
+  }
 }
 
 }  // namespace
 
-at::Tensor bmm_fp8(const at::Tensor&                            a,
-                   const at::Tensor&                            b,
-                   const at::Tensor&                            scale_a,
-                   const at::Tensor&                            scale_b,
-                   at::Tensor&                                  d,
-                   const std::tuple<int64_t, int64_t, int64_t>& scale_granularity_mnk,
-                   const std::string&                           backend) {
-  // a shape: (nr_batch, m, k), k major
-  // b shape: (nr_batch, k, n), k major
-  // d shape: (nr_batch, m, n), n major
+void bmm_fp8(ffi::TensorView                              a,
+             ffi::TensorView                              b,
+             ffi::TensorView                              scale_a,
+             ffi::TensorView                              scale_b,
+             ffi::TensorView                              d,
+             const std::tuple<int64_t, int64_t, int64_t>& scale_granularity_mnk,
+             const std::string&                           backend) {
+  check_mp31(a.device(), "bmm_fp8");
+  CHECK_MUSA(a);
+  CHECK_MUSA(b);
+  CHECK_MUSA(scale_a);
+  CHECK_MUSA(scale_b);
+  CHECK_MUSA(d);
+  CHECK_DEVICE(a, b);
+  CHECK_DEVICE(a, scale_a);
+  CHECK_DEVICE(a, scale_b);
+  CHECK_DEVICE(a, d);
+  CHECK_DIM(3, a);
+  CHECK_DIM(3, b);
+  CHECK_DIM(3, d);
+  CHECK_CONTIGUOUS(a);
+  TVM_FFI_ICHECK_EQ(b.stride(1), 1) << "b must be contiguous at k dimension";
+  TVM_FFI_ICHECK_EQ(d.stride(-1), 1) << "d must be contiguous at the last dimension";
+  TVM_FFI_ICHECK_EQ(scale_a.dtype(), dl_float32) << "scale_a must be float32";
+  TVM_FFI_ICHECK_EQ(scale_b.dtype(), dl_float32) << "scale_b must be float32";
 
-  CHECK_MP31("bmm_fp8");
-  at::TensorArg targs[]{{a, "a", 0}, {b, "b", 1}, {scale_a, "scale_a", 2}, {scale_b, "scale_b", 3}, {d, "d", 4}};
-  at::checkAllSameGPU(__func__, targs);
+  const auto scale_mode = get_scaling_mode_bmm_fp8(scale_granularity_mnk);
 
-  auto scale_mode = get_scaling_mode_bmm_fp8(scale_granularity_mnk);
-
-  constexpr int dim_abd = BatchMatMulScaledParam::DIM_ABD;
-  CHECK_TENSOR_AND_CONTIGUOUS(a, dim_abd);
-  CHECK_TENSOR(b, dim_abd);
-  TORCH_CHECK(b.strides()[1] == 1, "Tensor b must be contiguous at k dimension!");
-
-  TORCH_CHECK(scale_a.scalar_type() == at::kFloat, "bmm_fp8: scale_a must be float type");
-  TORCH_CHECK(scale_a.scalar_type() == at::kFloat, "bmm_fp8: scale_b must be float type");
-
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(d, dim_abd);
-
-  at::musa::OptionalMUSAGuard guard(a.device());
-  BatchMatMulScaledParam      param;
-
-  param.major_a = TensorMajor::K;  // !trans_a
-  param.major_b = TensorMajor::K;  // trans_b
-
+  BatchMatMulScaledParam param{};
+  param.major_a    = TensorMajor::K;
+  param.major_b    = TensorMajor::K;
   param.scale_mode = scale_mode;
+  param.type_a     = a.dtype();
+  param.type_b     = b.dtype();
+  param.type_d     = d.dtype();
 
-  param.type_a = a.scalar_type();
-  param.type_b = b.scalar_type();
-  param.type_d = d.scalar_type();
-  TORCH_CHECK(is_fp8_tensor_type(param.type_a), "bmm_fp8: a must be fp8 type");
-  TORCH_CHECK(is_fp8_tensor_type(param.type_b), "bmm_fp8: b must be fp8 type");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(param.type_d), "bmm_fp8: d must be bf16 or fp16 type");
+  TVM_FFI_ICHECK(is_fp8_dtype(param.type_a)) << "a must be fp8";
+  TVM_FFI_ICHECK(is_fp8_dtype(param.type_b)) << "b must be fp8";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(param.type_d)) << "d must be bf16 or fp16";
 
-  param.nr_batch = a.size(0);
-  param.m        = a.size(1);
-  param.n        = b.size(2);
-  param.k        = a.size(2);
+  param.nr_batch = static_cast<int>(a.size(0));
+  param.m        = static_cast<int>(a.size(1));
+  param.n        = static_cast<int>(b.size(2));
+  param.k        = static_cast<int>(a.size(2));
 
-  CHECK_SHAPE(b, param.nr_batch, param.k, param.n);
-  CHECK_SHAPE(d, param.nr_batch, param.m, param.n);
+  TVM_FFI_ICHECK_EQ(b.size(0), param.nr_batch);
+  TVM_FFI_ICHECK_EQ(b.size(1), param.k);
+  TVM_FFI_ICHECK_EQ(d.size(0), param.nr_batch);
+  TVM_FFI_ICHECK_EQ(d.size(1), param.m);
+  TVM_FFI_ICHECK_EQ(d.size(2), param.n);
+
+  if (gemm_common::gemm_early_return(param.m, param.n, param.k, d)) {
+    return;
+  }
+
   if (scale_mode == MatMulScalingMode::CHANNEL_TENSOR) {
-    CHECK_TENSOR_AND_CONTIGUOUS(scale_a, dim_abd);
-    CHECK_SHAPE(scale_a, param.nr_batch, param.m, 1);
+    CHECK_DIM(3, scale_a);
+    CHECK_CONTIGUOUS(scale_a);
+    TVM_FFI_ICHECK_EQ(scale_a.size(0), param.nr_batch);
+    TVM_FFI_ICHECK_EQ(scale_a.size(1), param.m);
+    TVM_FFI_ICHECK_EQ(scale_a.size(2), 1);
   } else {
-    CHECK_SCALAR_TENSOR(scale_a);
+    TVM_FFI_ICHECK_EQ(scale_a.ndim(), 0) << "scale_a must be a scalar tensor";
   }
-  CHECK_SCALAR_TENSOR(scale_b);
+  TVM_FFI_ICHECK_EQ(scale_b.ndim(), 0) << "scale_b must be a scalar tensor";
 
-  // TODO: maybe fail when support MN-major
-  at::Tensor trans_b = b.transpose(-2, -1);
-  for (int i = 0; i < dim_abd; ++i) {
-    param.stride_a[i] = a.strides()[i];
-    param.stride_b[i] = trans_b.strides()[i];
-    param.stride_d[i] = d.strides()[i];
-  }
+  param.stride_a[0] = a.stride(0);
+  param.stride_a[1] = a.stride(1);
+  param.stride_a[2] = a.stride(2);
+  param.stride_b[0] = b.stride(0);
+  param.stride_b[1] = b.stride(2);
+  param.stride_b[2] = b.stride(1);
+  param.stride_d[0] = d.stride(0);
+  param.stride_d[1] = d.stride(1);
+  param.stride_d[2] = d.stride(2);
 
   if (param.scale_mode == MatMulScalingMode::CHANNEL_TENSOR) {
-    for (int i = 0; i < dim_abd; ++i) {
-      param.stride_scale_a[i] = scale_a.strides()[i];
-    }
+    param.stride_scale_a[0] = scale_a.stride(0);
+    param.stride_scale_a[1] = scale_a.stride(1);
+    param.stride_scale_a[2] = scale_a.stride(2);
   }
 
   param.p_a       = a.data_ptr();
-  param.p_b       = trans_b.data_ptr();
+  param.p_b       = b.data_ptr();
   param.p_scale_a = scale_a.data_ptr();
   param.p_scale_b = scale_b.data_ptr();
   param.p_d       = d.data_ptr();
 
-  if (backend == "auto" || backend == "mudnn") {
-    musa::dnn::Handle& h = at::GetMudnnHandle();
-    bmm_fp8_run(param, h);
-  }
-
-  return d;
+  ffi::MUSADeviceGuard device_guard(a.device().device_id);
+  dispatch_bmm_backend(param, backend, a.device().device_id, get_stream(a.device()), true);
 }
 
-at::Tensor bmm_fp16(const at::Tensor& a, const at::Tensor& b, at::Tensor& d, const std::string& backend) {
-  CHECK_MP31("bmm_fp16");
-  at::TensorArg targs[]{{a, "a", 0}, {b, "b", 1}, {d, "d", 4}};
-  at::checkAllSameGPU(__func__, targs);
+void bmm_fp16(ffi::TensorView a, ffi::TensorView b, ffi::TensorView d, const std::string& backend) {
+  check_mp31(a.device(), "bmm_fp16");
+  CHECK_MUSA(a);
+  CHECK_MUSA(b);
+  CHECK_MUSA(d);
+  CHECK_DEVICE(a, b);
+  CHECK_DEVICE(a, d);
+  CHECK_DIM(3, a);
+  CHECK_DIM(3, b);
+  CHECK_DIM(3, d);
+  TVM_FFI_ICHECK_EQ(a.stride(2), 1) << "a must be contiguous at k dimension";
+  TVM_FFI_ICHECK_EQ(b.stride(1), 1) << "b must be contiguous at k dimension";
+  TVM_FFI_ICHECK_EQ(d.stride(-1), 1) << "d must be contiguous at the last dimension";
 
-  constexpr int dim_abd = BatchMatMulScaledParam::DIM_ABD;
-  CHECK_TENSOR(a, dim_abd);
-  TORCH_CHECK(a.strides()[2] == 1, "Tensor b must be contigouts at k dimension!");
-  CHECK_TENSOR(b, dim_abd);
-  TORCH_CHECK(b.strides()[1] == 1, "Tensor b must be contiguous at k dimension!");
-  CHECK_TENSOR_AND_LAST_DIM_CONTIGUOUS(d, dim_abd);
+  BatchMatMulScaledParam param{};
+  param.major_a = TensorMajor::K;
+  param.major_b = TensorMajor::K;
+  param.type_a  = a.dtype();
+  param.type_b  = b.dtype();
+  param.type_d  = d.dtype();
 
-  at::musa::OptionalMUSAGuard guard(a.device());
-  BatchMatMulScaledParam      param;
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(param.type_a)) << "a must be bf16 or fp16";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(param.type_b)) << "b must be bf16 or fp16";
+  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(param.type_d)) << "d must be bf16 or fp16";
 
-  param.major_a = TensorMajor::K;  // !trans_a
-  param.major_b = TensorMajor::K;  // trans_b
+  param.nr_batch = static_cast<int>(a.size(0));
+  param.m        = static_cast<int>(a.size(1));
+  param.n        = static_cast<int>(b.size(2));
+  param.k        = static_cast<int>(a.size(2));
 
-  param.type_a = a.scalar_type();
-  param.type_b = b.scalar_type();
-  param.type_d = d.scalar_type();
+  TVM_FFI_ICHECK_EQ(b.size(0), param.nr_batch);
+  TVM_FFI_ICHECK_EQ(b.size(1), param.k);
+  TVM_FFI_ICHECK_EQ(d.size(0), param.nr_batch);
+  TVM_FFI_ICHECK_EQ(d.size(1), param.m);
+  TVM_FFI_ICHECK_EQ(d.size(2), param.n);
 
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(param.type_a), "bmm_fp8: a must be bf16 or fp16 type");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(param.type_b), "bmm_fp8: b must be bf16 or fp16 type");
-  TORCH_CHECK(is_bf16_or_fp16_tensor_type(param.type_d), "bmm_fp8: d must be bf16 or fp16 type");
-
-  param.nr_batch = a.size(0);
-  param.m        = a.size(1);
-  param.n        = b.size(2);
-  param.k        = a.size(2);
-
-  CHECK_SHAPE(a, param.nr_batch, param.m, param.k);
-  CHECK_SHAPE(b, param.nr_batch, param.k, param.n);
-  CHECK_SHAPE(d, param.nr_batch, param.m, param.n);
-
-  at::Tensor trans_b = b.transpose(-2, -1);
-  for (int i = 0; i < dim_abd; ++i) {
-    param.stride_a[i] = a.strides()[i];
-    param.stride_b[i] = trans_b.strides()[i];
-    param.stride_d[i] = d.strides()[i];
+  if (gemm_common::gemm_early_return(param.m, param.n, param.k, d)) {
+    return;
   }
+
+  param.stride_a[0] = a.stride(0);
+  param.stride_a[1] = a.stride(1);
+  param.stride_a[2] = a.stride(2);
+  param.stride_b[0] = b.stride(0);
+  param.stride_b[1] = b.stride(2);
+  param.stride_b[2] = b.stride(1);
+  param.stride_d[0] = d.stride(0);
+  param.stride_d[1] = d.stride(1);
+  param.stride_d[2] = d.stride(2);
 
   param.p_a = a.data_ptr();
   param.p_b = b.data_ptr();
   param.p_d = d.data_ptr();
 
-  if (backend == "auto" || backend == "mudnn") {
-    musa::dnn::Handle& h = at::GetMudnnHandle();
-    bmm_fp16_run(param, h);
-  }
-
-  return d;
+  ffi::MUSADeviceGuard device_guard(a.device().device_id);
+  dispatch_bmm_backend(param, backend, a.device().device_id, get_stream(a.device()), false);
 }
 
-TORCH_LIBRARY_FRAGMENT(mate, m) {
-  m.def(
-      "bmm_fp8("
-      "Tensor a,"
-      "Tensor b,"
-      "Tensor scale_a,"
-      "Tensor scale_b,"
-      "Tensor d,"
-      "(int, int, int) scale_granularity_mnk,"
-      "str backend"
-      ")"
-      "-> Tensor");
-}
-
-TORCH_LIBRARY_FRAGMENT(mate, m) {
-  m.def(
-      "bmm_fp16("
-      "Tensor a,"
-      "Tensor b,"
-      "Tensor d,"
-      "str backend"
-      ")"
-      "-> Tensor");
-}
-
-TORCH_LIBRARY_IMPL(mate, PrivateUse1, m) {
-  m.impl("bmm_fp8", &bmm_fp8);
-}
-TORCH_LIBRARY_IMPL(mate, PrivateUse1, m) {
-  m.impl("bmm_fp16", &bmm_fp16);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8, bmm_fp8);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp16, bmm_fp16);

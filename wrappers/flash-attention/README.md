@@ -1,13 +1,14 @@
 # flash-attention
 
-`mate-flash-attention` is a compatibility wrapper package that preserves the `flash_attn` import path on top of MATE attention operators on MUSA.
+`flash_attn_3` is a compatibility wrapper package that follows the official FlashAttention-3 packaging layout on top of MATE attention operators on MUSA.
 
 ## Overview
 
-This wrapper is intended for projects that already target FlashAttention-style Python APIs and want to run on MUSA through MATE with smaller integration changes.
+This wrapper is intended for projects that already target FlashAttention-3 style Python APIs and want to run on MUSA through MATE with smaller integration changes. The current compatibility target is the `flash_attn_3` interface surface.
 
-- Package name: `mate-flash-attention`
-- Import path: `flash_attn`
+- Package name: `flash_attn_3`
+- Public import path: `flash_attn_interface`
+- Internal package path: `flash_attn_3`
 - Runtime backend: MATE attention operators on MUSA
 
 For the current compatibility scope and known limitations, see [../../docs/flash_attention.md](../../docs/flash_attention.md).
@@ -25,7 +26,7 @@ Before using this wrapper, make sure the following are already available:
 Build a wheel from the `wrappers/flash-attention` directory:
 
 ```bash
-python -m build --wheel --no-isolation
+python -m build --wheel
 ```
 
 The generated wheel will be placed under `dist/`.
@@ -41,7 +42,15 @@ pip install --no-build-isolation -e .
 Install a built wheel:
 
 ```bash
-pip install dist/mate_flash_attention-*.whl
+pip install dist/flash_attn_3-*.whl
+```
+
+If you previously installed the legacy `mate-flash-attention` package, uninstall it before installing `flash_attn_3` so the
+environment does not keep stale wrapper metadata.
+
+```bash
+pip uninstall -y mate-flash-attention
+pip install dist/flash_attn_3-*.whl
 ```
 
 ## Import
@@ -49,13 +58,14 @@ pip install dist/mate_flash_attention-*.whl
 Import the package directly:
 
 ```python
-import flash_attn
+import flash_attn_interface
 ```
 
 Import individual APIs:
 
 ```python
-from flash_attn import (
+from flash_attn_interface import (
+    flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
     get_scheduler_metadata,
@@ -66,6 +76,7 @@ from flash_attn import (
 
 The wrapper currently exposes:
 
+- `flash_attn_func`: FlashAttention-compatible dense QKV entry
 - `flash_attn_varlen_func`: FlashAttention-compatible varlen / ragged FMHA entry
 - `flash_attn_with_kvcache`: FlashAttention-compatible KV-cache entry, including paged KV cache use cases
 - `get_scheduler_metadata`: helper for split-KV scheduler metadata preparation
@@ -76,7 +87,7 @@ Minimal varlen FMHA example:
 
 ```python
 import torch
-from flash_attn import flash_attn_varlen_func
+from flash_attn_interface import flash_attn_varlen_func
 
 device = "musa"
 dtype = torch.bfloat16
@@ -107,7 +118,7 @@ out = flash_attn_varlen_func(
 Paged KV cache skeleton with scheduler metadata:
 
 ```python
-from flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
+from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
 
 metadata = get_scheduler_metadata(
     batch_size=batch_size,
@@ -148,11 +159,12 @@ tests/test_flash_attn.py
 Run them from the `wrappers/flash-attention` directory:
 
 ```bash
-pytest tests/test_flash_attn.py
+pytest tests/test_flash_attn.py tests/test_interface_unit.py
 ```
 
 ## Notes
 
-- This wrapper preserves the FlashAttention-style Python surface, but execution is provided by MATE on MUSA
+- This wrapper follows the FlashAttention-3 style Python package layout, and the current compatibility target is `flash_attn_3`
+- The `flash_attn` top-level package is intentionally not shipped, so Transformers FA2 / FA4 package checks keep failing
 - Actual feature coverage is documented in [../../docs/flash_attention.md](../../docs/flash_attention.md)
 - For the authoritative operator behavior, refer to the corresponding MATE APIs under `mate.mha_interface`

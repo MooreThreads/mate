@@ -5,15 +5,17 @@ MATE (**M**USA **A**I **T**ensor **E**ngine) is a centralized library for Genera
 ## Highlights
 
 - High-performance attention and GEMM operators for MUSA
-- Compatibility wrappers for `flash_attn` and `deep_gemm`
+- Compatibility wrappers for `flash_attn_3`, `sageattention`, `flash_mla`, and `deep_gemm`
 - CLI tools for environment checks, configuration inspection, and replay
 
 ## Quick Links
 
 - CLI documentation: [docs/mate_cli.md](docs/mate_cli.md)
-- FlashAttention compatibility summary: [docs/flash_attention.md](docs/flash_attention.md)
-- FlashAttention wrapper: [wrappers/flash-attention/README.md](wrappers/flash-attention/README.md)
-- DeepGEMM wrapper: [wrappers/deep_gemm/README.md](wrappers/deep_gemm/README.md)
+- FlashAttention-3 compatibility summary: [docs/flash_attention.md](docs/flash_attention.md)
+- FlashAttention-3 wrapper: [wrappers/flash-attention/README.md](wrappers/flash-attention/README.md)
+- SageAttention wrapper: [wrappers/SageAttention/README.md](wrappers/SageAttention/README.md)
+- FlashMLA wrapper: [wrappers/FlashMLA/README.md](wrappers/FlashMLA/README.md)
+- DeepGEMM wrapper: [wrappers/DeepGEMM/README.md](wrappers/DeepGEMM/README.md)
 
 ## Requirements
 
@@ -28,7 +30,37 @@ MATE (**M**USA **A**I **T**ensor **E**ngine) is a centralized library for Genera
 ```bash
 git clone https://github.com/MooreThreads/mate.git --recursive
 cd mate
-bash build.sh
+python -m build --wheel --no-isolation
+```
+
+For local development, install MATE in editable mode:
+
+```bash
+git clone https://github.com/MooreThreads/mate.git --recursive
+cd mate
+pip install --no-build-isolation -e . -v
+```
+
+If you forgot `--recursive` when cloning, initialize submodules before building or
+installing:
+
+```bash
+git submodule update --init --recursive
+```
+
+Pre-build AOT kernels before packaging the wheel:
+
+```bash
+git clone https://github.com/MooreThreads/mate.git --recursive
+cd mate
+MATE_MUSA_ARCH_LIST=3.1 python -m mate.aot
+python -m build --wheel --no-isolation
+```
+
+Customize AOT coverage by operator family when needed:
+
+```bash
+python -m mate.aot --attention-aot-level 0 --add-gemm true --add-moe false
 ```
 
 ## Repository Layout
@@ -71,8 +103,10 @@ MATE uses the packages under `wrappers/` as a compatibility layer for CUDA-orien
 
 | Wrapper | Package | Import Path | Purpose | Documentation |
 | --- | --- | --- | --- | --- |
-| `wrappers/flash-attention` | `mate-flash-attention` | `flash_attn` | FlashAttention-compatible APIs on top of MATE attention operators on MUSA | [wrapper README](wrappers/flash-attention/README.md), [compatibility summary](docs/flash_attention.md) |
-| `wrappers/deep_gemm` | `mate-deep_gemm` | `deep_gemm` | DeepGEMM-compatible APIs on top of MATE GEMM operators on MUSA | [wrapper README](wrappers/deep_gemm/README.md) |
+| `wrappers/flash-attention` | `flash_attn_3` | `flash_attn_interface` | FlashAttention-3-compatible APIs on top of MATE attention operators on MUSA | [wrapper README](wrappers/flash-attention/README.md), [compatibility summary](docs/flash_attention.md) |
+| `wrappers/SageAttention` | `sageattention` | `sageattention` | SageAttention-compatible dense quantized attention wrapper on top of MATE on MUSA | [wrapper README](wrappers/SageAttention/README.md) |
+| `wrappers/FlashMLA` | `flash_mla` | `flash_mla` | FlashMLA-compatible MLA dense/sparse decode and sparse prefill APIs on top of MATE MLA operators on MUSA | [wrapper README](wrappers/FlashMLA/README.md) |
+| `wrappers/DeepGEMM` | `deep-gemm` | `deep_gemm` | DeepGEMM-compatible APIs on top of MATE GEMM operators on MUSA | [wrapper README](wrappers/DeepGEMM/README.md) |
 
 ## Build Documentation
 

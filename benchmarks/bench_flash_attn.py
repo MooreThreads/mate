@@ -251,7 +251,6 @@ def run_bench(
                 pack_gqa=cfg.is_packgqa,
                 deterministic=False,
                 sm_margin=0,
-                return_attn_probs=False,
                 return_softmax_lse=False,
                 backend=backend,
             )

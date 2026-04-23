@@ -74,6 +74,42 @@ struct Mp31FmhaTmeLoadKeyBuilder {
   }
 };
 
+template <class Element,
+          class CanonicalSmemLayout,
+          class StrideK_,
+          TME::CacheHint InnerHint  = TME::CacheHint::CACHE_NORMAL,
+          TME::CacheHint OuterHint  = TME::CacheHint::CACHE_NORMAL,
+          int            VectorBits = 128>
+struct Mp31FmhaTmeLoadKeyBuilderNoPermute {
+  using IndexType = mute::remove_cvref_t<decltype(get<0>(StrideK_{}))>;
+
+  static constexpr int SmemTileN  = size<0>(CanonicalSmemLayout{});
+  static constexpr int SmemTileK  = size<1>(CanonicalSmemLayout{});
+  static constexpr int SmemStages = size<2>(CanonicalSmemLayout{});
+
+  using StrideK       = decltype(replace<0>(StrideK_{}, IndexType{}));
+  using TmeKTileShape = decltype(make_shape(Int<SmemTileN>{}, Int<SmemTileK>{}));
+
+  using TME_K = decltype(make_tme_copy<InnerHint, OuterHint>(
+      MP31_TME_LOAD{},
+      make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideK{}, int32_t(0)), StrideK{}),
+      take<0, 2>(CanonicalSmemLayout{}),
+      TmeKTileShape{}));
+
+  template <class GEngine, class GLayout>
+  static TME_K make_tme_copy(Tensor<GEngine, GLayout> const& gtensor) {
+    MUTE_STATIC_ASSERT_V(rank(gtensor) == _4{});
+    return mute::make_tme_copy<InnerHint, OuterHint>(
+        MP31_TME_LOAD{}, gtensor, take<0, 2>(CanonicalSmemLayout{}), TmeKTileShape{});
+  }
+
+  template <class GEngine, class GLayout>
+  MUTE_HOST_DEVICE static auto get_shape(Tensor<GEngine, GLayout> const& gtensor) {
+    MUTE_STATIC_ASSERT_V(rank(gtensor) == _4{});
+    return shape(gtensor);
+  }
+};
+
 template <class Element, class TileShape, class SmemAtomLayout, int Threads, class StrideK, int VectorBits = 128>
 struct Mp31FmhaLsuLoadKeyBuilder {
   static constexpr int MmaAtomN    = 8;

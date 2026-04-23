@@ -520,4 +520,3 @@ extern unsigned int e5m2e5m2bf16bf16ssgemm_gm1_nn_tce_256_128x256B128_epilogue_g
 extern unsigned int bf16bf16bf16bf16ssgemm_gm1_nt_tce_512_256x256B128_epilogue_persis_stage2_len;
 
 // clang-format on
-    

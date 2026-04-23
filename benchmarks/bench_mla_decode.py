@@ -10,7 +10,6 @@ import json
 import torch
 import mate
 
-import triton
 from einops import rearrange
 from torch.profiler import profile, ProfilerActivity  # noqa: F401
 from itertools import product

@@ -378,9 +378,9 @@ def _dump_function_outputs(
         metadata["tensor_info"]["total_size_bytes"] = (
             metadata["tensor_info"]["input_size_bytes"] + output_size
         )
-        metadata["tensor_info"]["total_size_mb"] = (
-            metadata["tensor_info"]["total_size_bytes"] / (1024 * 1024)
-        )
+        metadata["tensor_info"]["total_size_mb"] = metadata["tensor_info"][
+            "total_size_bytes"
+        ] / (1024 * 1024)
         metadata["execution_status"] = "completed"
 
         if "tensor_details" not in metadata:
@@ -482,7 +482,9 @@ def replay_from_dump(
 
     if inputs_pt_path.exists():
         # weights_only=False is required because dumps contain dict metadata, not just tensors
-        input_tensors = torch.load(str(inputs_pt_path), map_location="cpu", weights_only=False)
+        input_tensors = torch.load(
+            str(inputs_pt_path), map_location="cpu", weights_only=False
+        )
     elif inputs_safetensors_path.exists():
         try:
             from safetensors.torch import load_file
@@ -527,12 +529,12 @@ def replay_from_dump(
 
     for key in input_tensors.keys():
         if key.startswith("kwarg_"):
-            kwarg_name = key[len("kwarg_"):]
+            kwarg_name = key[len("kwarg_") :]
             kwargs[kwarg_name] = input_tensors[key]
 
     for key in input_metadata.keys():
         if key.startswith("kwarg_"):
-            kwarg_name = key[len("kwarg_"):]
+            kwarg_name = key[len("kwarg_") :]
             if kwarg_name not in kwargs:
                 kwargs[kwarg_name] = _reconstruct_value(input_metadata[key])
 
@@ -551,7 +553,9 @@ def replay_from_dump(
 
         if outputs_pt_path.exists():
             # weights_only=False is required because dumps contain dict metadata, not just tensors
-            expected_outputs = torch.load(str(outputs_pt_path), map_location="cpu", weights_only=False)
+            expected_outputs = torch.load(
+                str(outputs_pt_path), map_location="cpu", weights_only=False
+            )
         elif outputs_safetensors_path.exists():
             try:
                 from safetensors.torch import load_file
@@ -749,13 +753,13 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
                 # Only check for MUSA graph capture
                 device_type = str(value.device).split(":")[0]
                 if device_type == "musa":
-                        try:
-                            import torch_musa
+                    try:
+                        import torch_musa
 
-                            if hasattr(torch_musa, "is_current_stream_capturing"):
-                                is_capturing = torch_musa.is_current_stream_capturing()
-                        except Exception:
-                            pass
+                        if hasattr(torch_musa, "is_current_stream_capturing"):
+                            is_capturing = torch_musa.is_current_stream_capturing()
+                    except Exception:
+                        pass
 
                 # Skip statistics during MUSA graph capture (avoid sync issues)
                 if is_capturing:
