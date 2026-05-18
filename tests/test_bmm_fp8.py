@@ -9,8 +9,10 @@ from mate.testing.utils import (
     group_quantize_fp8,
     group_dequantize_fp8,
 )
+from mate.testing import supported_musa_compute_capability
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("m", [128, 2048])
 @pytest.mark.parametrize("n", [128, 2048])
@@ -113,6 +115,7 @@ def test_bmm_fp8(
     torch.testing.assert_close(d.float(), ref_d, rtol=5e-3, atol=5e-3)
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("m", [128, 2048])
 @pytest.mark.parametrize("n", [128, 2048])

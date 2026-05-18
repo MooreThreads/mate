@@ -1,679 +1,768 @@
-import functools
-import math
-from typing import Optional, Tuple
-
 import torch
+from mate.gdn_kernels.tilelang.gdn_utils import prepare_chunk_offsets
+from mate.utils import cosize
 import tilelang
 import tilelang.language as T
 
-_LOG2E = 1.4426950408889634
+__all__ = ["fused_chunk_gdn_prefill"]
 
 
-@functools.lru_cache
-def _torch_dtype_to_tl(dtype: torch.dtype) -> str:
-    mapping = {
-        torch.float16: "float16",
-        torch.bfloat16: "bfloat16",
-        torch.float32: "float32",
-    }
-    if dtype not in mapping:
-        raise ValueError(f"Unsupported dtype {dtype}.")
-    return mapping[dtype]
-
-
-@functools.lru_cache
-def _build_chunk_metadata(
-    cu_seqlens: torch.Tensor,
-    chunk_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """
-    Build per-chunk metadata once on host, then upload:
-      - chunk_offsets: [batch + 1]
-      - chunk_token_starts: [total_chunks]
-      - chunk_token_lens: [total_chunks]
-    """
-    dev = cu_seqlens.device
-    dtype = torch.int32
-
-    cu = cu_seqlens.to(dtype=dtype)
-    batch = cu.numel() - 1
-    seq_lens = cu[1:] - cu[:-1]
-    chunks_per_batch = (seq_lens + chunk_size - 1) // chunk_size
-
-    chunk_offsets = torch.cat(
-        [
-            torch.zeros(1, dtype=dtype, device=dev),
-            chunks_per_batch.cumsum(0, dtype=dtype),
-        ]
-    )
-
-    total_chunks = int(chunk_offsets[-1].item())
-
-    if total_chunks == 0:
-        empty = torch.empty(0, dtype=dtype, device=dev)
-        return empty, empty, empty, 0
-
-    batch_idx = torch.arange(batch, device=dev).repeat_interleave(
-        chunks_per_batch
-    )  # [total_chunks]
-    local_chunk_idx = (
-        torch.arange(total_chunks, dtype=dtype, device=dev) - chunk_offsets[batch_idx]
-    )  # [total_chunks]
-    starts = cu[:-1][batch_idx] + local_chunk_idx * chunk_size
-    lens = torch.clamp(
-        seq_lens[batch_idx] - local_chunk_idx * chunk_size, min=0, max=chunk_size
-    )
-
-    return (
-        chunk_offsets,
-        starts,
-        lens,
-        total_chunks,
-    )
-
-
-@functools.lru_cache(maxsize=32)
-def fused_prepare_compute_w_u_tl(
-    total_chunks: int,
-    total_tokens: int,
-    head_sab: int,
-    chunk_size: int,
-    dim_k: int,
-    dim_v: int,
-    head_k: Optional[int] = None,
-    dtype: str = "float16",
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
+        tilelang.PassConfigKey.TL_ENABLE_MUSA_BURST: True,
+        tilelang.PassConfigKey.TL_ENABLE_REDUCE_BURST: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+        tilelang.PassConfigKey.TL_DISABLE_INDEX_TYPE_PROMOTION: True,
+        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    },
+    compile_flags=[
+        "-Od3",
+        "-fno-signed-zeros",
+        "-fmusa-flush-denormals-to-zero",
+        "-mllvm",
+        "-mtgpu-if-convert=1",
+        "-mllvm",
+        "-misched=mtgpu-max-ilp",
+        "-mllvm",
+        "-mtgpu-tiny-offset-hint=1",
+        "-mllvm",
+        "-mtgpu-enable-postra-sched=0",
+        "-mllvm",
+        "-misched-recompute-slotindex=1",
+        "-mllvm",
+        "-mtgpu-combine-fop-instr=1",
+    ],
+)
+def tilelang_fused_chunk_gdn_prefill(
+    H,
+    Hg,
+    DK,
+    DV,
+    chunk_size,
+    scale,
+    accum_dtype,
+    qkva_dtype,
+    g_dtype,
+    b_dtype,
+    h0_dtype,
+    ht_dtype,
+    h_dtype,
+    o_dtype,
+    seqlen_dtype,
+    use_initial_state,
+    store_final_state,
+    is_varlen,
 ):
-    if head_k is None:
-        head_k = head_sab
-    if head_sab % head_k != 0:
-        raise ValueError("head_sab must be divisible by head_k.")
-    sab_to_k_group_size = head_sab // head_k
+    batch_size = T.dynamic("batch_size")
+    num_tokens = T.dynamic("num_tokens")
+    num_chunks = T.dynamic("num_chunks")
+    raw_batch_size = T.dynamic("raw_batch_size")
+    block_S = chunk_size
+    assert DV == 128, "gdn_prefill tilelang kernel currently supports DV=128 only"
 
-    accum_dtype = "float32"
-    block_C = chunk_size
-    num_rounds = int(math.ceil(math.log2(chunk_size))) if chunk_size > 1 else 0
+    if is_varlen:
+        q_shape = (1, num_tokens, Hg, DK)
+        k_shape = (1, num_tokens, Hg, DK)
+        v_shape = (1, num_tokens, H, DV)
+        o_shape = (1, num_tokens, H, DV)
+        a_shape = (1, num_tokens, H, chunk_size)
+        g_shape = (1, num_tokens, H)
+        b_shape = (1, num_tokens, H)
+        h_shape = (1, num_chunks, H, DK, DV)
+    else:
+        q_shape = (batch_size, num_tokens, Hg, DK)
+        k_shape = (batch_size, num_tokens, Hg, DK)
+        v_shape = (batch_size, num_tokens, H, DV)
+        o_shape = (batch_size, num_tokens, H, DV)
+        a_shape = (batch_size, num_tokens, H, chunk_size)
+        g_shape = (batch_size, num_tokens, H)
+        b_shape = (batch_size, num_tokens, H)
+        h_shape = (batch_size, num_chunks, H, DK, DV)
+    h0_shape = (raw_batch_size if is_varlen else batch_size, H, DK, DV)
+    ht_shape = (raw_batch_size, H, DK, DV)
+    seqlens_shape = (raw_batch_size + 1,) if is_varlen else (batch_size + 1,)
 
-    @tilelang.jit(
-        target="musa",
-        out_idx=[-3, -2, -1],  # output Tensor：w, u, cu_g
-        pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
-        },
-        compile_flags=["-O3", "-DENABLE_BF16"],
-    )
-    def _func(num_stages, threads=128, block_DK=64, block_DV=64):
-        assert dim_k % block_DK == 0, "dim_k must be divisible by block_DK"
-        assert dim_v % block_DV == 0, "dim_v must be divisible by block_DV"
+    @T.macro
+    def producer_phase(i):
+        return T.bitwise_xor((i // 2) % 2, 1)
 
-        @T.prim_func
-        def fused_prepare_compute_w_u(
-            k: T.Tensor([total_tokens, head_k, dim_k], dtype),
-            v: T.Tensor([total_tokens, head_sab, dim_v], dtype),
-            alpha: T.Tensor([total_tokens, head_sab], "float32"),
-            beta: T.Tensor([total_tokens, head_sab], "float32"),
-            chunk_token_starts: T.Tensor([total_chunks], "int32"),
-            chunk_token_lens: T.Tensor([total_chunks], "int32"),
-            w: T.Tensor([total_tokens, head_sab, dim_k], dtype),
-            u: T.Tensor([total_tokens, head_sab, dim_v], dtype),
-            cu_g: T.Tensor([total_tokens, head_sab], "float32"),
-        ):
-            with T.Kernel(total_chunks, head_sab, threads=threads) as (tid, sab_hid):
-                k_hid = sab_hid // sab_to_k_group_size
-                chunk_token_start = chunk_token_starts[tid]
-                actual_len = chunk_token_lens[tid]
+    @T.macro
+    def consumer_phase(i):
+        return (i // 2) % 2
 
-                # share memory
-                alpha_shared = T.alloc_shared([block_C], "float32")
-                beta_shared = T.alloc_shared([block_C], "float32")
-                cu_g_shared = T.alloc_shared([block_C], "float32")
-                k_shared = T.alloc_shared([block_C, block_DK], dtype)
-                k_beta_shared = T.alloc_shared([block_C, block_DK], dtype)
-                v_beta_shared = T.alloc_shared([block_C, block_DV], dtype)
-                S_left_shared = T.alloc_shared([block_C, block_C], dtype)
-                S_right_shared = T.alloc_shared([block_C, block_C], dtype)
-                P_left_shared = T.alloc_shared([block_C, block_C], dtype)
-                P_right_shared = T.alloc_shared([block_C, block_C], dtype)
+    @T.macro
+    def perm_dv(i):
+        stride = DV // 8
+        return (i % 8) * stride + (i // 8)
 
-                gram_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
-                temp_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
-                w_frag = T.alloc_fragment([block_C, block_DK], accum_dtype)
-                u_frag = T.alloc_fragment([block_C, block_DV], accum_dtype)
+    @T.macro
+    def inv_perm_dv(i):
+        stride = DV // 8
+        return (i % stride) * 8 + (i // stride)
 
-                for i in T.Parallel(block_C):
-                    valid_flag = i < actual_len
-                    alpha_shared[i] = T.if_then_else(
-                        valid_flag, alpha[chunk_token_start + i, sab_hid], 1.0
-                    )
-                    beta_shared[i] = T.if_then_else(
-                        valid_flag, beta[chunk_token_start + i, sab_hid], 1.0
-                    )
+    @T.macro
+    def inv_pair_dv(i):
+        stride = DV // 2
+        return (i % stride) * 2 + (i // stride)
 
-                acc = T.alloc_var("float32", init=0.0)
-                for i in T.serial(block_C):
-                    acc = acc + T.log(alpha_shared[i])
-                    cu_g_shared[i] = acc
+    @T.macro
+    def pair_dv(i):
+        stride = DV // 2
+        return (i % 2) * stride + (i // 2)
 
-                T.clear(gram_frag)
-                for i_k in T.Pipelined(dim_k // block_DK, num_stages=num_stages):
-                    k_offset = i_k * block_DK
-                    for n, kk in T.Parallel(block_C, block_DK):
-                        k_shared[n, kk] = T.if_then_else(
-                            n < actual_len,
-                            k[chunk_token_start + n, k_hid, k_offset + kk],
-                            0.0,
-                        )
+    @T.macro
+    def qs_fragment_to_natural_dv(i):
+        return inv_pair_dv(inv_perm_dv(i))
+
+    @T.macro
+    def perm_s(i):
+        stride = block_S // 8
+        return (i % 8) * stride + (i // 8)
+
+    @T.prim_func
+    def tilelang_fused_chunk_gdn_prefill_kernel(
+        q: T.Tensor(q_shape, dtype=qkva_dtype),
+        k: T.Tensor(k_shape, dtype=qkva_dtype),
+        v: T.Tensor(v_shape, dtype=qkva_dtype),
+        a: T.Tensor(a_shape, dtype=qkva_dtype),
+        g: T.Tensor(g_shape, dtype=g_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0: T.Tensor(h0_shape, dtype=h0_dtype),
+        cu_seqlens: T.Tensor(seqlens_shape, dtype=seqlen_dtype),
+        chunk_offsets: T.Tensor(seqlens_shape, dtype=seqlen_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+        h: T.Tensor(h_shape, dtype=h_dtype),
+        ht: T.Tensor(ht_shape, dtype=ht_dtype),
+    ):
+        launch_batch_size = raw_batch_size if is_varlen else batch_size
+        with T.Kernel(launch_batch_size * H, threads=1024) as (bbh,):
+            bb, bh = bbh // H, bbh % H
+            bhg = bh // (H // Hg)
+
+            batch_idx = T.alloc_var("int32")
+            seq_start_idx = T.alloc_var("int32")
+            seq_end_idx = T.alloc_var("int32")
+
+            batch_idx = 0 if is_varlen else bb
+            seq_start_idx = cu_seqlens[bb] if is_varlen else 0
+            seq_end_idx = cu_seqlens[bb + 1] if is_varlen else num_tokens
+
+            seq_len = T.alloc_var("int32")
+            seq_len = seq_end_idx - seq_start_idx
+            num_iters = T.alloc_var("int32")
+            num_iters = T.ceildiv(seq_len, block_S)
+            full_num_iters = T.alloc_var("int32")
+            full_num_iters = seq_len // block_S
+            tail_num_iters = T.alloc_var("int32")
+            tail_num_iters = num_iters - full_num_iters
+
+            q_shared = T.alloc_shared((2, block_S, DK), dtype=qkva_dtype)
+            k_shared = T.alloc_shared((2, block_S, DK), dtype=qkva_dtype)
+            scaled_k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+            v_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
+            o_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
+            pa_shared = T.alloc_shared((2, block_S, block_S), dtype=qkva_dtype)
+            g_shared = T.alloc_shared((2, block_S), dtype=accum_dtype, scope="shared")
+            b_shared = T.alloc_shared((2, block_S), dtype=accum_dtype, scope="shared")
+
+            h_shared = T.alloc_shared((DK, DV), dtype=qkva_dtype)
+            vd_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
+            g_exp_shared = T.alloc_shared(
+                (2, block_S), dtype=accum_dtype, scope="shared"
+            )
+            g_exp_rev_shared = T.alloc_shared(
+                (2, block_S), dtype=accum_dtype, scope="shared"
+            )
+
+            h_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
+            o_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
+            uv_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
+            p_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
+            g_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
+
+            q_is_ready = T.alloc_barrier(arrive_count=[32] * 2)
+            q_is_free = T.alloc_barrier(arrive_count=[640] * 2)
+            k_is_ready = T.alloc_barrier(arrive_count=[32] * 2)
+            k_is_free = T.alloc_barrier(arrive_count=[640] * 2)
+            gb_is_ready = T.alloc_barrier(arrive_count=[64] * 2)
+            gb_is_free = T.alloc_barrier(arrive_count=[768] * 2)
+            v_is_ready = T.alloc_barrier(arrive_count=32)
+            v_is_free = T.alloc_barrier(arrive_count=128)
+            o_is_ready = T.alloc_barrier(arrive_count=128)
+            o_is_free = T.alloc_barrier(arrive_count=64)
+
+            a_is_ready = T.alloc_barrier(arrive_count=[32] * 2)
+            a_is_free = T.alloc_barrier(arrive_count=[128] * 2)
+            inv_is_ready = T.alloc_barrier(arrive_count=[512] * 2)
+            inv_is_free = T.alloc_barrier(arrive_count=[128] * 2)
+            p_is_ready = T.alloc_barrier(arrive_count=[512] * 2)
+            vd_is_ready = T.alloc_barrier(arrive_count=128)
+            vd_is_free = T.alloc_barrier(arrive_count=512)
+            h_is_ready = T.alloc_barrier(arrive_count=512)
+            h_is_free = T.alloc_barrier(arrive_count=256)
+
+            b_bytes = 4 if b_dtype in (torch.float32, "float32") else 2
+            b_robust_desc = T.make_robust_desc(
+                T.address_of(b[batch_idx, seq_start_idx, 0]),
+                cosize((seq_end_idx - seq_start_idx, H)) * b_bytes,
+            )
+            g_bytes = 4 if g_dtype in (torch.float32, "float32") else 2
+            g_robust_desc = T.make_robust_desc(
+                T.address_of(g[batch_idx, seq_start_idx, 0]),
+                cosize((seq_end_idx - seq_start_idx, H)) * g_bytes,
+            )
+            qkva_bytes = (
+                2
+                if qkva_dtype in (torch.float16, torch.bfloat16, "float16", "bfloat16")
+                else 4
+            )
+            k_robust_desc = T.make_robust_desc(
+                T.address_of(k[batch_idx, seq_start_idx, 0, 0]),
+                cosize((seq_end_idx - seq_start_idx, Hg, DK)) * qkva_bytes,
+            )
+
+            tx = T.get_thread_binding()
+
+            with T.ws(0):
+                w_local = T.alloc_local([4], accum_dtype)
+                for i_s in T.serial(num_iters):
+                    T.barrier_wait(h_is_ready, i_s % 2)
+                    T.barrier_wait(k_is_ready[i_s % 2], consumer_phase(i_s))
+                    # U = K @ S
                     T.gemm(
-                        k_shared,
-                        k_shared,
-                        gram_frag,
+                        k_shared[i_s % 2, :, :],
+                        h_shared,
+                        uv_fragment,
+                        clear_accum=True,
+                        wg_wait=-1,
+                    )
+                    T.warpgroup_commit_batch()
+
+                    # W = V - g * U
+                    T.barrier_wait(gb_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.barrier_wait(v_is_ready, i_s % 2)
+                    T.warpgroup_wait(0)
+                    T.barrier_arrive(k_is_free[i_s % 2])
+                    T.barrier_arrive(h_is_free)
+
+                    ldg_tx = tx % 8
+                    ldg_ty = tx // 8
+                    for j_r in T.unroll(block_S // 16):
+                        for j_p in T.unroll(2):
+                            for j_q in T.unroll(2):
+                                for j_u in T.vectorized(4):
+                                    j_s = j_r * 16 + ldg_ty
+                                    w_local[j_u] = v_shared[
+                                        j_s,
+                                        ldg_tx * 8 + j_p * 64 + j_q * 4 + j_u,
+                                    ]
+                                for j_u in T.vectorized(4):
+                                    j_s = j_r * 16 + ldg_ty
+                                    j_v = ((j_q * 4 + j_u) * 2 + j_p) * 8 + ldg_tx
+                                    w_local[j_u] -= (
+                                        g_exp_shared[i_s % 2, j_s]
+                                        * uv_fragment[j_s, j_v]
+                                    )
+                                for j_u in T.vectorized(4):
+                                    j_s = j_r * 16 + ldg_ty
+                                    v_shared[
+                                        j_s, ldg_tx * 8 + j_p * 64 + j_q * 4 + j_u
+                                    ] = w_local[j_u]
+                    T.barrier_arrive(gb_is_free[i_s % 2])
+
+                    T.barrier_wait(inv_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.lma_wait()
+                    # Vd = Ag @ W
+                    T.gemm(
+                        pa_shared[i_s % 2, :, :],
+                        v_shared,
+                        uv_fragment,
+                        clear_accum=True,
+                        wg_wait=-1,
+                    )
+                    T.warpgroup_commit_batch()
+
+                    T.warpgroup_wait(0)
+                    T.barrier_arrive(inv_is_free[i_s % 2])
+                    T.barrier_wait(vd_is_free, T.bitwise_xor(i_s % 2, 1))
+                    for j_s, j_v in T.Parallel(block_S, DV):
+                        v_shared[j_s, perm_dv(j_v)] = uv_fragment[j_s, j_v]
+                        vd_shared[j_s, perm_dv(j_v)] = uv_fragment[j_s, j_v]
+                    T.lma_wait()
+                    T.barrier_arrive(vd_is_ready)
+
+            with T.ws(1):
+                o_store_local = T.alloc_local([4], accum_dtype)
+                for i_s in T.serial(num_iters):
+                    T.barrier_wait(q_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.barrier_wait(h_is_ready, i_s % 2)
+                    T.gemm(
+                        q_shared[i_s % 2, :, :],
+                        h_shared,
+                        o_fragment,
+                        clear_accum=True,
+                        wg_wait=-1,
+                    )
+                    T.warpgroup_commit_batch()
+
+                    T.warpgroup_wait(0)
+                    T.barrier_arrive(q_is_free[i_s % 2])
+                    T.barrier_arrive(h_is_free)
+
+                    T.barrier_wait(gb_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.barrier_wait(o_is_free, T.bitwise_xor(i_s % 2, 1))
+                    for j_s, j_v in T.Parallel(block_S, DV):
+                        o_fragment[j_s, j_v] *= g_exp_shared[i_s % 2, j_s] * scale
+                    T.barrier_arrive(gb_is_free[i_s % 2])
+
+                    T.barrier_wait(p_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.barrier_wait(vd_is_ready, i_s % 2)
+                    # O += Pg @ Vd
+                    T.gemm(
+                        pa_shared[i_s % 2, :, :],
+                        v_shared,
+                        o_fragment,
+                        clear_accum=False,
+                        wg_wait=-1,
+                    )
+                    T.warpgroup_commit_batch()
+                    T.warpgroup_wait(0)
+                    T.barrier_arrive(a_is_free[i_s % 2])
+                    T.barrier_arrive(v_is_free)
+                    # S2[S] O
+                    # o_fragment's DV register order is not natural.  Reorder
+                    # while storing so linear o_shared still gets packed x4.
+                    stg_tx = tx % 8
+                    stg_ty = (tx - 128) // 8
+                    for j_r in T.unroll(block_S // 16):
+                        for j_p in T.unroll(2):
+                            for j_q in T.unroll(2):
+                                for j_u in T.unroll(4):
+                                    j_s = j_r * 16 + stg_ty
+                                    j_v = ((j_q * 4 + j_u) * 2 + j_p) * 8 + stg_tx
+                                    o_store_local[j_u] = o_fragment[j_s, j_v]
+                                for j_u in T.vectorized(4):
+                                    j_s = j_r * 16 + stg_ty
+                                    o_shared[
+                                        j_s, stg_tx * 8 + j_p * 64 + j_q * 4 + j_u
+                                    ] = o_store_local[j_u]
+                    T.barrier_arrive(o_is_ready)
+
+            with T.ws(2, 3, 4, 5):
+                # Initialize S
+                if use_initial_state:
+                    for j_k, j_v in T.Parallel(DV, DK):
+                        h_fragment[j_k, j_v] = h0[bb, bh, inv_perm_dv(j_v), j_k]
+                else:
+                    for j_k, j_v in T.Parallel(DK, DV):
+                        h_fragment[j_k, j_v] = 0.0
+                # Main Loop
+                for i_s in T.serial(num_iters):
+                    valid_seqs = T.min(
+                        seq_end_idx - seq_start_idx - i_s * block_S, block_S
+                    )
+                    T.barrier_wait(h_is_free, T.bitwise_xor(i_s % 2, 1))
+                    for j_k, j_v in T.Parallel(DK, DV):
+                        h_shared[j_k, j_v] = h_fragment[j_k, j_v]
+                    T.lma_wait()
+                    T.barrier_arrive(h_is_ready)
+
+                    T.barrier_wait(q_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.barrier_wait(k_is_ready[i_s % 2], consumer_phase(i_s))
+                    T.gemm(
+                        q_shared[i_s % 2, :, :],
+                        k_shared[i_s % 2, :, :],
+                        p_fragment,
                         transpose_B=True,
+                        clear_accum=True,
+                        wg_wait=-1,
                     )
+                    T.warpgroup_commit_batch()
 
-                for i, j in T.Parallel(block_C, block_C):
-                    p_val = T.if_then_else(
-                        i < actual_len and j < i,
-                        T.cast(
-                            -gram_frag[i, j]
-                            * beta_shared[i]
-                            * T.exp2((cu_g_shared[i] - cu_g_shared[j]) * _LOG2E),
-                            dtype,
-                        ),
-                        0.0,
-                    )
-                    P_left_shared[i, j] = p_val
-                    P_right_shared[i, j] = p_val
+                    load_left = seq_start_idx + i_s * block_S
+                    k_ldg_tx = (tx - 256) % 16
+                    k_ldg_ty = (tx - 256) // 16
+                    for j_r in T.unroll(block_S // 32):
+                        for j_u in T.vectorized(8):
+                            T.copy(
+                                k[
+                                    batch_idx,
+                                    load_left + j_r * 32 + k_ldg_ty,
+                                    bhg,
+                                    k_ldg_tx * 8 + j_u,
+                                ],
+                                scaled_k_shared[
+                                    j_r * 32 + k_ldg_ty,
+                                    k_ldg_tx * 8 + j_u,
+                                ],
+                                disable_tma=True,
+                                force_async_copy=True,
+                                src_robust_desc=k_robust_desc,
+                            )
+                    T.ptx_commit_group()
 
-                T.clear(S_left_shared)
-                T.clear(S_right_shared)
-                for i in T.serial(block_C):
-                    S_left_shared[i, i] = T.if_then_else(i < actual_len, 1.0, 0.0)
-                    S_right_shared[i, i] = T.if_then_else(i < actual_len, 1.0, 0.0)
-
-                for _r in T.serial(num_rounds):
-                    T.gemm(P_left_shared, S_right_shared, temp_frag, clear_accum=True)
-                    for i, j in T.Parallel(block_C, block_C):
-                        s_next = S_left_shared[i, j] + temp_frag[i, j]
-                        S_left_shared[i, j] = s_next
-                        S_right_shared[i, j] = s_next
-                    T.gemm(P_left_shared, P_right_shared, temp_frag, clear_accum=True)
-                    T.copy(temp_frag, P_left_shared)
-                    T.copy(temp_frag, P_right_shared)
-                for i_k in T.Pipelined(dim_k // block_DK, num_stages=num_stages):
-                    k_offset = i_k * block_DK
-                    for n, kk in T.Parallel(block_C, block_DK):
-                        k_beta_shared[n, kk] = T.if_then_else(
-                            n < actual_len,
-                            k_shared[n, kk] * beta_shared[n],
+                    T.barrier_wait(gb_is_ready[i_s % 2], consumer_phase(i_s))
+                    # G = Lower(diag(g) @ I @ diag(1/g))
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        g_fragment[j_s, j_t] = (
+                            g_shared[i_s % 2, j_s] - g_shared[i_s % 2, j_t]
+                        )
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        g_fragment[j_s, j_t] = T.exp2(g_fragment[j_s, j_t] * 1.442695)
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        g_fragment[j_s, j_t] = T.if_then_else(
+                            j_s >= j_t and j_s < valid_seqs,
+                            g_fragment[j_s, j_t],
                             0.0,
                         )
+                    # Ag = G * Ar * b
+                    T.barrier_wait(a_is_ready[i_s % 2], consumer_phase(i_s))
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        pa_shared[i_s % 2, j_s, j_t] = (
+                            g_fragment[j_s, j_t]
+                            * pa_shared[i_s % 2, j_s, j_t]
+                            * b_shared[i_s % 2, j_t]
+                        )
+
+                    T.ptx_wait_group(0)
+                    for j_r in T.unroll(block_S // 32):
+                        for j_u in T.vectorized(8):
+                            scaled_k_shared[
+                                j_r * 32 + k_ldg_ty,
+                                k_ldg_tx * 8 + j_u,
+                            ] = (
+                                scaled_k_shared[
+                                    j_r * 32 + k_ldg_ty,
+                                    k_ldg_tx * 8 + j_u,
+                                ]
+                                * g_exp_rev_shared[i_s % 2, j_r * 32 + k_ldg_ty]
+                            )
+                    T.barrier_arrive(inv_is_ready[i_s % 2])
+
+                    T.warpgroup_wait(0)
+                    T.barrier_arrive(q_is_free[i_s % 2])
+                    T.barrier_arrive(k_is_free[i_s % 2])
+                    g_last_local = g_exp_shared[i_s % 2, valid_seqs - 1]
+                    for j_k, j_v in T.Parallel(DK, DV):
+                        h_fragment[j_k, j_v] *= g_last_local
+                    T.barrier_arrive(gb_is_free[i_s % 2])
+
+                    T.barrier_wait(inv_is_free[i_s % 2], consumer_phase(i_s))
+                    # Pg = s * G * P
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        pa_shared[i_s % 2, j_s, j_t] = (
+                            g_fragment[j_s, j_t] * p_fragment[j_s, j_t] * scale
+                        )
+                    T.lma_wait()
+                    T.barrier_arrive(p_is_ready[i_s % 2])
+
+                    T.barrier_wait(vd_is_ready, i_s % 2)
+                    T.lma_wait()
+                    # Make the scaled K tile visible before the 512-thread MMA.
+                    T.sync_threads(0, 512)
                     T.gemm(
-                        S_left_shared,
-                        k_beta_shared,
-                        w_frag,
-                        clear_accum=True,
+                        scaled_k_shared,
+                        vd_shared,
+                        h_fragment,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=False,
+                        wg_wait=-1,
                     )
-                    for n, kk in T.Parallel(block_C, block_DK):
-                        if n < actual_len:
-                            w[chunk_token_start + n, sab_hid, k_offset + kk] = w_frag[
-                                n, kk
-                            ]
+                    T.warpgroup_commit_batch()
+                    T.warpgroup_wait(0)
+                    T.barrier_arrive(vd_is_free)
+                # Store final S
+                if store_final_state:
+                    for j_k, j_v in T.Parallel(DV, DK):
+                        ht[bb, bh, inv_perm_dv(j_v), j_k] = h_fragment[j_k, j_v]
 
-                for i_v in T.Pipelined(dim_v // block_DV, num_stages=num_stages):
-                    v_start = i_v * block_DV
-                    for n, vv in T.Parallel(block_C, block_DV):
-                        valid_flag = n < actual_len
-                        v_beta_shared[n, vv] = T.if_then_else(
-                            valid_flag,
-                            v[chunk_token_start + n, sab_hid, v_start + vv]
-                            * beta_shared[n],
-                            0.0,
+            with T.ws(6):
+                if tx < 800:
+                    for i_s in T.serial(num_iters):
+                        T.barrier_wait(q_is_free[i_s % 2], producer_phase(i_s))
+                        load_left = seq_start_idx + i_s * block_S
+                        load_right = load_left + block_S
+                        if tx == 768:
+                            T.copy(
+                                q[batch_idx, load_left:load_right, bhg, 0:DK],
+                                q_shared[i_s % 2, :, :],
+                            )
+                        T.barrier_arrive(q_is_ready[i_s % 2])
+                elif tx < 832:
+                    for i_s in T.serial(num_iters):
+                        T.barrier_wait(k_is_free[i_s % 2], producer_phase(i_s))
+                        load_left = seq_start_idx + i_s * block_S
+                        load_right = load_left + block_S
+                        if tx == 800:
+                            T.copy(
+                                k[batch_idx, load_left:load_right, bhg, 0:DK],
+                                k_shared[i_s % 2, :, :],
+                            )
+                        T.barrier_arrive(k_is_ready[i_s % 2])
+                elif tx < 864:
+                    for i_s in T.serial(num_iters):
+                        T.barrier_wait(a_is_free[i_s % 2], producer_phase(i_s))
+                        load_left = seq_start_idx + i_s * block_S
+                        load_right = load_left + block_S
+                        if tx == 832:
+                            T.copy(
+                                a[batch_idx, load_left:load_right, bh, 0:block_S],
+                                pa_shared[i_s % 2, :, :],
+                            )
+                        T.barrier_arrive(a_is_ready[i_s % 2])
+                elif tx < 896:
+                    for i_s in T.serial(num_iters):
+                        load_left = seq_start_idx + i_s * block_S
+                        load_right = load_left + block_S
+                        T.barrier_wait(v_is_free, T.bitwise_xor(i_s % 2, 1))
+                        if tx == 864:
+                            T.copy(
+                                v[
+                                    batch_idx,
+                                    load_left:load_right,
+                                    bh,
+                                    :,
+                                ],
+                                v_shared,
+                            )
+                        T.barrier_arrive(v_is_ready)
+            with T.ws(7):
+                if tx < 960:
+                    for i_s in T.serial(num_iters):
+                        T.barrier_wait(gb_is_free[i_s % 2], producer_phase(i_s))
+                        load_left = seq_start_idx + i_s * block_S
+                        load_right = load_left + block_S
+                        valid_seqs = T.min(
+                            seq_end_idx - seq_start_idx - i_s * block_S, block_S
                         )
-                    T.gemm(
-                        S_left_shared,
-                        v_beta_shared,
-                        u_frag,
-                        clear_accum=True,
-                    )
-                    for n, vv in T.Parallel(block_C, block_DV):
-                        if n < actual_len:
-                            u[chunk_token_start + n, sab_hid, v_start + vv] = u_frag[
-                                n, vv
-                            ]
-
-                    for n in T.Parallel(block_C):
-                        if n < actual_len:
-                            cu_g[chunk_token_start + n, sab_hid] = cu_g_shared[n]
-
-        return fused_prepare_compute_w_u
-
-    return _func
-
-
-@functools.lru_cache(maxsize=32)
-def _h_recurrence_tl(
-    total_chunks: int,
-    total_tokens: int,
-    batch: int,
-    head_sab: int,
-    chunk_size: int,
-    dim_k: int,
-    dim_v: int,
-    head_k: Optional[int] = None,
-    dtype: str = "float16",
-):
-    if head_k is None:
-        head_k = head_sab
-    if head_sab % head_k != 0:
-        raise ValueError("head_sab must be divisible by head_k.")
-    sab_to_k_group_size = head_sab // head_k
-
-    accum_dtype = "float32"
-    block_C = chunk_size
-
-    @tilelang.jit(
-        target="musa",
-        out_idx=[-2, -1],
-        pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
-        },
-        compile_flags=["-O3", "-DENABLE_BF16"],
-    )
-    def _func(num_stages, threads=128, block_DV=64):
-        assert dim_v % block_DV == 0, "dim_v must be divisible by block_DV"
-
-        @T.prim_func
-        def h_recurrence(
-            k: T.Tensor([total_tokens, head_k, dim_k], dtype),
-            cu_g: T.Tensor([total_tokens, head_sab], "float32"),
-            w: T.Tensor([total_tokens, head_sab, dim_k], dtype),
-            u: T.Tensor([total_tokens, head_sab, dim_v], dtype),
-            cu_seqlens: T.Tensor([batch + 1], "int32"),
-            chunk_offsets: T.Tensor([batch + 1], "int32"),
-            initial_state: T.Tensor([batch, head_sab, dim_v, dim_k], "float32"),
-            output_state: T.Tensor([batch, head_sab, dim_v, dim_k], "float32"),
-            S: T.Tensor([total_chunks, head_sab, dim_v, dim_k], "float32"),
-            v_new: T.Tensor([total_tokens, head_sab, dim_v], dtype),
-        ):
-            with T.Kernel(dim_v // block_DV, batch, head_sab, threads=threads) as (
-                vid,
-                bid,
-                sab_hid,
-            ):
-                k_hid = sab_hid // sab_to_k_group_size
-                seq_start = cu_seqlens[bid]
-                seq_end = cu_seqlens[bid + 1]
-                cid = chunk_offsets[bid]
-                seqlen = seq_end - seq_start
-                num_chunks = (seqlen + block_C - 1) // block_C
-
-                v_offset = vid * block_DV
-
-                g_c = T.alloc_shared([block_C], "float32")
-                g_exp_c = T.alloc_shared([block_C], "float32")
-                g_decay_c = T.alloc_shared([block_C], "float32")
-                w_c = T.alloc_shared([block_C, dim_k], dtype)
-                k_c = T.alloc_shared([block_C, dim_k], dtype)
-                h_c = T.alloc_shared([block_DV, dim_k], dtype)
-                v_new_c = T.alloc_shared([block_C, block_DV], dtype)
-                v_scaled_c = T.alloc_shared([block_C, block_DV], dtype)
-                ws_frag = T.alloc_fragment([block_C, block_DV], accum_dtype)
-                h_next_frag = T.alloc_fragment([block_DV, dim_k], accum_dtype)
-
-                # initialize h
-                T.copy(
-                    initial_state[bid, sab_hid, v_offset : v_offset + block_DV, :],
-                    h_c,
-                    disable_tma=True,
-                )
-
-                for t in T.Pipelined(num_chunks, num_stages=num_stages):
-                    chunk_token_start = seq_start + t * block_C
-                    chunk_token_end = T.min(chunk_token_start + block_C, seq_end)
-                    actual_len = chunk_token_end - chunk_token_start
-
-                    for n in T.Parallel(block_C):
-                        g_c[n] = T.if_then_else(
-                            n < actual_len,
-                            cu_g[chunk_token_start + n, sab_hid],
-                            0.0,
+                        T.copy(
+                            g[batch_idx, load_left:load_right, bh],
+                            g_shared[i_s % 2, :],
+                            force_async_copy=True,
+                            src_robust_desc=g_robust_desc,
                         )
-
-                    g_last_val = g_c[actual_len - 1]
-
-                    for n in T.Parallel(block_C):
-                        g_exp_c[n] = T.exp2(g_c[n] * _LOG2E)
-                        g_decay_c[n] = T.exp2((g_last_val - g_c[n]) * _LOG2E)
-
-                    for n, kk in T.Parallel(block_C, dim_k):
-                        valid_flag = n < actual_len
-                        w_c[n, kk] = T.if_then_else(
-                            valid_flag, w[chunk_token_start + n, sab_hid, kk], 0.0
+                        T.copy(
+                            b[batch_idx, load_left:load_right, bh],
+                            b_shared[i_s % 2, :],
+                            force_async_copy=True,
+                            src_robust_desc=b_robust_desc,
                         )
-                        k_c[n, kk] = T.if_then_else(
-                            valid_flag, k[chunk_token_start + n, k_hid, kk], 0.0
-                        )
-                    T.gemm(
-                        w_c,
-                        h_c,
-                        ws_frag,
-                        transpose_B=True,
-                        clear_accum=True,
-                    )
-                    for n, vv in T.Parallel(block_C, block_DV):
-                        valid_flag = n < actual_len
-                        v_new_c[n, vv] = (
-                            T.if_then_else(
-                                valid_flag,
-                                u[chunk_token_start + n, sab_hid, v_offset + vv],
+                        T.ptx_commit_group()
+                        T.ptx_wait_group(0)
+                        T.sync_threads(1, 64)
+                        for j_s in T.Parallel(block_S):
+                            g_exp_rev_shared[i_s % 2, j_s] = T.if_then_else(
+                                j_s < valid_seqs,
+                                T.exp2(
+                                    (
+                                        g_shared[i_s % 2, valid_seqs - 1]
+                                        - g_shared[i_s % 2, j_s]
+                                    )
+                                    * 1.442695
+                                ),
                                 0.0,
                             )
-                            - ws_frag[n, vv] * g_exp_c[n]
-                        )
-                        v_scaled_c[n, vv] = v_new_c[n, vv] * g_decay_c[n]
-                        if valid_flag:
-                            v_new[chunk_token_start + n, sab_hid, v_offset + vv] = (
-                                v_new_c[n, vv]
+                            g_exp_shared[i_s % 2, j_s] = T.if_then_else(
+                                j_s < valid_seqs,
+                                T.exp2(g_shared[i_s % 2, j_s] * 1.442695),
+                                0.0,
                             )
+                        T.barrier_arrive(gb_is_ready[i_s % 2])
+                elif tx < 1024:
+                    for i_s in T.serial(full_num_iters):
+                        T.barrier_wait(o_is_ready, i_s % 2)
+                        load_left = seq_start_idx + i_s * block_S
+                        load_right = load_left + block_S
+                        if tx == 960:
+                            T.copy(o_shared, o[batch_idx, load_left:load_right, bh, :])
+                        T.tma_store_wait()
+                        T.barrier_arrive(o_is_free)
+                    if tail_num_iters > 0:
+                        i_s = full_num_iters
+                        store_left = seq_start_idx + i_s * block_S
+                        valid_seqs = seq_end_idx - store_left
+                        T.barrier_wait(o_is_ready, i_s % 2)
+                        for j_s, j_v in T.Parallel(block_S, DV):
+                            if j_s < valid_seqs:
+                                o[
+                                    batch_idx,
+                                    store_left + j_s,
+                                    bh,
+                                    j_v,
+                                ] = o_shared[j_s, j_v]
+                        T.barrier_arrive(o_is_free)
 
-                    for i, j in T.Parallel(block_DV, dim_k):
-                        h_next_frag[i, j] = h_c[i, j] * T.exp2(g_last_val * _LOG2E)
-                    T.gemm(
-                        v_scaled_c,
-                        k_c,
-                        h_next_frag,
-                        transpose_A=True,
-                        clear_accum=True,
-                    )
-                    T.copy(h_next_frag, h_c, disable_tma=True)
-                    T.copy(
-                        h_next_frag,
-                        S[cid + t, sab_hid, v_offset : v_offset + block_DV, :],
-                        disable_tma=True,
-                    )
-                # write final state
-                T.copy(
-                    h_next_frag,
-                    output_state[bid, sab_hid, v_offset : v_offset + block_DV, :],
-                    disable_tma=True,
-                )
+    def _symbol_part(value):
+        return (
+            str(value)
+            .replace("torch.", "")
+            .replace(".", "p")
+            .replace("-", "m")
+            .replace(" ", "_")
+        )
 
-        return h_recurrence
-
-    return _func
-
-
-@functools.lru_cache(maxsize=32)
-def _output_o_tl(
-    total_chunks: int,
-    total_tokens: int,
-    head_q: int,
-    head_kv: int,
-    group_size: int,
-    chunk_size: int,
-    scale: float,
-    dim_k: int,
-    dim_v: int,
-    head_o: Optional[int] = None,
-    head_sab: Optional[int] = None,
-    q_group_size: Optional[int] = None,
-    sab_group_size: Optional[int] = None,
-    head_k: Optional[int] = None,
-    dtype: str = "float32",
-):
-    if head_o is None:
-        head_o = head_q
-    if head_sab is None:
-        head_sab = head_kv
-    if head_k is None:
-        head_k = head_kv
-    if q_group_size is None:
-        q_group_size = head_o // head_q
-    if sab_group_size is None:
-        sab_group_size = group_size
-
-    if head_o % head_q != 0:
-        raise ValueError("head_o must be divisible by head_q.")
-    if head_o % head_sab != 0:
-        raise ValueError("head_o must be divisible by head_sab.")
-    if head_sab % head_k != 0:
-        raise ValueError("head_sab must be divisible by head_k.")
-    if q_group_size != head_o // head_q:
-        raise ValueError("q_group_size mismatch with head_o/head_q.")
-    if sab_group_size != head_o // head_sab:
-        raise ValueError("sab_group_size mismatch with head_o/head_sab.")
-
-    sab_to_k_group_size = head_sab // head_k
-
-    accum_dtype = "float32"
-    block_C = chunk_size
-
-    @tilelang.jit(
-        target="musa",
-        out_idx=[],
-        pass_configs={
-            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False,
-        },
-        compile_flags=["-O3", "-DENABLE_BF16"],
+    symbol = (
+        "tilelang_fused_chunk_gdn_prefill_kernel"
+        f"_h{H}_hg{Hg}_dk{DK}_dv{DV}_cs{chunk_size}"
+        f"_s{_symbol_part(scale)}"
+        f"_q{_symbol_part(qkva_dtype)}"
+        f"_g{_symbol_part(g_dtype)}"
+        f"_b{_symbol_part(b_dtype)}"
+        f"_h0{_symbol_part(h0_dtype)}"
+        f"_ht{_symbol_part(ht_dtype)}"
+        f"_o{_symbol_part(o_dtype)}"
+        f"_seq{_symbol_part(seqlen_dtype)}"
+        f"_init{int(use_initial_state)}_final{int(store_final_state)}_var{int(is_varlen)}"
     )
-    def _func(num_stages, threads=128, block_DV=64):
-        assert dim_v % block_DV == 0, "dim_v must be divisible by block_DV"
-
-        @T.prim_func
-        def output_o(
-            q: T.Tensor([total_tokens, head_q, dim_k], dtype),
-            k: T.Tensor([total_tokens, head_k, dim_k], dtype),
-            g: T.Tensor([total_tokens, head_sab], "float32"),
-            chunk_token_starts: T.Tensor([total_chunks], "int32"),
-            chunk_token_lens: T.Tensor([total_chunks], "int32"),
-            S: T.Tensor([total_chunks, head_sab, dim_v, dim_k], "float32"),
-            v_new: T.Tensor([total_tokens, head_sab, dim_v], dtype),
-            o: T.Tensor([total_tokens, head_o, dim_v], dtype),
-        ):
-            with T.Kernel(total_chunks, head_o, dim_v // block_DV, threads=threads) as (
-                tid,
-                out_hid,
-                vid,
-            ):
-                q_hid = out_hid // q_group_size
-                sab_hid = out_hid // sab_group_size
-                k_hid = sab_hid // sab_to_k_group_size
-
-                chunk_token_start = chunk_token_starts[tid]
-                actual_len = chunk_token_lens[tid]
-                v_offset = vid * block_DV
-
-                q_c = T.alloc_shared([block_C, dim_k], dtype)
-                k_c = T.alloc_shared([block_C, dim_k], dtype)
-                g_c = T.alloc_shared([block_C], dtype)
-                h_c = T.alloc_shared([block_DV, dim_k], dtype)
-                v_new_c = T.alloc_shared([block_C, block_DV], dtype)
-                attn = T.alloc_shared([block_C, block_C], dtype)
-                o_c = T.alloc_shared([block_C, block_DV], dtype)
-                o_frag = T.alloc_fragment([block_C, block_DV], accum_dtype)
-                attn_frag = T.alloc_fragment([block_C, block_C], accum_dtype)
-
-                for n, kk in T.Parallel(block_C, dim_k):
-                    valid_flag = n < actual_len
-                    q_c[n, kk] = T.if_then_else(
-                        valid_flag, q[chunk_token_start + n, q_hid, kk], 0.0
-                    )
-                    k_c[n, kk] = T.if_then_else(
-                        valid_flag, k[chunk_token_start + n, k_hid, kk], 0.0
-                    )
-
-                for i in T.Parallel(block_C):
-                    g_c[i] = g[chunk_token_start + i, sab_hid]
-
-                T.copy(
-                    S[tid, sab_hid, v_offset : v_offset + block_DV, :],
-                    h_c,
-                    disable_tma=True,
-                )
-                for n, vv in T.Parallel(block_C, block_DV):
-                    valid_flag = n < actual_len
-                    v_new_c[n, vv] = T.if_then_else(
-                        valid_flag,
-                        v_new[chunk_token_start + n, sab_hid, v_offset + vv],
-                        0.0,
-                    )
-
-                T.gemm(q_c, h_c, o_frag, transpose_B=True, clear_accum=True)
-                for i, j in T.Parallel(block_C, block_DV):
-                    o_frag[i, j] = o_frag[i, j] * T.exp2(g_c[i] * _LOG2E)
-
-                T.gemm(q_c, k_c, attn_frag, transpose_B=True, clear_accum=True)
-                for i, j in T.Parallel(block_C, block_C):
-                    attn[i, j] = T.if_then_else(
-                        j <= i,
-                        attn_frag[i, j] * T.exp2((g_c[i] - g_c[j]) * _LOG2E),
-                        0.0,
-                    )
-
-                T.gemm(attn, v_new_c, o_frag)
-                for i, j in T.Parallel(block_C, block_DV):
-                    o_frag[i, j] = scale * o_frag[i, j]
-                T.copy(o_frag, o_c)
-                for n, vv in T.Parallel(block_C, block_DV):
-                    if n < actual_len:
-                        o[chunk_token_start + n, out_hid, v_offset + vv] = o_c[n, vv]
-
-        return output_o
-
-    return _func
+    return tilelang_fused_chunk_gdn_prefill_kernel.with_attr("global_symbol", symbol)
 
 
-def gdn_prefill(
-    output: torch.Tensor,
-    output_state: torch.Tensor,
+def fused_chunk_gdn_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    initial_state: Optional[torch.Tensor] = None,
-    alpha: Optional[torch.Tensor] = None,
-    beta: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
+    a: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor | None = None,
+    output_state: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = True,
+    output_h: bool = False,
+    output_o: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
 ):
-    total_tokens = q.size(0)
+    batch_size, num_tokens, Hg, K = k.shape
+    _, _, H, V = v.shape
+    scale = scale or K ** (-0.5)
+    assert K == V == 128
+    assert chunk_size == 64
+
     if cu_seqlens is None:
-        cu_seqlens = torch.tensor([0, total_tokens], device=q.device, dtype=torch.int32)
+        real_batch_size = batch_size
+        num_chunks = tilelang.cdiv(num_tokens, chunk_size) if output_h else 0
+        cu_seqlens = torch.empty((batch_size + 1), dtype=torch.int32, device=k.device)
+        chunk_offsets = torch.empty(
+            (batch_size + 1), dtype=torch.int32, device=k.device
+        )
+        seqlen_dtype = torch.int32
+        is_varlen = False
     else:
-        cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32)
-
-    batch = cu_seqlens.size(0) - 1
-    head_q = q.size(1)
-    head_k = k.size(1)
-    head_v = v.size(1)
-    dim_k = k.size(2)
-    dim_v = v.size(2)
-
-    is_gqa = head_v == head_k and head_q % head_k == 0
-    is_gva = head_q == head_k and head_v % head_q == 0
-    if not (is_gqa or is_gva):
-        raise ValueError(
-            "Unsupported head configuration. "
-            "Supported: GQA (head_q % head_k == 0 and head_v == head_k) or "
-            "GVA (head_q == head_k and head_v % head_q == 0)."
+        real_batch_size = len(cu_seqlens) - 1
+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size).to(
+            cu_seqlens.dtype
         )
-    head_o = max(head_q, head_v)
-    head_sab = max(head_k, head_v)
-    if head_sab % head_k != 0:
-        raise ValueError("head_sab must be divisible by head_k.")
-    if head_o % head_q != 0 or head_o % head_sab != 0:
-        raise ValueError(
-            "head mapping requires head_o divisible by head_q and head_sab."
-        )
+        num_chunks = chunk_offsets[-1].item() if output_h else 0
+        seqlen_dtype = cu_seqlens.dtype
+        is_varlen = True
 
-    q_group_size = head_o // head_q
-    sab_group_size = head_o // head_sab
-    group_size = sab_group_size
-
-    if alpha is None:
-        alpha = torch.ones(total_tokens, head_sab, dtype=torch.float32, device=q.device)
-    if beta is None:
-        beta = torch.ones(total_tokens, head_sab, dtype=torch.float32, device=q.device)
-
+    use_initial_state = initial_state is not None
     if initial_state is None:
-        initial_state = torch.zeros(
-            batch, head_sab, dim_v, dim_k, dtype=torch.float32, device=q.device
+        initial_state = torch.empty(
+            (real_batch_size, H, K, V), dtype=torch.float32, device=k.device
         )
+    h = torch.empty((batch_size, num_chunks, H, K, V), dtype=k.dtype, device=k.device)
 
-    if output.shape[1] != head_o:
-        raise ValueError("output must have shape [total_tokens, head_o, dim_v].")
-    if output_state.shape[1] < head_sab:
-        raise ValueError("output_state must have at least head_sab heads on dim=1.")
+    if output is None:
+        o = torch.empty_like(v)
+    else:
+        if output.shape != v.shape:
+            raise ValueError(f"Expected output shape {v.shape}, got {output.shape}.")
+        if output.dtype != v.dtype:
+            raise ValueError(f"Expected output dtype {v.dtype}, got {output.dtype}.")
+        if output.device != v.device:
+            raise ValueError(f"Expected output device {v.device}, got {output.device}.")
+        o = output
 
-    # compute chunk metadata once (avoid per-block binary search in kernels)
-    chunk_offsets, chunk_token_starts, chunk_token_lens, total_chunks = (
-        _build_chunk_metadata(cu_seqlens, chunk_size)
-    )
+    final_state_shape = (real_batch_size, H, K, V)
+    if output_state is None:
+        final_state = torch.empty(
+            final_state_shape, dtype=torch.float32, device=k.device
+        )
+    else:
+        if output_state.shape != final_state_shape:
+            raise ValueError(
+                f"Expected output_state shape {final_state_shape}, got {output_state.shape}."
+            )
+        if output_state.dtype != torch.float32:
+            raise ValueError(
+                f"Expected output_state dtype torch.float32, got {output_state.dtype}."
+            )
+        if output_state.device != k.device:
+            raise ValueError(
+                f"Expected output_state device {k.device}, got {output_state.device}."
+            )
+        final_state = output_state
 
-    tl_dtype = _torch_dtype_to_tl(q.dtype)
-    # ---------- kernel1：w, u ----------
-    fused_fn = fused_prepare_compute_w_u_tl(
-        total_chunks,
-        total_tokens,
-        head_sab,
-        chunk_size,
-        dim_k,
-        dim_v,
-        head_k=head_k,
-        dtype=tl_dtype,
-    )(num_stages=2, threads=128, block_DK=64, block_DV=64)
-    w, u, cu_g = fused_fn(k, v, alpha, beta, chunk_token_starts, chunk_token_lens)
-
-    # ---------- kernel 2：recurrent state ----------
-    h_fn = _h_recurrence_tl(
-        total_chunks,
-        total_tokens,
-        batch,
-        head_sab,
-        chunk_size,
-        dim_k,
-        dim_v,
-        head_k=head_k,
-        dtype=tl_dtype,
-    )(num_stages=2, threads=128, block_DV=32)
-    S_buf, v_new = h_fn(
-        k,
-        cu_g,
-        w,
-        u,
-        cu_seqlens,
-        chunk_offsets,
-        initial_state,
-        output_state,
-    )
-
-    # ---------- kernel 3：output ----------
-    if scale is None:
-        scale = dim_k**-0.5
-
-    o_fn = _output_o_tl(
-        total_chunks,
-        total_tokens,
-        head_q,
-        head_sab,
-        group_size,
+    tilelang_fused_chunk_gdn_prefill_kernel = tilelang_fused_chunk_gdn_prefill(
+        H,
+        Hg,
+        K,
+        V,
         chunk_size,
         scale,
-        dim_k,
-        dim_v,
-        head_o=head_o,
-        head_sab=head_sab,
-        q_group_size=q_group_size,
-        sab_group_size=sab_group_size,
-        head_k=head_k,
-        dtype=tl_dtype,
-    )(num_stages=1, threads=128, block_DV=64)
-    o_fn(
+        qkva_dtype=q.dtype,
+        g_dtype=g.dtype,
+        b_dtype=b.dtype,
+        h0_dtype=initial_state.dtype,
+        ht_dtype=final_state.dtype,
+        h_dtype=h.dtype,
+        o_dtype=o.dtype,
+        seqlen_dtype=seqlen_dtype,
+        accum_dtype="float32",
+        use_initial_state=use_initial_state,
+        store_final_state=output_final_state,
+        is_varlen=is_varlen,
+    )
+    tilelang_fused_chunk_gdn_prefill_kernel(
         q,
         k,
-        cu_g,
-        chunk_token_starts,
-        chunk_token_lens,
-        S_buf,
-        v_new,
-        output,
+        v,
+        a,
+        g,
+        b,
+        initial_state,
+        cu_seqlens,
+        chunk_offsets,
+        o,
+        h,
+        final_state,
+    )
+
+    if not output_final_state:
+        final_state = None
+    if not output_h:
+        h = None
+    if not output_o:
+        o = None
+
+    return o, h, final_state
+
+
+if __name__ == "__main__":
+    tilelang_fused_chunk_gdn_prefill_kernel = tilelang_fused_chunk_gdn_prefill(
+        1,
+        1,
+        128,
+        128,
+        64,
+        1,
+        qkva_dtype=torch.float16,
+        g_dtype=torch.float32,
+        b_dtype=torch.float32,
+        h0_dtype=torch.float32,
+        ht_dtype=torch.float32,
+        h_dtype=torch.float32,
+        o_dtype=torch.float16,
+        seqlen_dtype=torch.int32,
+        accum_dtype="float32",
+        use_initial_state=True,
+        store_final_state=True,
+        is_varlen=True,
     )

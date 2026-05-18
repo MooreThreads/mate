@@ -1,0 +1,71 @@
+# ruff: noqa
+"""Unified TileLang sparse prefill entrypoint."""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import torch
+
+from .sparse_mla_v32_fwd_pipelined import (
+    tilelang_sparse_mla_prefill_fwd_interface as _prefill_v32,
+)
+from .sparse_mla_model1_fwd_pipelined import (
+    sparse_mla_fwd_interface_model1 as _prefill_model1,
+)
+
+
+def sparse_mla_prefill_fwd(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch sparse prefill by compile-time layout variant."""
+
+    assert d_v == 512, "sparse prefill only supports d_v == 512"
+    assert q.dtype == torch.bfloat16, "q must be bfloat16"
+    assert kv.dtype == torch.bfloat16, "kv must be bfloat16"
+    assert indices.dtype == torch.int32, "indices must be int32"
+    seq_len_q, _, head_dim_q = q.shape
+    _, h_k, _ = kv.shape
+    assert q.stride(-1) == 1, "q last dimension must be contiguous"
+    assert kv.stride(-1) == 1, "kv last dimension must be contiguous"
+    assert indices.stride(-1) == 1, "indices last dimension must be contiguous"
+    assert head_dim_q == kv.shape[-1]
+    assert seq_len_q == indices.shape[0]
+    assert h_k == indices.shape[1]
+    assert h_k == 1
+
+    if head_dim_q == 512:
+        topk = indices.shape[-1]
+        assert topk % 64 == 0, (
+            "MODEL1 sparse prefill requires topk to be a multiple of 64"
+        )
+        return _prefill_model1(
+            q,
+            kv,
+            indices,
+            topk_length=topk_length,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            d_v=d_v,
+            return_max_logits=True,
+        )
+
+    if head_dim_q == 576:
+        return _prefill_v32(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            return_max_logits=True,
+        )
+
+    raise AssertionError(f"Unsupported sparse prefill q.shape[-1]: {head_dim_q}")

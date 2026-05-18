@@ -1,12 +1,14 @@
 import argparse
 from contextlib import contextmanager
 from pathlib import Path
+from typing import SupportsInt, cast
 
 import tvm_ffi.cpp  # noqa: F401
 
 from mate.jit import build_jit_specs, copy_built_kernels, env as jit_env
 from mate.jit.attention.fmha import gen_fmha_aot
 from mate.jit.deep_gemm_attention import gen_deep_gemm_attention_aot
+from mate.jit.gemm.deep_gemm.hyperconnection import gen_hyperconnection_aot
 from mate.jit.gemm_ops import gen_gemm_ops_aot
 from mate.jit.mla_ops import gen_mla_ops_aot
 from mate.jit.moe_fused_gate import gen_moe_fused_gate_aot
@@ -62,6 +64,53 @@ def override_jit_env(
             setattr(jit_env, name, value)
 
 
+def get_default_config() -> dict[str, object]:
+    return {
+        "attention_aot_level": 1,
+        "add_gemm": True,
+        "add_moe": True,
+    }
+
+
+def _dedupe_specs(specs):
+    deduped = {}
+    for spec in specs:
+        existing = deduped.get(spec.name)
+        if existing is None:
+            deduped[spec.name] = spec
+        elif existing != spec:
+            raise ValueError(f"JIT spec collision for name={spec.name}")
+    return list(deduped.values())
+
+
+def gen_all_modules(config: dict[str, object] | None = None):
+    final_config = get_default_config()
+    if config is not None:
+        final_config.update(config)
+
+    attention_aot_level = int(cast(SupportsInt, final_config["attention_aot_level"]))
+    add_gemm = bool(final_config["add_gemm"])
+    add_moe = bool(final_config["add_moe"])
+
+    specs = []
+    if attention_aot_level > 0:
+        specs.extend(gen_fmha_aot(attention_aot_level))
+        specs.extend(gen_mla_ops_aot())
+        specs.extend(gen_sage_attention_aot())
+    if add_gemm:
+        specs.extend(gen_gemm_ops_aot())
+        specs.extend(gen_deep_gemm_attention_aot())
+        specs.extend(gen_hyperconnection_aot())
+    if add_moe:
+        specs.extend(gen_moe_fused_gate_aot())
+
+    return _dedupe_specs(specs)
+
+
+def register_default_modules(config: dict[str, object] | None = None) -> int:
+    return len(gen_all_modules(config))
+
+
 def compile_and_package_aot(
     output_dir: Path,
     build_dir: Path,
@@ -84,16 +133,13 @@ def compile_and_package_aot(
         jit_env.MATE_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
         jit_env.MATE_JIT_DIR.mkdir(parents=True, exist_ok=True)
 
-        specs = []
-        if attention_aot_level > 0:
-            specs.extend(gen_fmha_aot(attention_aot_level))
-            specs.extend(gen_mla_ops_aot())
-            specs.extend(gen_sage_attention_aot())
-        if add_gemm:
-            specs.extend(gen_gemm_ops_aot())
-            specs.extend(gen_deep_gemm_attention_aot())
-        if add_moe:
-            specs.extend(gen_moe_fused_gate_aot())
+        specs = gen_all_modules(
+            {
+                "attention_aot_level": attention_aot_level,
+                "add_gemm": add_gemm,
+                "add_moe": add_moe,
+            }
+        )
 
         if dry_run:
             return specs

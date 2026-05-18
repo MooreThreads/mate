@@ -3,7 +3,7 @@ import torch
 from mate.api_logging import mate_api
 from mate._backend import resolve_backend
 from mate.jit.gemm_ops import get_gemm_ops_module
-from mate.testing.utils import ceil_div
+from mate.utils import ceil_div
 from typing import Tuple, Optional, Literal
 
 
@@ -161,7 +161,9 @@ def masked_moe_gemm_16bit(
 
         # zero init is required
         signal = torch.zeros(
-            expert_sz * ceil_div(max_m, tile_signal), dtype=torch.int32, device=a.device
+            expert_sz * ceil_div(max_m, tile_signal),
+            dtype=torch.int32,
+            device=a.device,
         )
 
     res = _get_module().get_function("masked_moe_gemm_16bit")(
@@ -349,7 +351,9 @@ def masked_moe_gemm_8bit(
 
         # zero init is required
         signal = torch.zeros(
-            expert_sz * ceil_div(max_m, tile_signal), dtype=torch.int32, device=a.device
+            expert_sz * ceil_div(max_m, tile_signal),
+            dtype=torch.int32,
+            device=a.device,
         )
 
     res = _get_module().get_function("masked_moe_gemm_8bit")(
@@ -524,6 +528,7 @@ def bmm_fp8(
     out: Optional[torch.Tensor] = None,
     backend: str = "auto",
     scale_granularity_mnk: Optional[Tuple[int, int, int]] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ):
     """
     Perform batched matrix multiplication with FP8 quantized tensors.
@@ -595,6 +600,7 @@ def bmm_fp16(
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: str = "auto",
+    c: Optional[torch.Tensor] = None,
 ):
     backend = resolve_backend(
         backend, supported=("mudnn",), allow_auto=True, default="auto"
@@ -604,11 +610,17 @@ def bmm_fp16(
         m = a.size(1)
         n = b.size(2)
 
-        if out_dtype not in [torch.bfloat16, torch.float16]:
-            raise ValueError("Only bf16 and fp16 are supported for out_type!")
+        if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+            raise ValueError("Only bf16, fp16 and fp32 are supported for out_type!")
 
         out = torch.empty((batch, m, n), dtype=out_dtype, device=a.device)
-    _get_module().get_function("bmm_fp16")(a, b, out, backend)
+
+    if c is not None and a.size(2) == 0:
+        if out.data_ptr() != c.data_ptr():
+            out.copy_(c)
+        return out
+
+    _get_module().get_function("bmm_fp16")(a, b, out, c, backend)
     return out
 
 
@@ -624,6 +636,7 @@ def gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: str = "auto",
+    output_scale: Optional[torch.Tensor] = None,
 ):
     """
     Perform groupwise FP8 GEMM operation with scaling.
@@ -655,21 +668,42 @@ def gemm_fp8_nt_groupwise(
         Default is ``(1, 128, 128)``.
     out : Optional[Tensor]
         Pre-allocated output tensor with shape ``(m, n)``.
-        Should be of bf16 type. If None, a new tensor will be allocated.
+        Should be bf16/fp16 when ``output_scale`` is None, or fp8_e4m3 when
+        ``output_scale`` is provided. If None, a new tensor will be allocated.
     out_dtype : Optional[torch.dtype]
-        Data type for the output tensor. Only torch.bfloat16 is supported.
-        If None, defaults to torch.bfloat16.
+        Data type for the output tensor when ``out`` is None. If ``out`` is
+        provided, ``out.dtype`` is validated instead.
+        Defaults to torch.bfloat16 without ``output_scale`` and fp8_e4m3 with
+        ``output_scale``.
     backend : str
-        Backend to use for the operation. Currently only supports "mudnn".
+        Backend to use for the operation. Use ``"mudnn"`` when
+        ``output_scale`` is None and ``"mubin"`` when ``output_scale`` is
+        provided. ``"auto"`` selects the supported backend for the selected
+        output path.
+    output_scale: Optional[torch.Tensor]
+        Quantization scale tensor for FP8 output. If provided, the operation
+        uses the mubin FP8-output path. If None, output is not quantized.
+        Default is None.
 
     Returns
     -------
     Tensor
-        Result tensor with shape ``(m, n)`` in the specified output data type (bf16).
+        Result tensor with shape ``(m, n)`` in the specified output data type.
     """
-    backend = resolve_backend(
-        backend, supported=("mudnn",), allow_auto=True, default="auto"
-    )
+
+    if output_scale is None:
+        backend = resolve_backend(
+            backend, supported=("mudnn",), allow_auto=True, default="auto"
+        )
+        if backend == "auto":
+            backend = "mudnn"
+    else:
+        # The FP8-output kernel is implemented by the mubin backend.
+        backend = resolve_backend(
+            backend, supported=("mubin",), allow_auto=True, default="auto"
+        )
+        if backend == "auto":
+            backend = "mubin"
 
     if scale_major_mode is None:
         scale_major_mode = "K"
@@ -684,27 +718,66 @@ def gemm_fp8_nt_groupwise(
     if scale_granularity_mnk is None:
         scale_granularity_mnk = (1, 128, 128)
 
+    major_a_mode = "K"
+    major_b_mode = "K"
+
+    m = a.size(0)
+    n = b.size(0)
+    expected_out_shape = (m, n)
+
+    supported_out_dtypes: Tuple[torch.dtype, ...]
+    if output_scale is not None:
+        supported_out_dtypes = (torch.float8_e4m3fn,)
+        default_out_dtype = torch.float8_e4m3fn
+        out_dtype_error = "fp8_output only supports e4m3 now"
+    else:
+        supported_out_dtypes = (torch.bfloat16, torch.float16)
+        default_out_dtype = torch.bfloat16
+        out_dtype_error = "Only bf16 and fp16 are supported for out_type!"
+
     if out is None:
-        m = a.size(0)
-        n = b.size(0)
-
         if out_dtype is None:
-            out_dtype = torch.bfloat16
+            out_dtype = default_out_dtype
 
-        if out_dtype not in [torch.bfloat16]:
-            raise ValueError("Only bf16 and fp16 are supported for out_type!")
+        if out_dtype not in supported_out_dtypes:
+            raise ValueError(out_dtype_error)
 
-        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+        out = torch.empty(expected_out_shape, dtype=out_dtype, device=a.device)
+    else:
+        if not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor")
+        if tuple(out.shape) != expected_out_shape:
+            raise ValueError(
+                f"out must have shape {expected_out_shape}, got {tuple(out.shape)}"
+            )
+        if out.device != a.device:
+            raise ValueError(f"out must be on device {a.device}, got {out.device}")
+        if out.dtype not in supported_out_dtypes:
+            raise ValueError(out_dtype_error)
+        if output_scale is None and out.stride(-1) != 1:
+            raise ValueError("out must be contiguous at the last dimension")
 
-    _get_module().get_function("gemm_fp8_nt_groupwise")(
-        a,
-        b,
-        a_scale,
-        b_scale,
-        scale_major_mode,
-        mma_sm,
-        scale_granularity_mnk,
-        out,
-        backend,
-    )
+    if output_scale is not None:
+        _get_module().get_function("groupwise_gemm_8bit_fp8output")(
+            (a, a_scale),
+            (b, b_scale),
+            scale_granularity_mnk,
+            out,
+            output_scale,
+            major_a_mode,
+            major_b_mode,
+            None,
+        )
+    else:
+        _get_module().get_function("gemm_fp8_nt_groupwise")(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            mma_sm,
+            scale_granularity_mnk,
+            out,
+            backend,
+        )
     return out

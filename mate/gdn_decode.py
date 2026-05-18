@@ -11,9 +11,11 @@ import torch
 
 from mate.api_logging import mate_api
 from mate.gdn_kernels.tilelang import gdn_decode as gdn_decode_tilelang
+from mate.gdn_kernels.tilelang import gdn_mtp as gdn_mtp_tilelang
 
 _SUPPORTED_QKV_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_OUTPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_SUPPORTED_DT_BIAS_DTYPES = (torch.float32, torch.bfloat16)
 
 
 def _check_same_device(reference: torch.Tensor, **tensors: torch.Tensor) -> None:
@@ -80,10 +82,11 @@ def _validate_common_decode_inputs(
             f"Expected a/b to have the same dtype as q, got "
             f"q={q.dtype}, a={a.dtype}, b={b.dtype}."
         )
-    if A_log.dtype != torch.float32 or dt_bias.dtype != torch.float32:
+    if A_log.dtype != torch.float32:
+        raise ValueError(f"A_log must be float32, got A_log={A_log.dtype}.")
+    if dt_bias.dtype not in _SUPPORTED_DT_BIAS_DTYPES:
         raise ValueError(
-            f"A_log and dt_bias must both be float32, got "
-            f"A_log={A_log.dtype}, dt_bias={dt_bias.dtype}."
+            f"dt_bias must be float32 or bfloat16, got dt_bias={dt_bias.dtype}."
         )
 
     _check_same_device(
@@ -126,7 +129,6 @@ def _gated_delta_rule_decode_pretranspose_impl(
     *,
     batch_size: int,
     seq_len: int,
-    num_q_heads: int,
     head_dim_k: int,
     num_v_heads: int,
     head_dim_v: int,
@@ -174,6 +176,140 @@ def _gated_delta_rule_decode_pretranspose_impl(
     return output, state
 
 
+def _gated_delta_rule_mtp_vk_fp32_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    head_dim_k: int,
+    num_v_heads: int,
+    head_dim_v: int,
+    state_indices: Optional[torch.Tensor],
+    scale: Optional[float],
+    output: Optional[torch.Tensor],
+    intermediate_states_buffer: Optional[torch.Tensor],
+    disable_state_update: bool,
+    use_qk_l2norm: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if state.device != q.device:
+        raise ValueError(
+            f"Expected state to be on device {q.device}, got {state.device}."
+        )
+    if state.dim() != 4 or state.shape[1:] != (
+        num_v_heads,
+        head_dim_v,
+        head_dim_k,
+    ):
+        raise ValueError(
+            f"Expected state [pool_size, HV={num_v_heads}, V={head_dim_v}, "
+            f"K={head_dim_k}] for VK MTP, got {tuple(state.shape)}"
+        )
+
+    pool_size = state.shape[0]
+    if state_indices is None:
+        if pool_size != batch_size:
+            raise ValueError(
+                "state_indices=None uses identity mapping, so state must have "
+                f"shape [B={batch_size}, HV={num_v_heads}, V={head_dim_v}, K={head_dim_k}], "
+                f"got {tuple(state.shape)}"
+            )
+        state_indices_kernel = None
+    else:
+        if state_indices.dim() != 1 or state_indices.shape[0] != batch_size:
+            raise ValueError(
+                f"state_indices must have shape [B={batch_size}], got {tuple(state_indices.shape)}"
+            )
+        if state_indices.device != q.device:
+            raise ValueError(
+                f"Expected state_indices to be on device {q.device}, got {state_indices.device}."
+            )
+        if state_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                f"state_indices must be int32 or int64, got {state_indices.dtype}."
+            )
+        state_indices_kernel = (
+            state_indices
+            if state_indices.dtype == torch.int32
+            else state_indices.to(dtype=torch.int32)
+        )
+
+    if output is None:
+        output = torch.empty(
+            (batch_size, seq_len, num_v_heads, head_dim_v),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+    if intermediate_states_buffer is not None:
+        if intermediate_states_buffer.dim() != 5 or intermediate_states_buffer.shape[
+            2:
+        ] != (
+            num_v_heads,
+            head_dim_v,
+            head_dim_k,
+        ):
+            raise ValueError(
+                "Expected intermediate_states_buffer shape "
+                f"[buffer_size, cache_steps, HV={num_v_heads}, V={head_dim_v}, K={head_dim_k}], "
+                f"got {tuple(intermediate_states_buffer.shape)}."
+            )
+        if intermediate_states_buffer.shape[0] < batch_size:
+            raise ValueError(
+                "intermediate_states_buffer dim 0 must be at least "
+                f"batch_size={batch_size}, got {intermediate_states_buffer.shape[0]}."
+            )
+        if intermediate_states_buffer.shape[1] < seq_len:
+            raise ValueError(
+                "intermediate_states_buffer dim 1 must be at least "
+                f"seq_len={seq_len}, got {intermediate_states_buffer.shape[1]}."
+            )
+        if intermediate_states_buffer.dtype != torch.float32:
+            raise ValueError(
+                f"intermediate_states_buffer must be float32, got {intermediate_states_buffer.dtype}."
+            )
+        if intermediate_states_buffer.device != q.device:
+            raise ValueError(
+                "intermediate_states_buffer must be on the same device as q."
+            )
+        if not intermediate_states_buffer.is_contiguous():
+            raise ValueError("intermediate_states_buffer must be contiguous.")
+
+    state_is_contiguous = state.is_contiguous()
+    state_kernel = state if state_is_contiguous else state.contiguous()
+
+    scale_value = head_dim_k**-0.5 if scale is None else float(scale)
+    gdn_mtp_tilelang.run_gated_delta_rule_mtp_vk_fp32(
+        q=q,
+        k=k,
+        v=v,
+        state=state_kernel,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        state_indices=state_indices_kernel,
+        output=output,
+        intermediate_states_buffer=intermediate_states_buffer,
+        scale=scale_value,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+
+    # Match FlashInfer wrapper behavior: update a contiguous working buffer in
+    # the kernel, then let PyTorch copy it back into the original strided state.
+    if not disable_state_update and not state_is_contiguous:
+        state.copy_(state_kernel)
+
+    return output, state
+
+
 @mate_api
 def gated_delta_rule_decode(
     q: torch.Tensor,
@@ -196,8 +332,8 @@ def gated_delta_rule_decode(
 
     Single entry point for decode (``T=1``) and MTP/speculative decode (``T>1``).
     The API layer owns parameter semantics and backend dispatch. The current MATE
-    implementation exposes the unified API surface but only implements the
-    VK-layout + FP32-state + ``T=1`` backend.
+    implementation supports the VK-layout + FP32-state TileLang backends for
+    single-token decode and MTP/speculative decode.
 
     Args:
         q (torch.Tensor):
@@ -214,25 +350,23 @@ def gated_delta_rule_decode(
         a (torch.Tensor):
             Input-dependent decay of shape ``[B, T, HV]``.
         dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``. Must be float32.
+            Decay bias of shape ``[HV]``. Must be float32 or bfloat16.
         b (torch.Tensor):
             Update gate of shape ``[B, T, HV]``.
         state_layout (str):
             ``"VK"`` (K-last) or ``"KV"`` (K-major). Default ``"VK"``.
         state_indices (Optional[torch.Tensor]):
             Optional ``[B]`` int32/int64 mapping batch entries to a state pool.
-            The unified API reserves this for pooled decode / MTP. Current MATE
-            implementation does not support it yet.
+            ``None`` means identity mapping. Negative values are padding rows:
+            output is zeroed and state is not read or updated for that batch.
         scale (Optional[float]):
             Query scale. If None, defaults to ``1 / sqrt(K)``.
         output (Optional[torch.Tensor]):
             Optional pre-allocated output tensor of shape ``[B, T, HV, V]``.
         intermediate_states_buffer (Optional[torch.Tensor]):
             Optional rollback buffer for MTP/speculative decode.
-            Current MATE implementation does not support it yet.
         disable_state_update (bool):
-            If True, state should be treated as read-only. Current MATE
-            implementation always updates state in-place.
+            If True, state is treated as read-only on the MTP path.
         use_qk_l2norm (bool):
             Whether to L2-normalize q and k in-kernel. Default True.
 
@@ -243,6 +377,7 @@ def gated_delta_rule_decode(
 
     Dispatch:
         - ``state_layout="VK"``, ``state.dtype=float32``, ``T=1`` -> TileLang pretranspose fp32 decode
+        - ``state_layout="VK"``, ``state.dtype=float32``, ``T>1`` -> TileLang fp32 MTP
         - Other combinations currently raise with a clear error
 
     Note:
@@ -326,7 +461,6 @@ def gated_delta_rule_decode(
             b=b,
             batch_size=B,
             seq_len=T,
-            num_q_heads=H,
             head_dim_k=K,
             num_v_heads=HV,
             head_dim_v=V,
@@ -335,15 +469,29 @@ def gated_delta_rule_decode(
             use_qk_l2norm=use_qk_l2norm,
         )
 
-    if not use_pool:
-        raise ValueError(
-            "VK fp32 MTP (T>1) requires state_indices and state as pool [pool_size, HV, V, K]"
+    if K != 128 or V != 128:
+        raise NotImplementedError(
+            f"VK fp32 MTP currently supports K=V=128 only, got K={K}, V={V}"
         )
-    pool_size = state.shape[0]
-    if state.shape != (pool_size, HV, V, K):
-        raise ValueError(
-            f"Expected state [pool_size, HV, V, K] for VK MTP, got {state.shape}"
-        )
-    if state_indices.shape != (B,):
-        raise ValueError(f"state_indices must be [B={B}], got {state_indices.shape}")
-    raise NotImplementedError("VK fp32 MTP backend is not implemented in MATE yet")
+
+    return _gated_delta_rule_mtp_vk_fp32_impl(
+        q=q,
+        k=k,
+        v=v,
+        state=state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        batch_size=B,
+        seq_len=T,
+        head_dim_k=K,
+        num_v_heads=HV,
+        head_dim_v=V,
+        state_indices=state_indices,
+        scale=scale,
+        output=output,
+        intermediate_states_buffer=intermediate_states_buffer,
+        disable_state_update=disable_state_update,
+        use_qk_l2norm=use_qk_l2norm,
+    )

@@ -1,18 +1,61 @@
 import torch
-from typing import Tuple, Optional
+from typing import Optional, Tuple
+
 from mate.deep_gemm import (
     fp8_mqa_logits as mate_fp8_mqa_logits,
     fp8_paged_mqa_logits as mate_fp8_paged_mqa_logits,
     get_paged_mqa_logits_metadata as mate_get_paged_mqa_logits_metadata,
+    tf32_hc_prenorm_gemm as mate_tf32_hc_prenorm_gemm,
 )
 from mate.gemm import (
-    ragged_m_moe_gemm_16bit,
-    masked_moe_gemm_16bit,
-    ragged_m_moe_gemm_8bit,
-    masked_moe_gemm_8bit,
+    bmm_fp16,
     gemm_fp8_nt_groupwise,
+    masked_moe_gemm_16bit,
+    masked_moe_gemm_8bit,
     ragged_k_moe_gemm_8bit,
+    ragged_m_moe_gemm_16bit,
+    ragged_m_moe_gemm_8bit,
 )
+
+
+def bf16_gemm_nt(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+    compiled_dims: str = "nk",
+):
+    _ = compiled_dims
+
+    if a.dim() != 2 or b.dim() != 2 or d.dim() != 2:
+        raise ValueError("bf16_gemm_nt expects 2D a, b and d tensors")
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        raise ValueError("bf16_gemm_nt expects bf16 a and b tensors")
+    if d.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("bf16_gemm_nt expects bf16 or fp32 d tensor")
+    if a.device != b.device or a.device != d.device:
+        raise ValueError("a, b and d must be on the same device")
+
+    m, k = a.shape
+    n, kb = b.shape
+    if k != kb or tuple(d.shape) != (m, n):
+        raise ValueError("bf16_gemm_nt expects a[m,k], b[n,k] and d[m,n]")
+
+    if c is not None:
+        if c.dim() != 2 or tuple(c.shape) != (m, n):
+            raise ValueError("c must have the same shape as d")
+        if c.device != d.device:
+            raise ValueError("c must be on the same device as d")
+        if d.dtype != torch.float32 or c.dtype != torch.float32:
+            raise ValueError("bf16_gemm_nt with c expects fp32 c and d tensors")
+
+    bmm_fp16(
+        a.unsqueeze(0),
+        b.unsqueeze(0).transpose(-2, -1),
+        d.dtype,
+        d.unsqueeze(0),
+        c=c.unsqueeze(0) if c is not None else None,
+    )
 
 
 def m_grouped_bf16_gemm_nt_contiguous(
@@ -141,6 +184,16 @@ def fp8_gemm_nt(
     return gemm_fp8_nt_groupwise(
         a[0], b[0], a[1], b[1], scale_granularity_mnk=recipe, out=d
     )
+
+
+def tf32_hc_prenorm_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    sqr_sum: torch.Tensor,
+    num_splits: Optional[int] = None,
+):
+    return mate_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=num_splits)
 
 
 def get_paged_mqa_logits_metadata(

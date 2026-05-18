@@ -700,7 +700,10 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
                                               ffi::Optional<ffi::TensorView> tile_scheduler_metadata_opt,
                                               ffi::Optional<ffi::TensorView> num_splits_opt,
                                               ffi::Optional<ffi::TensorView> q,
-                                              ffi::Optional<int64_t>         bs) {
+                                              ffi::Optional<int64_t>         bs,
+                                              ffi::Optional<ffi::TensorView> topk_length,
+                                              ffi::Optional<ffi::TensorView> extra_topk_length,
+                                              ffi::Optional<int64_t>         extra_topk) {
   FFI_CHECK(seqlens_k.has_value() || q.has_value(), "seqlens_k or q must be provided");
 
   auto                 tensor_device = seqlens_k.has_value() ? seqlens_k.value().device() : q.value().device();
@@ -715,7 +718,12 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
 
   const int batch_size = static_cast<int>(
       bs.has_value() ? bs.value() : (seqlens_k.has_value() ? seqlens_k.value().size(0) : q.value().size(0)));
-  const bool is_sparse_attn = topk.has_value();
+  const bool      is_sparse_attn    = topk.has_value();
+  ffi::TensorView device_cmp_tensor = seqlens_k.has_value() ? seqlens_k.value() : q.value();
+  if (extra_topk.has_value()) {
+    FFI_CHECK(is_sparse_attn, "extra_topk may only be provided when topk is provided");
+    FFI_CHECK(extra_topk.value() >= 0, "extra_topk must be non-negative");
+  }
 
   if (is_sparse_attn) {
     CHECK_HAS_VALUE_WITH_MSG(h_q, "num_heads_q must be provided when topk is provided");
@@ -724,6 +732,20 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
     CHECK_MUSA(seqlens_k.value());
     CHECK_CONTIGUOUS(seqlens_k.value());
     CHECK_INPUT_TYPE(seqlens_k.value(), dl_int32);
+  }
+  if (topk_length.has_value()) {
+    CHECK_MUSA(topk_length.value());
+    CHECK_CONTIGUOUS(topk_length.value());
+    CHECK_INPUT_TYPE(topk_length.value(), dl_int32);
+    CHECK_DEVICE(topk_length.value(), device_cmp_tensor);
+    expect_shape(topk_length.value(), {batch_size}, "topk_length");
+  }
+  if (extra_topk_length.has_value()) {
+    CHECK_MUSA(extra_topk_length.value());
+    CHECK_CONTIGUOUS(extra_topk_length.value());
+    CHECK_INPUT_TYPE(extra_topk_length.value(), dl_int32);
+    CHECK_DEVICE(extra_topk_length.value(), device_cmp_tensor);
+    expect_shape(extra_topk_length.value(), {batch_size}, "extra_topk_length");
   }
 
   const int            tile_m         = is_sparse_attn ? 64 : 128;
@@ -750,7 +772,6 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
           ? num_splits_opt.value()
           : ffi::TensorView(num_splits_storage = alloc_tensor(ffi::Shape{batch_size + 1}, dl_int32, tensor_device));
 
-  ffi::TensorView device_cmp_tensor = seqlens_k.has_value() ? seqlens_k.value() : q.value();
   CHECK_DEVICE(tile_scheduler_metadata, device_cmp_tensor);
   CHECK_DEVICE(num_splits, device_cmp_tensor);
   CHECK_CONTIGUOUS(tile_scheduler_metadata);
@@ -766,11 +787,15 @@ MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seq
   params.seqlens_k_ptr = seqlens_k.has_value() ? static_cast<int32_t*>(seqlens_k.value().data_ptr()) : nullptr;
   params.tile_scheduler_metadata_ptr = static_cast<int32_t*>(tile_scheduler_metadata.data_ptr());
   params.num_splits_ptr              = static_cast<int32_t*>(num_splits.data_ptr());
-  params.batch_size                  = batch_size;
-  params.block_size_n                = attn_impl_meta.k_block_size;
-  params.fixed_overhead_num_blocks   = attn_impl_meta.fixed_overhead_num_blocks;
-  params.num_mp_parts                = attn_impl_meta.num_mp_parts;
-  params.topk                        = is_sparse_attn ? static_cast<int>(topk.value()) : -1;
+  params.topk_length_ptr = topk_length.has_value() ? static_cast<int32_t*>(topk_length.value().data_ptr()) : nullptr;
+  params.extra_topk_length_ptr =
+      extra_topk_length.has_value() ? static_cast<int32_t*>(extra_topk_length.value().data_ptr()) : nullptr;
+  params.batch_size                = batch_size;
+  params.block_size_n              = attn_impl_meta.k_block_size;
+  params.fixed_overhead_num_blocks = attn_impl_meta.fixed_overhead_num_blocks;
+  params.num_mp_parts              = attn_impl_meta.num_mp_parts;
+  params.topk                      = is_sparse_attn ? static_cast<int>(topk.value()) : -1;
+  params.extra_topk                = extra_topk.has_value() ? static_cast<int>(extra_topk.value()) : -1;
   run_get_mla_metadata_kernel(params,
                               get_stream(seqlens_k.has_value() ? seqlens_k.value().device() : q.value().device()));
 
@@ -786,7 +811,10 @@ ffi::Array<ffi::Any> get_mla_decoding_metadata(ffi::Optional<ffi::TensorView> se
                                                ffi::Optional<ffi::Tensor>     tile_scheduler_metadata,
                                                ffi::Optional<ffi::Tensor>     num_splits,
                                                ffi::Optional<ffi::TensorView> q,
-                                               ffi::Optional<int64_t>         bs) {
+                                               ffi::Optional<int64_t>         bs,
+                                               ffi::Optional<ffi::TensorView> topk_length,
+                                               ffi::Optional<ffi::TensorView> extra_topk_length,
+                                               ffi::Optional<int64_t>         extra_topk) {
   TVM_FFI_ICHECK(tile_scheduler_metadata.has_value() == num_splits.has_value())
       << "tile_scheduler_metadata and num_splits must be both provided or both omitted";
 
@@ -809,7 +837,10 @@ ffi::Array<ffi::Any> get_mla_decoding_metadata(ffi::Optional<ffi::TensorView> se
                                                tile_scheduler_metadata_view,
                                                num_splits_view,
                                                q,
-                                               bs);
+                                               bs,
+                                               topk_length,
+                                               extra_topk_length,
+                                               extra_topk);
 
   ffi::Tensor tile_scheduler_metadata_result =
       tile_scheduler_metadata.has_value() ? tile_scheduler_metadata.value() : result.tile_scheduler_metadata_storage;
@@ -883,6 +914,9 @@ void dispatch_mla_impl_for_fa_interface(ffi::TensorView                q_nope,
                                          ffi::Optional<int64_t>(),
                                          tile_scheduler_metadata_view.view,
                                          num_splits_view.view,
+                                         ffi::Optional<ffi::TensorView>(),
+                                         ffi::Optional<int64_t>(),
+                                         ffi::Optional<ffi::TensorView>(),
                                          ffi::Optional<ffi::TensorView>(),
                                          ffi::Optional<int64_t>());
   }

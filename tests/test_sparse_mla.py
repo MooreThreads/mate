@@ -3,11 +3,77 @@ import time  # noqa: F401
 import math  # noqa: F401
 import torch
 import pytest
-import tilelang.testing
 from typing import Optional, Tuple  # noqa: F401
 import random
 import enum
 from typing import List
+import mate
+from mate.testing import supported_musa_compute_capability
+from mate.execution_context import (
+    maybe_fake_tensor_mode,
+    is_dry_run_enabled,
+    empty_if_dry_run,
+)
+
+from mate.sparse_mla.tilelang.sparse_mla_model1_fwd_pipelined import (
+    sparse_mla_fwd_interface_model1,
+)
+from mate.testing.sparse_mla import (
+    ref_sparse_mla_fwd_interface as ref_sparse_mla_fwd_interface_model1,
+)
+
+
+USE_FAKE_MODE = is_dry_run_enabled()
+
+
+def build_model1_kv_cache(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Quantize bf16 KV to FlashMLA MODEL1 official 584-byte layout."""
+    assert kv_bf16.ndim == 3 and kv_bf16.shape[-1] == 512
+    skv, hkv, d = kv_bf16.shape
+    assert d == 512
+    result = torch.empty((skv, hkv, 584), dtype=torch.uint8, device=kv_bf16.device)
+    nope_fp8 = result[:, :, :448].view(torch.float8_e4m3fn)
+    rope_bf16 = result[:, :, 448:576].view(torch.bfloat16)
+    scale_bytes = result[:, :, 576:584]
+    rope_bf16[:] = kv_bf16[:, :, 448:]
+    scale_bytes[:, :, 7] = 0
+
+    nope = kv_bf16[:, :, :448].float()
+    for tile_idx in range(7):
+        tile = nope[:, :, tile_idx * 64 : (tile_idx + 1) * 64]
+        scale_inv = tile.abs().max(dim=-1).values / 448.0
+        scale_inv = torch.pow(2, torch.clamp_min(scale_inv, 1e-4).log2().ceil())
+        scale_bytes[:, :, tile_idx] = (torch.log2(scale_inv) + 127).to(torch.uint8)
+        nope_fp8[:, :, tile_idx * 64 : (tile_idx + 1) * 64] = (
+            tile / scale_inv.unsqueeze(-1)
+        ).to(torch.float8_e4m3fn)
+    return result.contiguous()
+
+
+def dequant_kv(kv_b):
+    """Dequant official 584-byte MODEL1 FP8 KV cache to bf16.
+
+    Layout:
+      bytes 0-447   : fp8_e4m3 NoPE (448 values, 7 tiles x 64 dims)
+      bytes 448-575 : bf16 RoPE (64 values)
+      bytes 576-583 : fp8_e8m0 scales (7 valid + 1 padding)
+    """
+    skv, hkv, b = kv_b.shape
+    if b != 584:
+        raise ValueError(f"Unsupported KV cache layout: {b} bytes (expected 584)")
+    nope_fp8 = kv_b[:, :, :448].view(torch.float8_e4m3fn)
+    rope_bf16 = kv_b[:, :, 448 : 448 + 128].view(torch.bfloat16)
+    scales_uint8 = kv_b[:, :, 576 : 576 + 8]
+    # Manual bit-cast e8m0 -> float32:
+    #   e8m0: E8M0 format, bias=127, value = 2^(byte-127)
+    #   For power-of-2, float32_bits = byte << 23  (sign=0, exp=byte, mantissa=0)
+    fp32_bits = scales_uint8[:, :, :7].to(torch.int32) << 23
+    scales_float = fp32_bits.view(torch.float32)
+    scales_expanded = scales_float.repeat_interleave(64, dim=-1)
+    nope_dequant = (nope_fp8.to(torch.float32) * scales_expanded).to(torch.bfloat16)
+    return torch.cat([nope_dequant, rope_bf16], dim=-1).contiguous()
+
+
 # torch.random.manual_seed(42)
 
 
@@ -108,8 +174,8 @@ def quantize_k_cache(
         result_k_scale_factor = (
             result[:, block_size * (d_nope + 2 * d_rope) :]
             .view(num_blocks, block_size, 8)[:, :, :7]
-            .view(torch.float8_e8m0fnu)
-        )  # [num_blocks, block_size, num_tiles]
+            .view(torch.uint8)
+        )
 
         result_k_rope[:] = input_k_cache[..., d_nope:]
         for tile_idx in range(0, num_tiles):
@@ -124,9 +190,9 @@ def quantize_k_cache(
                 / 448.0
             )  # [num_blocks, block_size]
             cur_scale_factors_inv = _cast_scale_inv_to_ue8m0(cur_scale_factors_inv)
-            result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv.to(
-                torch.float8_e8m0fnu
-            )
+            result_k_scale_factor[:, :, tile_idx] = (
+                torch.log2(cur_scale_factors_inv).to(torch.int32) + 127
+            ).to(torch.uint8)
 
             cur_scale_factors_inv = cur_scale_factors_inv.view(
                 num_blocks, block_size, 1
@@ -191,15 +257,18 @@ def dequantize_k_cache(
         input_scale = (
             quant_k_cache[:, block_size * (d_nope + 2 * d_rope) :]
             .view(num_blocks, block_size, 8)[:, :, :7]
-            .view(torch.float8_e8m0fnu)
-        )  # [num_blocks, block_size, num_tiles]
+            .view(torch.uint8)
+        )
 
         result[..., d_nope:] = input_rope
         for tile_idx in range(0, num_tiles):
             cur_nope = input_nope[
                 ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
             ].to(torch.bfloat16)
-            cur_scales = input_scale[:, :, tile_idx].to(torch.bfloat16).unsqueeze(-1)
+            cur_scale_bits = input_scale[:, :, tile_idx].to(torch.int32) << 23
+            cur_scales = (
+                cur_scale_bits.view(torch.float32).to(torch.bfloat16).unsqueeze(-1)
+            )
             result[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
                 cur_nope * cur_scales
             )
@@ -441,7 +510,8 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True):
     return o.to(torch.bfloat16), score
 
 
-@tilelang.testing.requires_musa_compute_version_ge(3, 1)
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("batch", [1, 2, 4, 8])
 @pytest.mark.parametrize("sq", [1, 2, 3, 8])
 @pytest.mark.parametrize("skv", [65536, 1024])
@@ -516,9 +586,21 @@ def test_dsa_decode(batch, sq, skv, heads, hkv, dqk, dv, topk, dtype, sm_scale):
     kcache = quantize_k_cache(kv, FP8KVCacheLayout.V32_FP8Sparse).contiguous()
     kv_dequant = dequantize_k_cache(kcache, FP8KVCacheLayout.V32_FP8Sparse).contiguous()
 
-    import mate
-
-    tile_scheduler_metadata, num_splits = mate.flashmla.get_mla_metadata(
+    tile_scheduler_metadata, num_splits = empty_if_dry_run(
+        mate.flashmla.get_mla_metadata,
+        last=False,
+        empty_values=[
+            torch.empty(
+                (
+                    64,
+                    8,
+                ),
+                dtype=torch.int32,
+                device=device,
+            ),
+            torch.empty((batch + 1,), dtype=torch.int32, device=device),
+        ],
+    )(
         cache_seqlens=None,
         num_q_tokens_per_head_k=sq * heads // 1,
         num_heads_k=1,
@@ -564,7 +646,8 @@ def test_dsa_decode(batch, sq, skv, heads, hkv, dqk, dv, topk, dtype, sm_scale):
     assert is_out_correct
 
 
-@tilelang.testing.requires_musa_compute_version_ge(3, 1)
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("sq", [128, 256, 255])
 @pytest.mark.parametrize("skv", [65536, 32768, 1024])
 @pytest.mark.parametrize(
@@ -632,8 +715,6 @@ def test_dsa_prefill(sq, skv, heads, hkv, dqk, dv, topk, dtype, sm_scale):
                 i_i = torch.randperm(skv, device=device)[:topk]
                 indices[t, h, : len(i_i)] = i_i
 
-    import mate
-
     tl_out, _, _ = mate.flashmla.flash_mla_sparse_fwd(
         q=q,
         kv=kv,
@@ -660,3 +741,436 @@ def test_dsa_prefill(sq, skv, heads, hkv, dqk, dv, topk, dtype, sm_scale):
         cos_diff_tol=5e-6,
     )
     assert is_out_correct
+
+
+MODEL1_PREFILL_CASES = [
+    # (tag, S, SKV, topk, SKV_EXTRA, extra_topk, H, topk_len, extra_topk_len, sink, mostly_invalid, all_invalid, future_indices)
+    ("basic_small", 1, 128, 128, 0, 0, 64, False, False, False, False, False, False),
+    ("basic_oob", 213, 95, 128, 0, 0, 128, False, False, False, False, False, False),
+    (
+        "extra_small",
+        321,
+        512,
+        128,
+        512,
+        64,
+        128,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ),
+    (
+        "dynamic_len",
+        321,
+        512,
+        128,
+        512,
+        64,
+        128,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+    ),
+    ("attn_sink", 213, 153, 256, 0, 0, 64, True, False, True, False, False, False),
+    (
+        "corner_many_oob",
+        1024,
+        1024,
+        2048,
+        0,
+        0,
+        64,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ),
+    ("all_invalid", 321, 512, 128, 512, 64, 128, True, True, True, False, True, False),
+    (
+        "large_extra",
+        321,
+        2046,
+        2048,
+        2046,
+        2048,
+        128,
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ),
+]
+
+
+MODEL1_DECODE_CASES = [
+    # (tag, B, S, SKV, topk, SKV_EXTRA, extra_topk, H, topk_len, extra_topk_len, sink)
+    ("basic", 128, 1, 8192, 2048, 0, 0, 128, False, False, False),
+    ("basic_small", 4, 1, 512, 64, 0, 0, 64, False, False, False),
+    ("extra", 74, 1, 1024, 576, 1024, 576, 128, False, False, False),
+    ("dynamic_len", 321, 1, 2046, 2048, 2046, 2048, 128, True, True, False),
+    ("attn_sink", 32, 1, 1024, 576, 1024, 576, 128, True, True, True),
+    ("all_invalid", 32, 1, 512, 64, 512, 64, 64, True, True, True),
+]
+
+
+def _ref_sparse_mla_decode_model1(
+    q,
+    kv,
+    indices,
+    extra_kv=None,
+    extra_indices=None,
+    topk_length=None,
+    extra_topk_length=None,
+    sm_scale=None,
+    attn_sink=None,
+    d_v=512,
+):
+    q = q.float()
+    kv = kv.float()
+    sq, h, dim_q = q.shape
+    sk, _, _ = kv.shape
+    dim = d_v
+    sm_scale = dim_q**-0.5 if sm_scale is None else sm_scale
+
+    indices_orig = indices.clone()
+    if topk_length is not None:
+        pos = torch.arange(indices.shape[-1], device=indices.device).view(1, 1, -1)
+        indices_orig = torch.where(
+            pos < topk_length.view(-1, 1, 1),
+            indices_orig,
+            torch.full_like(indices_orig, -1),
+        )
+
+    invalid_mask_orig = (indices_orig < 0) | (indices_orig >= sk)
+    indices_orig_safe = indices_orig.clone()
+    indices_orig_safe[invalid_mask_orig] = 0
+    gathered_kv_orig = kv.index_select(
+        dim=0, index=indices_orig_safe.flatten()
+    ).reshape(sq, -1, dim)
+
+    if extra_kv is not None:
+        extra_kv = extra_kv.float()
+        sk_extra = extra_kv.shape[0]
+        indices_extra = extra_indices.clone()
+        if extra_topk_length is not None:
+            pos = torch.arange(
+                indices_extra.shape[-1], device=indices_extra.device
+            ).view(1, 1, -1)
+            indices_extra = torch.where(
+                pos < extra_topk_length.view(-1, 1, 1),
+                indices_extra,
+                torch.full_like(indices_extra, -1),
+            )
+
+        invalid_mask_extra = (indices_extra < 0) | (indices_extra >= sk_extra)
+        indices_extra_safe = indices_extra.clone()
+        indices_extra_safe[invalid_mask_extra] = 0
+        gathered_kv_extra = extra_kv.index_select(
+            dim=0, index=indices_extra_safe.flatten()
+        ).reshape(sq, -1, dim)
+        gathered_kv = torch.cat([gathered_kv_orig, gathered_kv_extra], dim=1)
+        invalid_mask = torch.cat([invalid_mask_orig, invalid_mask_extra], dim=2)
+    else:
+        gathered_kv = gathered_kv_orig
+        invalid_mask = invalid_mask_orig
+
+    logits = q @ gathered_kv.transpose(1, 2)
+    logits *= sm_scale
+    logits = logits.masked_fill(invalid_mask.view(sq, 1, -1), float("-inf"))
+
+    lonely_q_mask = invalid_mask.view(sq, -1).all(dim=1).view(sq, 1).expand(sq, h)
+    lse = torch.full((sq, h), float("+inf"), dtype=logits.dtype, device=logits.device)
+    valid_q_mask = ~lonely_q_mask
+    lse[valid_q_mask] = torch.logsumexp(logits[valid_q_mask], dim=-1)
+
+    attn = torch.zeros_like(logits)
+    attn[valid_q_mask] = torch.exp(
+        logits[valid_q_mask] - lse[valid_q_mask].unsqueeze(-1)
+    )
+    out = attn @ gathered_kv[..., :dim]
+    if attn_sink is not None:
+        out *= torch.sigmoid(lse - attn_sink.view(1, h)).unsqueeze(-1)
+    out[lonely_q_mask.unsqueeze(-1).expand_as(out)] = 0.0
+    return out.to(torch.bfloat16), lse
+
+
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
+@pytest.mark.parametrize(
+    "case", MODEL1_PREFILL_CASES, ids=[case[0] for case in MODEL1_PREFILL_CASES]
+)
+def test_model1_sparse_mla_prefill(case):
+    (
+        tag,
+        seq_len,
+        seq_len_kv,
+        topk,
+        seq_len_kv_extra,
+        extra_topk,
+        num_heads,
+        have_topk_length,
+        have_extra_topk_length,
+        have_attn_sink,
+        mostly_invalid,
+        all_indices_invalid,
+        force_future_indices,
+    ) = case
+    del tag
+
+    torch.random.manual_seed(0)
+    device = get_test_device()
+    sm_scale = 512**-0.5
+    q = torch.randn((seq_len, num_heads, 512), dtype=torch.bfloat16, device=device)
+    kv = torch.randn((seq_len_kv, 1, 512), dtype=torch.bfloat16, device=device)
+
+    indices = torch.full((seq_len, 1, topk), -1, dtype=torch.int32, device=device)
+    for token_idx in range(seq_len):
+        max_len = max(1, token_idx + 1)
+        cur_indices = torch.randperm(max_len, device=device)[:topk]
+        indices[token_idx, 0, : len(cur_indices)] = cur_indices
+        if force_future_indices and topk > 0 and token_idx + 1 < seq_len_kv:
+            indices[token_idx, 0, 0] = token_idx + 1
+
+    if all_indices_invalid:
+        indices.fill_(2147483647)
+    elif mostly_invalid:
+        invalid_mask = torch.rand(indices.shape, device=device) < 0.9
+        indices = torch.where(
+            invalid_mask, torch.full_like(indices, 2147483647), indices
+        )
+
+    topk_length = None
+    if have_topk_length:
+        topk_length = torch.randint(
+            1, topk + 1, (seq_len,), dtype=torch.int32, device=device
+        )
+
+    extra_kv = None
+    extra_indices = None
+    extra_topk_length = None
+    if extra_topk > 0:
+        extra_kv = torch.randn(
+            (seq_len_kv_extra, 1, 512), dtype=torch.bfloat16, device=device
+        )
+        extra_indices = torch.full(
+            (seq_len, 1, extra_topk), -1, dtype=torch.int32, device=device
+        )
+        for token_idx in range(seq_len):
+            max_len = max(1, token_idx + 1)
+            cur_indices = torch.randperm(max_len, device=device)[:extra_topk]
+            extra_indices[token_idx, 0, : len(cur_indices)] = cur_indices
+            if (
+                force_future_indices
+                and extra_topk > 0
+                and token_idx + 1 < seq_len_kv_extra
+            ):
+                extra_indices[token_idx, 0, 0] = token_idx + 1
+        if all_indices_invalid:
+            extra_indices.fill_(2147483647)
+        elif mostly_invalid:
+            invalid_mask = torch.rand(extra_indices.shape, device=device) < 0.9
+            extra_indices = torch.where(
+                invalid_mask, torch.full_like(extra_indices, 2147483647), extra_indices
+            )
+        if have_extra_topk_length:
+            extra_topk_length = torch.randint(
+                1, extra_topk + 1, (seq_len,), dtype=torch.int32, device=device
+            )
+
+    attn_sink = None
+    if have_attn_sink:
+        attn_sink = torch.randn((num_heads,), dtype=torch.float32, device=device)
+        inf_mask = torch.randn((num_heads,), dtype=torch.float32, device=device)
+        attn_sink[inf_mask > 0.5] = float("inf")
+        attn_sink[inf_mask < -0.5] = float("-inf")
+
+    if extra_kv is None:
+        tl_out, _, tl_lse = mate.flashmla.flash_mla_sparse_fwd(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            d_v=512,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+        )
+    else:
+        tl_out, tl_lse = sparse_mla_fwd_interface_model1(
+            q,
+            kv,
+            indices,
+            extra_kv=extra_kv,
+            extra_indices=extra_indices,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            d_v=512,
+        )
+
+    ref_out, ref_lse = ref_sparse_mla_fwd_interface_model1(
+        q,
+        kv,
+        indices,
+        extra_kv=extra_kv,
+        extra_indices=extra_indices,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        d_v=512,
+    )
+    torch.testing.assert_close(tl_out, ref_out.to(device), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(tl_lse, ref_lse.to(device), rtol=1e-2, atol=1e-2)
+
+
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
+@pytest.mark.parametrize(
+    "case", MODEL1_DECODE_CASES, ids=[case[0] for case in MODEL1_DECODE_CASES]
+)
+def test_model1_sparse_mla_decode(case):
+    (
+        tag,
+        batch_size,
+        seq_len_q,
+        seq_len_kv,
+        topk,
+        seq_len_kv_extra,
+        extra_topk,
+        num_heads,
+        have_topk_length,
+        have_extra_topk_length,
+        have_attn_sink,
+    ) = case
+    all_indices_invalid = tag == "all_invalid"
+
+    torch.random.manual_seed(0)
+    device = get_test_device()
+    total_q = batch_size * seq_len_q
+    page_size = 64
+    num_pages = (seq_len_kv + page_size - 1) // page_size
+
+    q = torch.randn(
+        (batch_size, seq_len_q, num_heads, 512), dtype=torch.bfloat16, device=device
+    )
+    kv = torch.randn(
+        (num_pages, page_size, 1, 512), dtype=torch.bfloat16, device=device
+    )
+
+    indices = torch.full(
+        (batch_size, seq_len_q, 1, topk), -1, dtype=torch.int32, device=device
+    )
+    if not all_indices_invalid:
+        for batch_idx in range(batch_size):
+            for q_idx in range(seq_len_q):
+                cur_indices = torch.randperm(seq_len_kv, device=device)[:topk]
+                indices[batch_idx, q_idx, 0, : len(cur_indices)] = cur_indices
+
+    topk_length = None
+    if have_topk_length:
+        if all_indices_invalid:
+            topk_length = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+        else:
+            topk_length = torch.randint(
+                1, topk + 1, (batch_size,), dtype=torch.int32, device=device
+            )
+
+    extra_k_cache = None
+    extra_kv_dequant = None
+    extra_indices = None
+    extra_topk_length = None
+    if extra_topk > 0:
+        num_extra_pages = (seq_len_kv_extra + page_size - 1) // page_size
+        extra_kv = torch.randn(
+            (num_extra_pages, page_size, 1, 512), dtype=torch.bfloat16, device=device
+        )
+        extra_indices = torch.full(
+            (batch_size, seq_len_q, 1, extra_topk),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        if not all_indices_invalid:
+            for batch_idx in range(batch_size):
+                for q_idx in range(seq_len_q):
+                    cur_indices = torch.randperm(seq_len_kv_extra, device=device)[
+                        :extra_topk
+                    ]
+                    extra_indices[batch_idx, q_idx, 0, : len(cur_indices)] = cur_indices
+        if have_extra_topk_length:
+            if all_indices_invalid:
+                extra_topk_length = torch.zeros(
+                    (batch_size,), dtype=torch.int32, device=device
+                )
+            else:
+                extra_topk_length = torch.randint(
+                    1, extra_topk + 1, (batch_size,), dtype=torch.int32, device=device
+                )
+        extra_k_cache = quantize_k_cache(extra_kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
+        extra_kv_dequant = dequantize_k_cache(
+            extra_k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse
+        ).view(-1, 1, 512)
+
+    attn_sink = None
+    if have_attn_sink:
+        attn_sink = torch.randn((num_heads,), dtype=torch.float32, device=device)
+        inf_mask = torch.randn((num_heads,), dtype=torch.float32, device=device)
+        attn_sink[inf_mask > 0.5] = float("inf")
+        attn_sink[inf_mask < -0.5] = float("-inf")
+
+    k_cache = quantize_k_cache(kv, FP8KVCacheLayout.MODEL1_FP8Sparse)
+    kv_dequant = dequantize_k_cache(k_cache, FP8KVCacheLayout.MODEL1_FP8Sparse).view(
+        -1, 1, 512
+    )
+
+    tl_out, tl_lse = mate.flashmla.flash_mla_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        block_table=None,
+        cache_seqlens=None,
+        head_dim_v=512,
+        tile_scheduler_metadata=None,
+        num_splits=None,
+        softmax_scale=0.1352337788608801,
+        causal=False,
+        is_fp8_kvcache=True,
+        indices=indices,
+        attn_sink=attn_sink,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+    )
+
+    ref_out, ref_lse = _ref_sparse_mla_decode_model1(
+        q.view(total_q, num_heads, 512),
+        kv_dequant,
+        indices.view(total_q, 1, topk),
+        extra_kv=extra_kv_dequant,
+        extra_indices=extra_indices.view(total_q, 1, extra_topk)
+        if extra_indices is not None
+        else None,
+        topk_length=topk_length.repeat_interleave(seq_len_q)
+        if topk_length is not None
+        else None,
+        extra_topk_length=extra_topk_length.repeat_interleave(seq_len_q)
+        if extra_topk_length is not None
+        else None,
+        sm_scale=0.1352337788608801,
+        attn_sink=attn_sink,
+    )
+    ref_out = ref_out.view(batch_size, seq_len_q, num_heads, 512)
+    ref_lse = ref_lse.view(batch_size, seq_len_q, num_heads).transpose(1, 2)
+    torch.testing.assert_close(tl_out, ref_out.to(device), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(tl_lse, ref_lse.to(device), rtol=1e-2, atol=1e-2)

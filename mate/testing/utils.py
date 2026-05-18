@@ -8,12 +8,9 @@ import os
 import sys
 import functools
 
+from mate.utils import ceil_div
 
 from typing import Optional, Literal
-
-
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
 
 
 def align(x: int, y: int) -> int:
@@ -638,3 +635,20 @@ def gen_qkv(
     v = v.reshape(total_tokens, num_v_heads, dim_v).to(dtype).contiguous().to(device)
 
     return q, k, v
+
+
+def calc_diff(x: torch.Tensor, y: torch.Tensor):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
+
+
+def count_bytes(*tensors):
+    total = 0
+    for t in tensors:
+        if isinstance(t, (tuple, list)):
+            total += count_bytes(*t)
+        elif t is not None:
+            total += t.numel() * t.element_size()
+    return total

@@ -77,89 +77,6 @@ void mpxx_clean_logits(ffi::TensorView                logits,
 
 }  // namespace
 
-void get_paged_mqa_logits_metadata(ffi::TensorView context_lens, int64_t block_kv, ffi::TensorView schedule_meta) {
-  CHECK_MUSA(context_lens);
-  CHECK_MUSA(schedule_meta);
-  CHECK_CONTIGUOUS(context_lens);
-  CHECK_CONTIGUOUS(schedule_meta);
-  CHECK_INPUT_TYPE(context_lens, dl_int32);
-  CHECK_INPUT_TYPE(schedule_meta, dl_int32);
-  CHECK_DEVICE(schedule_meta, context_lens);
-  TVM_FFI_ICHECK(context_lens.dim() == 1 || context_lens.dim() == 2)
-      << "context_lens must be 1D [batch] or 2D [batch, next_n]";
-  CHECK_DIM(2, schedule_meta);
-  TVM_FFI_ICHECK(block_kv > 0) << "block_kv must be positive";
-
-  ffi::MUSADeviceGuard device_guard(context_lens.device().device_id);
-
-  const bool is_context_lens_2d = (context_lens.dim() == 2);
-  const int  batch_size         = static_cast<int>(context_lens.size(0));
-  const int  next_n             = is_context_lens_2d ? static_cast<int>(context_lens.size(1)) : 1;
-
-  TVM_FFI_ICHECK(!is_context_lens_2d || next_n == 1 || next_n == 2 || next_n == 4)
-      << "2D context_lens: next_n must be 1, 2 or 4, got " << next_n;
-
-  musaDeviceProp dprops{};
-  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&dprops, context_lens.device().device_id));
-  const int64_t num_mps = schedule_meta.size(0) - 1;
-  TVM_FFI_ICHECK(schedule_meta.size(1) == 2) << "schedule_meta shape must be [num_mps + 1, 2]";
-  TVM_FFI_ICHECK(num_mps > 0 && num_mps <= dprops.multiProcessorCount)
-      << "num_mps must be in range [1, " << dprops.multiProcessorCount << "]";
-
-  constexpr int num_math_warpsquads = 4;
-  constexpr int num_threads         = 32;
-  const int     aligned_batch_size  = round_up(batch_size, 32);
-  const int     split_kv            = block_kv * num_math_warpsquads;
-  const int     smem_size           = aligned_batch_size * static_cast<int>(sizeof(int));
-
-  TVM_FFI_ICHECK(smem_size <= 192 * 1024) << "smem_size exceeds 192KB";
-
-  musaStream_t stream = get_stream(context_lens.device());
-
-  auto* ctx_ptr  = static_cast<uint32_t*>(context_lens.data_ptr());
-  auto* meta_ptr = static_cast<uint32_t*>(schedule_meta.data_ptr());
-
-  auto launch = [&](auto AlignedBatchSizeTag, auto IsContextLens2DTag, auto NextNTag) {
-    constexpr int  kAlignedBatch = decltype(AlignedBatchSizeTag)::value;
-    constexpr bool kIs2D         = decltype(IsContextLens2DTag)::value;
-    constexpr int  kNextN        = decltype(NextNTag)::value;
-    mate::deep_gemm::mpxx_paged_mqa_logits_metadata<kAlignedBatch, kIs2D, kNextN>
-        <<<1, num_threads, smem_size, stream>>>(batch_size, ctx_ptr, meta_ptr, split_kv, num_mps);
-  };
-
-  auto dispatch_next_n = [&](auto AlignedBatchSizeTag, auto IsContextLens2DTag) {
-    if (next_n == 1) {
-      launch(AlignedBatchSizeTag, IsContextLens2DTag, mute::_1{});
-    } else if (next_n == 2) {
-      launch(AlignedBatchSizeTag, IsContextLens2DTag, mute::_2{});
-    } else {
-      launch(AlignedBatchSizeTag, IsContextLens2DTag, mute::_4{});
-    }
-  };
-
-  auto dispatch_is_2d = [&](auto AlignedBatchSizeTag) {
-    if (is_context_lens_2d) {
-      dispatch_next_n(AlignedBatchSizeTag, std::true_type{});
-    } else {
-      dispatch_next_n(AlignedBatchSizeTag, std::false_type{});
-    }
-  };
-
-  if (aligned_batch_size == 32) {
-    dispatch_is_2d(mute::_32{});
-  } else if (aligned_batch_size == 64) {
-    dispatch_is_2d(mute::_64{});
-  } else if (aligned_batch_size == 96) {
-    dispatch_is_2d(mute::_96{});
-  } else if (aligned_batch_size == 128) {
-    dispatch_is_2d(mute::_128{});
-  } else {
-    TVM_FFI_ICHECK(false) << "Unsupported batch size: " << aligned_batch_size;
-  }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
-}
-
 ffi::Tensor fp8_paged_mqa_logits(ffi::TensorView q,
                                  ffi::TensorView fused_kv_cache,
                                  ffi::TensorView weights,
@@ -252,12 +169,12 @@ ffi::Tensor fp8_paged_mqa_logits(ffi::TensorView q,
 
   using Element = mutlass::float_e4m3_t;
 
-  auto stride_q   = make_stride(static_cast<int32_t>(q.stride(2)), _1{});
-  auto stride_k   = make_stride(static_cast<int32_t>(head_dim), _1{}, static_cast<int32_t>(kv_cache_stride));
-  auto stride_sfk = make_stride(_1{}, static_cast<int32_t>(kv_cache_stride / static_cast<int64_t>(sizeof(float))));
-  auto stride_w   = make_stride(_1{}, static_cast<int32_t>(weights.size(1) * next_n));
-  auto stride_block_table = make_stride(static_cast<int32_t>(block_table.stride(0)), _1{});
-  auto stride_logits      = make_stride(static_cast<int32_t>(logits.stride(0)), _1{});
+  auto stride_q           = make_stride(q.stride(2), _1{});
+  auto stride_k           = make_stride(head_dim, _1{}, kv_cache_stride);
+  auto stride_sfk         = make_stride(_1{}, kv_cache_stride / static_cast<int64_t>(sizeof(float)));
+  auto stride_w           = make_stride(_1{}, weights.size(1) * next_n);
+  auto stride_block_table = make_stride(block_table.stride(0), _1{});
+  auto stride_logits      = make_stride(logits.stride(0), _1{});
 
   auto* kv_cache_ptr = static_cast<Element const*>(fused_kv_cache.data_ptr());
   auto* kv_scale_ptr =
@@ -426,6 +343,8 @@ ffi::Tensor fp8_mqa_logits(ffi::TensorView q,
   TVM_FFI_ICHECK(q.stride(-1) == 1) << "q must be contiguous at the last dimension";
   TVM_FFI_ICHECK(q.stride(1) == head_dim && q.stride(0) == num_heads * head_dim)
       << "q must be laid out as contiguous [seq_len, num_heads, head_dim]";
+  TVM_FFI_ICHECK(weights.stride(1) == 1 && weights.stride(0) == num_heads)
+      << "weights must be laid out as contiguous [seq_len, num_heads]";
   TVM_FFI_ICHECK(kv.stride(-1) == 1) << "kv must be contiguous at the last dimension";
   TVM_FFI_ICHECK(kv_scale.numel() == seq_len_kv) << "kv_scale.numel() must match kv.shape[0]";
 
@@ -450,16 +369,17 @@ ffi::Tensor fp8_mqa_logits(ffi::TensorView q,
   ffi::Shape  out_strides{out_cols_padded, 1};
   ffi::Tensor out = out_pad.as_strided(out_shape, out_strides);
 
-  auto stride_q      = make_stride(static_cast<int32_t>(q.stride(1)), _1{});
-  using StrideQ      = decltype(stride_q);
-  auto stride_k_row  = static_cast<int32_t>(kv.stride(0));
-  auto stride_k      = make_stride(stride_k_row, _1{}, int32_t(kBlockKV) * stride_k_row);
-  using StrideK      = decltype(stride_k);
-  auto stride_sfk    = make_stride(_1{}, int32_t(kBlockKV) * static_cast<int32_t>(kv_scale.stride(0)));
-  using StrideSFK    = decltype(stride_sfk);
-  auto stride_w      = make_stride(_1{}, static_cast<int32_t>(num_heads * kBlockQ));
+  auto stride_q   = make_stride(q.stride(1), _1{});
+  using StrideQ   = decltype(stride_q);
+  auto stride_k   = make_stride(kv.stride(0), _1{});
+  using StrideK   = decltype(stride_k);
+  auto stride_sfk = make_stride(kv_scale.stride(0), _0{});
+  using StrideSFK = decltype(stride_sfk);
+  // Weights are merged from [seq_len, num_heads] to [seq_len * num_heads, 1] for TME.
+  // The merged head dimension is contiguous; the q-block stride still comes from the real row stride.
+  auto stride_w      = make_stride(_1{}, int64_t(seq_len) * num_heads);
   using StrideW      = decltype(stride_w);
-  auto stride_logits = make_stride(static_cast<int32_t>(out.stride(0)), _1{});
+  auto stride_logits = make_stride(out.stride(0), _1{});
   using StrideLogits = decltype(stride_logits);
 
   using Element = mutlass::float_e4m3_t;
@@ -556,6 +476,5 @@ ffi::Tensor fp8_mqa_logits(ffi::TensorView q,
   return out;
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_metadata, get_paged_mqa_logits_metadata);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_paged_mqa_logits, fp8_paged_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mqa_logits, fp8_mqa_logits);

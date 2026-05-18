@@ -103,6 +103,26 @@ out = sageattn(
 )
 ```
 
+FP8 output example:
+
+```python
+out_fp8, out_scale = sageattn(
+    q,
+    k,
+    v,
+    tensor_layout="HND",
+    is_causal=False,
+    qk_quant_dtype="int8",
+    fp8_output=True,
+)
+
+out_dequant = out_fp8.to(torch.float32) * out_scale
+```
+
+When `return_lse=True`, the FP8 output form returns
+`(out_fp8, out_scale, lse)`. Without FP8 output, the return forms are `out` or
+`(out, lse)`.
+
 ## Tests
 
 Wrapper-level tests are available in:
@@ -129,6 +149,9 @@ pytest tests/test_sageattn_interface.py
   `quant_recipe` overrides `qk_quant_gran`
 - Only `qk_quant_gran="per_thread"` is supported as a shortcut; other
   granularities should be expressed via an explicit supported `quant_recipe`
+- `fp8_output=True` returns an FP8 tensor plus a `torch.float32` `out_scale`
+  tensor; `out_scale` has the same public tensor layout as the output and a
+  final scale dimension of `1`
 - Unsupported in this wrapper package: varlen, KV-cache wrapper entrypoints,
   public INT8 wrapper entrypoints other than the SM90-compatible name, and
   low-level pre-quantized public APIs

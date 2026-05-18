@@ -19,12 +19,21 @@ from mate.jit.utils import maybe_contiguous
 
 
 QuantRecipe = Tuple[int, int, int, int]
+SageAttentionQuantizedOutput = Union[
+    torch.Tensor,
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
+SageAttentionQuantizedKVCacheOutput = Union[
+    torch.Tensor,
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
 _DEFAULT_DENSE_RECIPE: QuantRecipe = (128, 128, -1, 1)
 
 
 class _SageAttentionAsmQuantMode(IntEnum):
     PER_TENSOR = 0
-    PER_CHANNEL = 1
     PER_BLOCK = 2
     PER_THREAD = 6
     PER_BLOCK_V = 7
@@ -32,7 +41,6 @@ class _SageAttentionAsmQuantMode(IntEnum):
 
 _ASM_QUANT_MODE_BY_RECIPE = {
     (-1, -1, -1, -1): _SageAttentionAsmQuantMode.PER_TENSOR,
-    (1, 1, -1, 1): _SageAttentionAsmQuantMode.PER_CHANNEL,
     (128, 128, -1, 1): _SageAttentionAsmQuantMode.PER_BLOCK,
     (128, 16, -1, 1): _SageAttentionAsmQuantMode.PER_THREAD,
     (128, 128, -1, 128): _SageAttentionAsmQuantMode.PER_BLOCK_V,
@@ -41,7 +49,6 @@ _ASM_QUANT_MODE_BY_RECIPE = {
 _DENSE_ASM_RECIPES = set(_ASM_QUANT_MODE_BY_RECIPE)
 _KVCACHE_ASM_RECIPES = {
     (-1, -1, -1, -1),
-    (1, 1, -1, 1),
     (128, 128, -1, 1),
     (128, 16, -1, 1),
 }
@@ -83,8 +90,9 @@ def sage_attn_quantized(
     causal: bool = False,
     quant_recipe: Optional[QuantRecipe] = None,
     return_lse: bool = False,
+    fp8_output: bool = False,
     backend: str = "mubin",
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> SageAttentionQuantizedOutput:
     r"""
     Low-level pre-quantized dense SageAttention forward pass.
 
@@ -111,21 +119,18 @@ def sage_attn_quantized(
     q_scale : Optional[Tensor]
         Query scale tensor matching the backend layout for ``q`` and
         ``quant_recipe``. For example, per-tensor quantization uses shape
-        ``(1, 1, 1, 1)``, the unit-block recipe ``(1, 1, -1, 1)`` uses
-        ``(batch, seqlen_q, num_q_heads, 1)``, and the block-based dense
-        recipes use ``(batch, q_seq_scale_num, num_q_heads, 1)``.
+        ``(1, 1, 1, 1)``, while the sequence-block dense recipes use
+        ``(batch, q_seq_scale_num, num_q_heads, 1)``.
     k_scale : Optional[Tensor]
         Key scale tensor matching the backend layout for ``k`` and
-        ``quant_recipe``. For the unit-block recipe ``(1, 1, -1, 1)``, the
-        expected shape is ``(batch, seqlen_kv, num_kv_heads, 1)``. Other dense
-        non-tensor recipes use ``(batch, k_seq_scale_num, num_kv_heads, 1)``.
+        ``quant_recipe``. The supported dense non-tensor recipes use
+        ``(batch, k_seq_scale_num, num_kv_heads, 1)``.
     v_scale : Optional[Tensor]
         Value scale tensor matching the backend layout for ``v`` and
         ``quant_recipe``. For block-V quantization ``(128, 128, -1, 128)`` the
-        expected shape is ``(batch, ceil_div(seqlen_kv, 128), num_kv_heads, 2)``;
-        the unit-block recipe ``(1, 1, -1, 1)`` expects
-        ``(batch, seqlen_kv, num_kv_heads, head_dim_v)``; other dense
-        non-tensor recipes expect ``(batch, 1, num_kv_heads, head_dim_v)``.
+        expected shape is ``(batch, ceil_div(seqlen_kv, 128), num_kv_heads, 1)``;
+        other supported dense non-tensor recipes expect
+        ``(batch, 1, num_kv_heads, head_dim_v)``.
     softmax_scale : Optional[float]
         Scale factor applied to ``QK^T`` before the softmax. Defaults to
         ``1 / sqrt(head_dim_qk)`` when not provided.
@@ -137,26 +142,34 @@ def sage_attn_quantized(
         describes the quantization block size on the corresponding axis.
 
         The dense path currently supports the following tuples:
-        ``(-1, -1, -1, -1)``, ``(1, 1, -1, 1)``, ``(128, 128, -1, 1)``,
-        ``(128, 16, -1, 1)``, and ``(128, 128, -1, 128)``. ``-1`` means the
+        ``(-1, -1, -1, -1)``, ``(128, 128, -1, 1)``, ``(128, 16, -1, 1)``,
+        and ``(128, 128, -1, 128)``. ``-1`` means the
         corresponding axis is not split into smaller quantization blocks.
-        ``1`` means a unit-size block on that axis; on sequence axes this is
-        token-level blocking. Defaults to ``(128, 128, -1, 1)``.
+        Defaults to ``(128, 128, -1, 1)``.
     return_lse : bool, optional
         Whether to also return the log-sum-exp tensor produced by the kernel.
         Default is ``False``.
+    fp8_output : bool, optional
+        Whether to quantize the attention output to FP8. If ``False``, the
+        output tensor uses ``torch.bfloat16``. If ``True``, the output tensor
+        uses the same FP8 dtype as ``v`` and the function also returns an
+        ``out_scale`` tensor with shape ``(batch, seqlen_q, num_q_heads, 1)``
+        and dtype ``torch.float32``.
     backend : str, optional
         Backend selector. Only ``"mubin"`` is supported for this low-level
         quantized path.
 
     Returns
     -------
-    Union[Tensor, Tuple[Tensor, Tensor]]
-        If ``return_lse`` is ``False``, returns the attention output with shape
-        ``(batch, seqlen_q, num_q_heads, head_dim_v)`` and dtype ``bfloat16``.
-
-        If ``return_lse`` is ``True``, also returns an ``lse`` tensor with shape
-        ``(batch, num_q_heads, seqlen_q)`` and dtype ``float32``.
+    Union[Tensor, Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]
+        The output tensor has shape
+        ``(batch, seqlen_q, num_q_heads, head_dim_v)``. When
+        ``fp8_output=False``, returns ``out`` or ``(out, lse)`` depending on
+        ``return_lse``, where ``out`` has dtype ``torch.bfloat16``. When
+        ``fp8_output=True``, returns ``(out_fp8, out_scale)`` or
+        ``(out_fp8, out_scale, lse)``, where ``out_fp8.dtype == v.dtype`` and
+        ``out_scale.dtype == torch.float32``. The ``lse`` tensor has shape
+        ``(batch, num_q_heads, seqlen_q)`` and dtype ``torch.float32``.
     """
     resolved_quant_recipe = quant_recipe or _DEFAULT_DENSE_RECIPE
     if backend != "mubin":
@@ -177,10 +190,14 @@ def sage_attn_quantized(
     headdim_v = v.shape[-1]
 
     module = _get_module()
+    out_dtype = v.dtype if fp8_output else torch.bfloat16
     out = torch.empty(
-        (batch, seqlen_q, nheads, headdim_v),
-        dtype=torch.bfloat16,
-        device=q.device,
+        (batch, seqlen_q, nheads, headdim_v), dtype=out_dtype, device=q.device
+    )
+    out_scale = (
+        torch.empty((batch, seqlen_q, nheads, 1), dtype=torch.float32, device=q.device)
+        if fp8_output
+        else None
     )
     lse = torch.empty(
         (batch, nheads, seqlen_q),
@@ -190,6 +207,7 @@ def sage_attn_quantized(
 
     module.sage_attn_quantized_asm(
         out,
+        maybe_contiguous(out_scale),
         lse,
         maybe_contiguous(q),
         maybe_contiguous(k),
@@ -202,6 +220,10 @@ def sage_attn_quantized(
         quant_mode,
     )
 
+    if fp8_output and return_lse:
+        return out, out_scale, lse
+    if fp8_output:
+        return out, out_scale
     return (out, lse) if return_lse else out
 
 
@@ -219,8 +241,9 @@ def sage_attn_quantized_with_kvcache(
     causal: bool = False,
     quant_recipe: Optional[QuantRecipe] = None,
     return_lse: bool = False,
+    fp8_output: bool = False,
     backend: str = "mubin",
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> SageAttentionQuantizedKVCacheOutput:
     r"""
     Low-level pre-quantized SageAttention forward pass with paged KV cache.
 
@@ -251,20 +274,15 @@ def sage_attn_quantized_with_kvcache(
     q_scale : Optional[Tensor]
         Query scale tensor matching the backend layout for ``q`` and
         ``quant_recipe``. Per-tensor quantization uses shape ``(1, 1, 1, 1)``,
-        the unit-block recipe ``(1, 1, -1, 1)`` uses
-        ``(batch, seqlen_q, num_q_heads, 1)``, and the other non-tensor
-        recipes use ``(batch, q_seq_scale_num, num_q_heads, 1)``.
+        and the supported non-tensor recipes use
+        ``(batch, q_seq_scale_num, num_q_heads, 1)``.
     k_scale : Optional[Tensor]
         Key-cache scale tensor matching the backend layout for ``k_cache`` and
-        ``quant_recipe``. The unit-block recipe ``(1, 1, -1, 1)`` expects
-        ``(num_blocks, page_block_size, num_kv_heads, 1)``. Other non-tensor
-        KV-cache recipes expect shape
+        ``quant_recipe``. The supported non-tensor KV-cache recipes expect shape
         ``(num_blocks, k_seq_scale_num_per_block, num_kv_heads, 1)``.
     v_scale : Optional[Tensor]
         Value-cache scale tensor matching the backend layout for ``v_cache`` and
-        ``quant_recipe``. The unit-block recipe ``(1, 1, -1, 1)`` expects
-        ``(num_blocks, page_block_size, num_kv_heads, head_dim_v)``. Other
-        non-tensor KV-cache recipes expect shape
+        ``quant_recipe``. The supported non-tensor KV-cache recipes expect shape
         ``(num_blocks, 1, num_kv_heads, head_dim_v)``.
     softmax_scale : Optional[float]
         Scale factor applied to ``QK^T`` before the softmax. Defaults to
@@ -277,26 +295,34 @@ def sage_attn_quantized_with_kvcache(
         describes the quantization block size on the corresponding axis.
 
         The KV-cache path currently supports ``(-1, -1, -1, -1)``,
-        ``(1, 1, -1, 1)``, ``(128, 128, -1, 1)``, and ``(128, 16, -1, 1)``.
-        ``-1`` means the corresponding axis is not split into smaller
-        quantization blocks. ``1`` means a unit-size block on that axis; on
-        sequence axes this is token-level blocking. Defaults to
-        ``(128, 128, -1, 1)``.
+        ``(128, 128, -1, 1)``, and ``(128, 16, -1, 1)``. ``-1`` means the
+        corresponding axis is not split into smaller quantization blocks.
+        Defaults to ``(128, 128, -1, 1)``.
     return_lse : bool, optional
         Whether to also return the log-sum-exp tensor produced by the kernel.
         Default is ``False``.
+    fp8_output : bool, optional
+        Whether to quantize the attention output to FP8. If ``False``, the
+        output tensor uses ``torch.bfloat16``. If ``True``, the output tensor
+        uses the same FP8 dtype as ``v_cache`` and the function also returns an
+        ``out_scale`` tensor with shape ``(batch, seqlen_q, num_q_heads, 1)``
+        and dtype ``torch.float32``.
     backend : str, optional
         Backend selector. Only ``"mubin"`` is supported for this low-level
         quantized path.
 
     Returns
     -------
-    Union[Tensor, Tuple[Tensor, Tensor]]
-        If ``return_lse`` is ``False``, returns the attention output with shape
-        ``(batch, seqlen_q, num_q_heads, head_dim_v)`` and dtype ``bfloat16``.
-
-        If ``return_lse`` is ``True``, also returns an ``lse`` tensor with shape
-        ``(batch, num_q_heads, seqlen_q)`` and dtype ``float32``.
+    Union[Tensor, Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]
+        The output tensor has shape
+        ``(batch, seqlen_q, num_q_heads, head_dim_v)``. When
+        ``fp8_output=False``, returns ``out`` or ``(out, lse)`` depending on
+        ``return_lse``, where ``out`` has dtype ``torch.bfloat16``. When
+        ``fp8_output=True``, returns ``(out_fp8, out_scale)`` or
+        ``(out_fp8, out_scale, lse)``, where
+        ``out_fp8.dtype == v_cache.dtype`` and
+        ``out_scale.dtype == torch.float32``. The ``lse`` tensor has shape
+        ``(batch, num_q_heads, seqlen_q)`` and dtype ``torch.float32``.
     """
     resolved_quant_recipe = quant_recipe or _DEFAULT_DENSE_RECIPE
     if backend != "mubin":
@@ -317,10 +343,14 @@ def sage_attn_quantized_with_kvcache(
     headdim_v = v_cache.shape[-1]
 
     module = _get_module()
+    out_dtype = v_cache.dtype if fp8_output else torch.bfloat16
     out = torch.empty(
-        (batch, seqlen_q, nheads, headdim_v),
-        dtype=torch.bfloat16,
-        device=q.device,
+        (batch, seqlen_q, nheads, headdim_v), dtype=out_dtype, device=q.device
+    )
+    out_scale = (
+        torch.empty((batch, seqlen_q, nheads, 1), dtype=torch.float32, device=q.device)
+        if fp8_output
+        else None
     )
     lse = torch.empty(
         (batch, nheads, seqlen_q),
@@ -330,6 +360,7 @@ def sage_attn_quantized_with_kvcache(
 
     module.sage_attn_quantized_with_kvcache_asm(
         out,
+        maybe_contiguous(out_scale),
         lse,
         maybe_contiguous(q),
         maybe_contiguous(k_cache),
@@ -344,6 +375,10 @@ def sage_attn_quantized_with_kvcache(
         quant_mode,
     )
 
+    if fp8_output and return_lse:
+        return out, out_scale, lse
+    if fp8_output:
+        return out, out_scale
     return (out, lse) if return_lse else out
 
 

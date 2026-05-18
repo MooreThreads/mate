@@ -2,6 +2,7 @@ import pytest
 import torch
 from mate.moe_fused_gate import moe_fused_gate
 from typing import Optional
+from mate.testing import supported_musa_compute_capability
 
 
 def biased_grouped_topk_impl(
@@ -69,6 +70,7 @@ def biased_grouped_topk_impl(
     return topk_weights, topk_ids
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize(
     "seq_length",
     list(range(1, 10))
@@ -191,6 +193,73 @@ def test_moe_fused_gate_combined(
     )
 
 
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("seq_length", [1, 64, 2904])
+@pytest.mark.parametrize(
+    "params",
+    [
+        (256, 1, 1, 8),
+        (256, 8, 4, 8),
+        (384, 1, 1, 8),
+        (384, 8, 4, 8),
+        (160, 1, 1, 8),
+    ],
+)
+def test_moe_fused_gate_small_scores_large_bias(seq_length, params):
+    num_experts, num_expert_group, topk_group, topk = params
+    dtype = torch.float32
+    device = "musa:0"
+
+    torch.manual_seed(seq_length + num_experts)
+    tensor = torch.full(
+        (seq_length, num_experts), -16.0, dtype=dtype, device=device
+    )  # sigmoid(-16) ~= 1.125e-7
+    tensor += torch.rand_like(tensor) * 0.5
+    scores = tensor.clone()
+
+    bias = torch.full((num_experts,), 11.0, dtype=dtype, device=device)
+    bias += torch.rand_like(bias) * 0.5
+
+    output, indices = moe_fused_gate(
+        tensor,
+        bias,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        renormalize=True,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    ref_output, ref_indices = biased_grouped_topk_impl(
+        scores,
+        scores,
+        bias,
+        topk=topk,
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    assert not torch.isnan(output).any()
+    assert torch.allclose(
+        ref_indices.sort()[0].to(torch.int32),
+        indices.sort()[0].to(torch.int32),
+        rtol=1e-04,
+        atol=1e-05,
+    )
+    assert torch.allclose(
+        ref_output.sort()[0].to(torch.float32),
+        output.sort()[0].to(torch.float32),
+        rtol=1e-02,
+        atol=1e-03,
+    )
+
+
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize(
     "seq_length",
     [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import mate
+from mate.testing import supported_musa_compute_capability
 
 
 # Keep the reference path numerically aligned with gdn_unified_tilelang testing.
@@ -224,6 +225,162 @@ def _manual_seed_device(seed: int | None, device_type: str) -> None:
 def _synchronize_device(device_type: str) -> None:
     if device_type == "musa":
         torch.musa.synchronize()
+
+
+def _make_sglang_split_qkv_views(
+    *,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_dim = num_q_heads * head_size
+    k_dim = num_k_heads * head_size
+    v_dim = num_v_heads * head_size
+    mixed_qkv = torch.empty(
+        batch_size, q_dim + k_dim + v_dim, dtype=dtype, device=device
+    )
+
+    q_dense = torch.randn(
+        batch_size, 1, num_q_heads, head_size, dtype=dtype, device=device
+    )
+    k_dense = torch.randn(
+        batch_size, 1, num_k_heads, head_size, dtype=dtype, device=device
+    )
+    k_dense = torch.nn.functional.normalize(k_dense, p=2.0, dim=-1)
+    v_dense = torch.randn(
+        batch_size, 1, num_v_heads, head_size, dtype=dtype, device=device
+    )
+
+    q_flat, k_flat, v_flat = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+    q_flat.copy_(q_dense.view(batch_size, q_dim))
+    k_flat.copy_(k_dense.view(batch_size, k_dim))
+    v_flat.copy_(v_dense.view(batch_size, v_dim))
+
+    q = q_flat.view(batch_size, 1, num_q_heads, head_size)
+    k = k_flat.view(batch_size, 1, num_k_heads, head_size)
+    v = v_flat.view(batch_size, 1, num_v_heads, head_size)
+
+    fused_stride = q_dim + k_dim + v_dim
+    assert q.stride()[1:] == (q_dim, head_size, 1)
+    assert k.stride()[1:] == (k_dim, head_size, 1)
+    assert v.stride()[1:] == (v_dim, head_size, 1)
+    if batch_size > 1:
+        assert q.stride()[0] == fused_stride
+        assert k.stride()[0] == fused_stride
+        assert v.stride()[0] == fused_stride
+        assert not q.is_contiguous()
+        assert not k.is_contiguous()
+        assert not v.is_contiguous()
+    return q, k, v
+
+
+def _make_split_gate_views(
+    *,
+    batch_size: int,
+    num_heads: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mixed_ab = torch.empty(batch_size, 1, num_heads * 2, dtype=dtype, device=device)
+    a_view, b_view = torch.split(mixed_ab, [num_heads, num_heads], dim=-1)
+
+    a_dense = torch.randn(batch_size, 1, num_heads, dtype=dtype, device=device) * 0.1
+    b_dense = torch.randn(batch_size, 1, num_heads, dtype=dtype, device=device)
+    a_view.copy_(a_dense)
+    b_view.copy_(b_dense)
+
+    assert a_view.stride() == (num_heads * 2, num_heads * 2, 1)
+    assert b_view.stride() == (num_heads * 2, num_heads * 2, 1)
+    if batch_size > 1:
+        assert not a_view.is_contiguous()
+        assert not b_view.is_contiguous()
+    return a_view, b_view
+
+
+def _make_strided_decode_output(
+    *,
+    batch_size: int,
+    num_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    workspace = torch.empty(
+        batch_size,
+        1,
+        num_heads,
+        head_size * 2,
+        dtype=dtype,
+        device=device,
+    )
+    output = workspace[..., :head_size]
+    assert output.shape == (batch_size, 1, num_heads, head_size)
+    assert not output.is_contiguous()
+    return output
+
+
+def _assert_decode_matches_reference(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    input_state_ref: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b_tensor: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+    output: torch.Tensor | None = None,
+) -> None:
+    state = input_state_ref.transpose(-2, -1).contiguous()
+    state_ptr = state.data_ptr()
+    out, returned_state = mate.gated_delta_rule_decode(
+        q=q,
+        k=k,
+        v=v,
+        state=state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b_tensor,
+        state_layout="VK",
+        scale=scale,
+        output=output,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    _synchronize_device(q.device.type)
+
+    assert state.data_ptr() == state_ptr
+    assert returned_state.data_ptr() == state_ptr
+    if output is not None:
+        assert out.data_ptr() == output.data_ptr()
+
+    ref_o, ref_state = decode_delta_rule(
+        q.squeeze(1).float(),
+        k.squeeze(1).float(),
+        v.squeeze(1).float(),
+        input_state_ref,
+        A_log=A_log.float(),
+        a=a.squeeze(1).float(),
+        dt_bias=dt_bias.float(),
+        b=b_tensor.squeeze(1).float(),
+        scale_factor=scale,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        use_l2_norm=use_qk_l2norm,
+    )
+    ref_o = ref_o.to(q.dtype)
+    ref_state = ref_state.transpose(-2, -1).contiguous()
+
+    atol = 1e-2 if q.dtype == torch.float16 else 5e-3
+    rtol = 1e-2 if q.dtype == torch.float16 else 5e-3
+    torch.testing.assert_close(out.squeeze(1), ref_o, atol=atol, rtol=rtol)
+    torch.testing.assert_close(returned_state, ref_state, atol=atol, rtol=rtol)
 
 
 def _test_decode_kernel_pretranspose(
@@ -470,6 +627,7 @@ def _test_decode_kernel_bitwise_stable_pretranspose(
     )
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", [1.0])
@@ -505,6 +663,149 @@ def test_decode_kernel_basic_pretranspose(
     )
 
 
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize("dt_bias_dtype", ["float32", "bfloat16"])
+def test_decode_kernel_sglang_split_qkv_pretranspose(
+    dtype: str,
+    dt_bias_dtype: str,
+    seed: int = _get_default_seed(),
+) -> None:
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+
+    batch_size = 32
+    num_q_heads = 16
+    num_k_heads = 16
+    num_v_heads = 32
+    head_size = 128
+    scale = 1.0
+
+    dtype_torch = getattr(torch, dtype)
+    device = _get_runtime_device(allow_skip=True)
+    _manual_seed_device(seed, device.type)
+
+    q, k, v = _make_sglang_split_qkv_views(
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        dtype=dtype_torch,
+        device=device,
+    )
+
+    input_state_ref = torch.randn(
+        batch_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = (
+        torch.randn(num_v_heads, dtype=getattr(torch, dt_bias_dtype), device=device)
+        * 0.1
+    )
+    a = torch.randn(batch_size, 1, num_v_heads, dtype=dtype_torch, device=device) * 0.1
+    b_tensor = torch.randn(
+        batch_size,
+        1,
+        num_v_heads,
+        dtype=dtype_torch,
+        device=device,
+    )
+
+    _assert_decode_matches_reference(
+        q=q,
+        k=k,
+        v=v,
+        input_state_ref=input_state_ref,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_tensor=b_tensor,
+        scale=scale,
+        output=None,
+        use_qk_l2norm=True,
+    )
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("use_qk_l2norm", [True, False])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_decode_kernel_strided_inputs_and_output_pretranspose(
+    dtype: str,
+    batch_size: int,
+    use_qk_l2norm: bool,
+    seed: int = _get_default_seed(),
+) -> None:
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+
+    num_q_heads = 8
+    num_k_heads = 8
+    num_v_heads = 32
+    head_size = 128
+    scale = 1.0
+
+    dtype_torch = getattr(torch, dtype)
+    device = _get_runtime_device(allow_skip=True)
+    _manual_seed_device(seed, device.type)
+
+    q, k, v = _make_sglang_split_qkv_views(
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        dtype=dtype_torch,
+        device=device,
+    )
+    a, b_tensor = _make_split_gate_views(
+        batch_size=batch_size,
+        num_heads=num_v_heads,
+        dtype=dtype_torch,
+        device=device,
+    )
+    output = _make_strided_decode_output(
+        batch_size=batch_size,
+        num_heads=num_v_heads,
+        head_size=head_size,
+        dtype=dtype_torch,
+        device=device,
+    )
+
+    input_state_ref = torch.randn(
+        batch_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+
+    _assert_decode_matches_reference(
+        q=q,
+        k=k,
+        v=v,
+        input_state_ref=input_state_ref,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_tensor=b_tensor,
+        scale=scale,
+        output=output,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+
+
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("scale", [1.0])
 @pytest.mark.parametrize("head_size", [128])

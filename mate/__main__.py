@@ -14,8 +14,10 @@ Requirements:
 import os
 import sys
 import json
+import re
 import importlib
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -26,6 +28,22 @@ TVM_FFI_INSTALL_HINT = (
     "containing 'musa' (for example v0.1.9.post2+musa.1); the upstream "
     "public build is not compatible with MATE."
 )
+WRAPPER_PACKAGES = (
+    {
+        "distribution": "flash_attn_3",
+        "module": "flash_attn_3",
+        "display": "flash_attn_3",
+    },
+    {
+        "distribution": "sageattention",
+        "module": "sageattention",
+        "display": "sageattention",
+    },
+    {"distribution": "flash_mla", "module": "flash_mla", "display": "flash_mla"},
+    {"distribution": "deep-gemm", "module": "deep_gemm", "display": "deep-gemm"},
+)
+
+_DEV_SUFFIX_RE = re.compile(r"\.dev\d+$")
 
 
 # Version - try multiple sources
@@ -85,6 +103,10 @@ ENV_VARS = {
     "MATE_WORKSPACE_BASE": "Base directory for the MATE cache workspace",
     "MATE_DISABLE_JIT": "Disable runtime JIT and require matching AOT modules",
     "MATE_JIT_VERBOSE": "Show verbose ninja output for runtime JIT builds",
+    "MATE_EXTRA_CFLAGS": "Extra host compiler flags for JIT builds",
+    "MATE_EXTRA_MUSAFLAGS": "Extra mcc flags for JIT builds",
+    "MATE_EXTRA_LDFLAGS": "Extra linker flags for JIT builds",
+    "MATE_MCC": "Override the mcc compiler path used by JIT builds",
 }
 
 
@@ -96,6 +118,178 @@ def _read_installed_package_version(package_name: str) -> str | None:
         return resolved if resolved else None
     except Exception:
         return None
+
+
+def _public_version(version: str) -> str:
+    try:
+        from packaging.version import Version
+
+        return Version(version).public
+    except Exception:
+        return version.split("+", 1)[0]
+
+
+def _wrapper_compat_version(version: str) -> str:
+    return _DEV_SUFFIX_RE.sub("", _public_version(version))
+
+
+def _short_commit(commit: str | None) -> str:
+    if not commit or commit == "unknown":
+        return "unknown"
+    return commit[:16]
+
+
+def _parse_build_meta(text: str) -> dict[str, str]:
+    values = {}
+    for name in ("__version__", "__git_version__"):
+        match = re.search(rf"(?m)^{name}\s*=\s*['\"]([^'\"]+)['\"]", text)
+        if match:
+            values[name] = match.group(1)
+    return values
+
+
+def _read_wrapper_build_meta_from_distribution(distribution, module_name: str):
+    try:
+        files = distribution.files or []
+    except Exception:
+        files = []
+
+    expected_path = f"{module_name}/_build_meta.py"
+    for file in files:
+        if file.as_posix() != expected_path:
+            continue
+        try:
+            return _parse_build_meta(
+                distribution.locate_file(file).read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except Exception:
+        spec = None
+    if not spec or not spec.submodule_search_locations:
+        return {}
+
+    build_meta_path = (
+        Path(next(iter(spec.submodule_search_locations))) / "_build_meta.py"
+    )
+    if not build_meta_path.exists():
+        return {}
+    try:
+        return _parse_build_meta(build_meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _extract_exact_requirement_pin(requirement_specifier) -> str | None:
+    specifiers = list(requirement_specifier)
+    if len(specifiers) != 1:
+        return None
+
+    specifier = specifiers[0]
+    if specifier.operator != "==" or specifier.version.endswith(".*"):
+        return None
+    return specifier.version
+
+
+def _read_mate_requirement(distribution) -> tuple[str | None, str | None]:
+    try:
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+    except Exception:
+        return None, None
+
+    for raw_requirement in distribution.requires or []:
+        try:
+            requirement = Requirement(raw_requirement)
+        except Exception:
+            continue
+        if canonicalize_name(requirement.name) == "mate":
+            return raw_requirement, _extract_exact_requirement_pin(
+                requirement.specifier
+            )
+    return None, None
+
+
+def _get_wrapper_package_statuses(expected_version: str, expected_git_version: str):
+    from importlib import metadata
+
+    expected_wrapper_version = _wrapper_compat_version(expected_version)
+    statuses = []
+    for wrapper in WRAPPER_PACKAGES:
+        status: dict[str, Any] = {
+            **wrapper,
+            "installed": False,
+            "version": None,
+            "git_version": None,
+            "mate_requirement": None,
+            "errors": [],
+        }
+
+        try:
+            distribution = metadata.distribution(wrapper["distribution"])
+        except metadata.PackageNotFoundError:
+            statuses.append(status)
+            continue
+
+        status["installed"] = True
+        status["version"] = distribution.version
+        build_meta = _read_wrapper_build_meta_from_distribution(
+            distribution, wrapper["module"]
+        )
+        status["git_version"] = build_meta.get("__git_version__")
+        status["build_meta_version"] = build_meta.get("__version__")
+        mate_requirement, mate_exact_version = _read_mate_requirement(distribution)
+        status["mate_requirement"] = mate_requirement
+
+        wrapper_compat_version = (
+            _wrapper_compat_version(status["version"]) if status["version"] else None
+        )
+        if wrapper_compat_version != expected_wrapper_version:
+            status["errors"].append(
+                "version "
+                f"{status['version']} does not match MATE-compatible version "
+                f"{expected_wrapper_version} (ignoring dev suffix)"
+            )
+
+        if (
+            status["build_meta_version"]
+            and status["build_meta_version"] != status["version"]
+        ):
+            status["errors"].append(
+                "build metadata version "
+                f"{status['build_meta_version']} does not match package metadata "
+                f"{status['version']}"
+            )
+
+        expected_specifier = f"=={expected_wrapper_version}"
+        if not mate_exact_version:
+            status["errors"].append(
+                f"dependency on mate is {mate_requirement or 'missing'}, "
+                f"expected an exact mate{expected_specifier} pin"
+            )
+        elif _wrapper_compat_version(mate_exact_version) != expected_wrapper_version:
+            status["errors"].append(
+                f"dependency on mate is {mate_requirement}, expected mate-compatible "
+                f"version {expected_wrapper_version} (ignoring dev suffix)"
+            )
+
+        if not expected_git_version or expected_git_version == "unknown":
+            status["errors"].append("MATE commit metadata is unavailable")
+        elif not status["git_version"] or status["git_version"] == "unknown":
+            status["errors"].append("wrapper commit metadata is unavailable")
+        elif status["git_version"] != expected_git_version:
+            status["errors"].append(
+                "wrapper commit "
+                f"{_short_commit(status['git_version'])} does not match MATE "
+                f"{_short_commit(expected_git_version)}"
+            )
+
+        statuses.append(status)
+
+    return statuses
 
 
 def _read_tvm_ffi_module_version() -> str | None:
@@ -198,10 +392,58 @@ def _get_musa_arch_status():
     }
 
 
+def _get_jit_status_info(register_modules: bool = False):
+    try:
+        from mate.jit import env as jit_env
+        from mate.jit import jit_spec_registry
+
+        registration_error = None
+        if register_modules and not jit_spec_registry.get_all_statuses():
+            try:
+                from mate.aot import register_default_modules
+
+                register_default_modules()
+            except Exception as exc:
+                registration_error = str(exc)
+
+        return {
+            "available": True,
+            "error": registration_error,
+            "cache_dir": str(jit_env.MATE_CACHE_DIR),
+            "workspace_dir": str(jit_env.MATE_WORKSPACE_DIR),
+            "jit_dir": str(jit_env.MATE_JIT_DIR),
+            "gen_src_dir": str(jit_env.MATE_GEN_SRC_DIR),
+            "aot_dir": str(jit_env.MATE_AOT_DIR),
+            "disable_jit": jit_env.disable_jit_enabled(),
+            "jit_verbose": os.environ.get("MATE_JIT_VERBOSE", "0") == "1",
+            "stats": jit_spec_registry.get_stats(),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "error": str(exc),
+            "cache_dir": None,
+            "workspace_dir": None,
+            "jit_dir": None,
+            "gen_src_dir": None,
+            "aot_dir": None,
+            "disable_jit": os.environ.get("MATE_DISABLE_JIT", "0") == "1",
+            "jit_verbose": os.environ.get("MATE_JIT_VERBOSE", "0") == "1",
+            "stats": {
+                "total": 0,
+                "compiled": 0,
+                "aot": 0,
+                "jit_compiled": 0,
+                "not_compiled": 0,
+            },
+        }
+
+
 def get_system_info():
     """Gather system information."""
     tvm_ffi_status = _get_tvm_ffi_status()
     musa_arch_status = _get_musa_arch_status()
+    jit_status = _get_jit_status_info(register_modules=True)
     info = {
         "mate_version": __version__,
         "git_version": __git_version__,
@@ -217,6 +459,16 @@ def get_system_info():
         "musa_arch_available": musa_arch_status["musa_arch_available"],
         "musa_arch_status": musa_arch_status["musa_arch_status"],
         "musa_arch_error": musa_arch_status["musa_arch_error"],
+        "jit_available": jit_status["available"],
+        "jit_error": jit_status["error"],
+        "jit_cache_dir": jit_status["cache_dir"],
+        "jit_workspace_dir": jit_status["workspace_dir"],
+        "jit_dir": jit_status["jit_dir"],
+        "jit_gen_src_dir": jit_status["gen_src_dir"],
+        "aot_dir": jit_status["aot_dir"],
+        "disable_jit": jit_status["disable_jit"],
+        "jit_verbose": jit_status["jit_verbose"],
+        "jit_stats": jit_status["stats"],
     }
 
     # PyTorch info
@@ -256,6 +508,67 @@ def print_kv(
     """Print a key-value pair."""
     click.secho(f"{key}:", fg=key_color, nl=False)
     click.secho(f" {value}", fg=value_color)
+
+
+def _ensure_modules_registered(announce: bool = True):
+    try:
+        from mate.aot import register_default_modules
+        from mate.jit import jit_spec_registry
+
+        statuses = jit_spec_registry.get_all_statuses()
+        if not statuses:
+            if announce:
+                click.secho(
+                    "No modules found. Registering default modules...", fg="yellow"
+                )
+            count = register_default_modules()
+            if announce:
+                click.secho(f"Registered {count} modules", fg="green")
+            statuses = jit_spec_registry.get_all_statuses()
+        return statuses
+    except Exception as exc:
+        click.secho(f"Unable to register JIT modules: {exc}", fg="red")
+        if "MATE_MUSA_ARCH_LIST" not in os.environ:
+            click.secho(
+                "Set MATE_MUSA_ARCH_LIST explicitly for offline diagnostics, "
+                "for example: MATE_MUSA_ARCH_LIST=3.1",
+                fg="yellow",
+            )
+        return []
+
+
+def _status_color(status: str) -> str:
+    if status == "AOT":
+        return "green"
+    if status == "JIT Compiled":
+        return "cyan"
+    return "red"
+
+
+def _print_status_summary(statuses):
+    from mate.jit import jit_spec_registry
+
+    stats = jit_spec_registry.get_stats()
+    print_kv("Total modules", str(stats["total"]))
+    print_kv("Compiled", str(stats["compiled"]), value_color="green")
+    print_kv("AOT", str(stats["aot"]), value_color="green")
+    print_kv("JIT compiled", str(stats["jit_compiled"]), value_color="cyan")
+    print_kv("Not compiled", str(stats["not_compiled"]), value_color="red")
+
+
+def _status_as_dict(status):
+    return {
+        "name": status.name,
+        "status": status.status,
+        "library_path": str(status.library_path) if status.library_path else None,
+        "aot_path": str(status.aot_path),
+        "jit_library_path": str(status.jit_library_path),
+        "build_dir": str(status.build_dir),
+        "ninja_path": str(status.ninja_path),
+        "sources": [str(source) for source in status.sources],
+        "num_sources": status.num_sources,
+        "num_generated_sources": status.num_generated_sources,
+    }
 
 
 @click.group(invoke_without_command=True)
@@ -330,6 +643,29 @@ def show_config(output_json: bool):
         click.secho("Reason: ", fg="magenta", nl=False)
         click.secho(info["musa_arch_error"], fg="yellow", bold=True)
 
+    # JIT/AOT Info
+    print_header("JIT/AOT Status")
+    if info["jit_available"]:
+        print_kv("Cache directory", info["jit_cache_dir"] or "N/A")
+        print_kv("Workspace directory", info["jit_workspace_dir"] or "N/A")
+        print_kv("Cached ops directory", info["jit_dir"] or "N/A")
+        print_kv("Generated source directory", info["jit_gen_src_dir"] or "N/A")
+        print_kv("AOT directory", info["aot_dir"] or "N/A")
+        print_kv("MATE_DISABLE_JIT", str(info["disable_jit"]))
+        print_kv("MATE_JIT_VERBOSE", str(info["jit_verbose"]))
+        stats = info["jit_stats"]
+        print_kv("Registered modules", str(stats["total"]))
+        print_kv("Compiled modules", str(stats["compiled"]), value_color="green")
+        print_kv("AOT modules", str(stats["aot"]), value_color="green")
+        print_kv("JIT compiled modules", str(stats["jit_compiled"]), value_color="cyan")
+        print_kv("Not compiled modules", str(stats["not_compiled"]), value_color="red")
+        if info["jit_error"]:
+            click.secho("JIT registration warning: ", fg="magenta", nl=False)
+            click.secho(info["jit_error"], fg="yellow", bold=True)
+    else:
+        click.secho("JIT unavailable: ", fg="magenta", nl=False)
+        click.secho(info["jit_error"], fg="yellow", bold=True)
+
     # TVM-FFI Info
     print_header("TVM-FFI")
     version_color = "cyan" if info["tvm_ffi_musa_enabled"] else "red"
@@ -400,6 +736,95 @@ def env_cmd():
         click.secho(f"{var:<{max_key_len}} ", fg="cyan", nl=False)
         click.secho(f"{display_value:<53} ", fg=value_color, nl=False)
         click.secho(description, fg="white")
+
+
+@cli.command("module-status")
+@click.option("--detailed", is_flag=True, help="Show source and path details")
+def module_status_cmd(detailed: bool):
+    """Show registered JIT/AOT module status without compiling."""
+    statuses = _ensure_modules_registered()
+    if not statuses:
+        return
+
+    statuses = sorted(statuses, key=lambda status: status.name)
+    print_header("Module Status")
+    _print_status_summary(statuses)
+    click.echo()
+
+    for status in statuses:
+        click.secho(f"{status.name:<72} ", fg="white", nl=False)
+        click.secho(status.status, fg=_status_color(status.status))
+        if detailed:
+            if status.library_path:
+                print_kv("  Library", str(status.library_path), key_color="white")
+            print_kv("  AOT path", str(status.aot_path), key_color="white")
+            print_kv("  JIT path", str(status.jit_library_path), key_color="white")
+            print_kv("  Ninja", str(status.ninja_path), key_color="white")
+            print_kv("  Sources", str(status.num_sources), key_color="white")
+            print_kv(
+                "  Generated sources",
+                str(status.num_generated_sources),
+                key_color="white",
+            )
+
+
+@cli.command("list-modules")
+@click.argument("module_name", required=False)
+def list_modules_cmd(module_name: str | None):
+    """List registered JIT/AOT modules or inspect one module."""
+    statuses = _ensure_modules_registered(announce=module_name is None)
+    if not statuses:
+        return
+
+    if module_name:
+        match = next(
+            (status for status in statuses if status.name == module_name), None
+        )
+        if match is None:
+            click.secho(f"Module '{module_name}' not found.", fg="red")
+            return
+        click.echo(json.dumps(_status_as_dict(match), indent=2))
+        return
+
+    for status in sorted(statuses, key=lambda item: item.name):
+        click.secho(f"{status.name:<72} ", fg="white", nl=False)
+        click.secho(status.status, fg=_status_color(status.status))
+
+
+@cli.command("export-compile-commands")
+@click.argument("path", required=False, default="compile_commands.json")
+def export_compile_commands_cmd(path: str):
+    """Export JIT module compile commands for IDEs and tooling."""
+    statuses = _ensure_modules_registered()
+    if not statuses:
+        return
+
+    from mate.jit import jit_spec_registry
+
+    compile_commands = []
+    for spec in jit_spec_registry.get_all_specs().values():
+        compile_commands.extend(spec.get_compile_commands())
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(compile_commands, f, indent=2)
+    click.secho(
+        f"Exported {len(compile_commands)} compile commands to {output_path}",
+        fg="green",
+    )
+
+
+@cli.command("clear-cache")
+def clear_cache_cmd():
+    """Clear the runtime JIT cache directory, leaving AOT libraries untouched."""
+    try:
+        from mate.jit import clear_cache_dir
+
+        clear_cache_dir()
+        click.secho("JIT cache cleared successfully.", fg="green")
+    except Exception as exc:
+        click.secho(f"Failed to clear JIT cache: {exc}", fg="red")
 
 
 @cli.command("replay")
@@ -648,10 +1073,47 @@ def check_cmd():
 
         mate_path = Path(mate.__file__).parent
         aot_dir = mate_path / "data" / "aot"
-        if aot_dir.exists() and list(aot_dir.glob("*.so")):
+        if aot_dir.exists() and list(aot_dir.rglob("*.so")):
             click.secho("✓ AOT libraries found", fg="green")
         else:
             warnings.append("AOT libraries not found (JIT mode only)")
+
+        print_header("Wrapper Packages")
+        expected_wrapper_version = _wrapper_compat_version(mate.__version__)
+        wrapper_statuses = _get_wrapper_package_statuses(
+            mate.__version__, __git_version__
+        )
+        for status in wrapper_statuses:
+            display = status["display"]
+            if not status["installed"]:
+                click.secho(f"⚠ {display} not installed", fg="yellow")
+                warnings.append(f"{display} wrapper not installed")
+                continue
+
+            if status["errors"]:
+                click.secho(f"✗ {display} mismatch", fg="red", bold=True)
+                click.secho(f"  Version: {status['version']}", fg="cyan")
+                click.secho(
+                    "  Expected MATE-compatible version: "
+                    f"{expected_wrapper_version} (dev suffix ignored)",
+                    fg="cyan",
+                )
+                click.secho(
+                    f"  Wrapper commit: {_short_commit(status['git_version'])}",
+                    fg="cyan",
+                )
+                click.secho(
+                    f"  MATE commit: {_short_commit(__git_version__)}",
+                    fg="cyan",
+                )
+                for error in status["errors"]:
+                    errors.append(f"{display}: {error}")
+                    click.secho(f"  - {error}", fg="red")
+                continue
+
+            click.secho(f"✓ {display} matches MATE", fg="green")
+            click.secho(f"  Version: {status['version']}", fg="cyan")
+            click.secho(f"  Commit: {_short_commit(status['git_version'])}", fg="cyan")
 
     except ImportError as exc:
         errors.append(f"MATE import failed: {exc}")

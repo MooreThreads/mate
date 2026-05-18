@@ -13,11 +13,14 @@ struct GetDecodingMetadataParams {
   int* __restrict__ seqlens_k_ptr;
   int* __restrict__ tile_scheduler_metadata_ptr;
   int* __restrict__ num_splits_ptr;
+  int* __restrict__ topk_length_ptr;
+  int* __restrict__ extra_topk_length_ptr;
   int batch_size;
   int block_size_n;
   int fixed_overhead_num_blocks;
   int num_mp_parts;
   int topk;
+  int extra_topk;
 };
 
 struct MlaCombineParams {

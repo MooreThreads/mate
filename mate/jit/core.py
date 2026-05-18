@@ -13,7 +13,11 @@ import tvm_ffi.cpp
 from tvm_ffi.utils import FileLock
 
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, run_ninja
+from .cpp_ext import (
+    generate_compile_commands_for_op,
+    generate_ninja_build_for_op,
+    run_ninja,
+)
 
 
 def write_if_different(path: Path, content: str) -> bool:
@@ -51,6 +55,28 @@ class JitSpecStatus:
     library_path: Optional[Path]
     sources: List[Path]
     is_aot: bool
+    is_jit_compiled: bool
+    aot_path: Path
+    jit_library_path: Path
+    build_dir: Path
+    ninja_path: Path
+    num_generated_sources: int
+
+    @property
+    def status(self) -> str:
+        if self.is_aot:
+            return "AOT"
+        if self.is_jit_compiled:
+            return "JIT Compiled"
+        return "Not Compiled"
+
+    @property
+    def kind(self) -> str:
+        return self.status
+
+    @property
+    def num_sources(self) -> int:
+        return len(self.sources)
 
 
 class JitSpecRegistry:
@@ -87,6 +113,12 @@ class JitSpecRegistry:
             library_path=library_path,
             sources=spec.sources,
             is_aot=spec.is_aot,
+            is_jit_compiled=spec.is_jit_compiled and not spec.is_aot,
+            aot_path=spec.resolved_aot_path,
+            jit_library_path=spec.jit_library_path,
+            build_dir=spec.build_dir,
+            ninja_path=spec.ninja_path,
+            num_generated_sources=len(spec.generated_sources),
         )
 
     def get_all_statuses(self) -> List[JitSpecStatus]:
@@ -102,6 +134,8 @@ class JitSpecRegistry:
         return {
             "total": len(statuses),
             "compiled": sum(1 for status in statuses if status.is_compiled),
+            "aot": sum(1 for status in statuses if status.is_aot),
+            "jit_compiled": sum(1 for status in statuses if status.is_jit_compiled),
             "not_compiled": sum(1 for status in statuses if not status.is_compiled),
         }
 
@@ -141,8 +175,16 @@ class JitSpec:
         return self.aot_path is not None and self.aot_path.exists()
 
     @property
+    def is_jit_compiled(self) -> bool:
+        return self.jit_library_path.exists()
+
+    @property
     def is_compiled(self) -> bool:
-        return self.is_aot or self.jit_library_path.exists()
+        return self.is_aot or self.is_jit_compiled
+
+    @property
+    def resolved_aot_path(self) -> Path:
+        return self.aot_path or default_aot_path(self.name)
 
     def get_library_path(self) -> Path:
         if self.is_aot:
@@ -169,14 +211,28 @@ class JitSpec:
     def load(self, library_path: Path):
         return tvm_ffi.load_module(str(library_path))
 
-    def build(self, verbose: bool = False) -> Path:
+    def get_compile_commands(self) -> List[dict]:
+        return generate_compile_commands_for_op(
+            name=self.name,
+            sources=self.sources,
+            extra_cflags=self.extra_cflags,
+            extra_cuda_cflags=self.extra_cuda_cflags,
+            extra_include_dirs=self.extra_include_dirs,
+        )
+
+    def build(self, verbose: bool = False, need_lock: bool = True) -> Path:
         if jit_env.disable_jit_enabled():
             raise MissingJITCacheError(
-                "JIT compilation is disabled via MATE_DISABLE_JIT, but no matching AOT module exists.",
+                "JIT compilation is disabled via MATE_DISABLE_JIT, "
+                "but no matching AOT module exists.",
                 spec=self,
             )
 
-        with FileLock(str(self.lock_path)):
+        if need_lock:
+            with FileLock(str(self.lock_path)):
+                self.write_ninja()
+                run_ninja(self.build_dir, self.ninja_path, verbose)
+        else:
             self.write_ninja()
             run_ninja(self.build_dir, self.ninja_path, verbose)
         return self.jit_library_path
@@ -186,8 +242,9 @@ class JitSpec:
             return self.load(self.aot_path)  # type: ignore[arg-type]
 
         verbose = os.environ.get("MATE_JIT_VERBOSE", "0") == "1"
-        library_path = self.build(verbose=verbose)
-        return self.load(library_path)
+        with FileLock(str(self.lock_path)):
+            library_path = self.build(verbose=verbose, need_lock=False)
+            return self.load(library_path)
 
 
 def gen_jit_spec(

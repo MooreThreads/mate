@@ -462,11 +462,12 @@ inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n) {
   bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k;
 
   int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
-  // TODO: metadata kernel need to set params for local.
-  int const seqlen_k_loaded = params.seqlen_k;
-  // int const seqlen_k_loaded = !params.is_local
-  //   ? params.seqlen_k
-  //   : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + tile_m));
+  // metadata kernel need to set params for local.
+  // int const seqlen_k_loaded = params.seqlen_k;
+  int const seqlen_k_loaded =
+      !params.is_local
+          ? params.seqlen_k
+          : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + tile_m));
   int const num_n_blocks = (seqlen_k_loaded + tile_n - 1) / tile_n;
   int const num_m_blocks = (seqlen_q_packgqa + tile_m - 1) / tile_m;
   // TODO: Other dtype size (fp8, etc.)

@@ -118,7 +118,7 @@ struct FmhaFwdParams {
   // The cos and sin matrices for rotary embedding.
   void* __restrict__ rotary_cos_ptr;
   void* __restrict__ rotary_sin_ptr;
-  int* __restrict__ seqlens_rotary;
+  uint32_t* __restrict__ seqlens_rotary;
 
   // The indices to index into the KV cache.
   uint32_t* __restrict__ kv_batch_idx;
@@ -139,6 +139,8 @@ struct FmhaFwdParams {
 
   bool is_causal;
   bool is_local;
+
+  bool is_rotary_interleaved;
 
   int window_size_left, window_size_right;
 };

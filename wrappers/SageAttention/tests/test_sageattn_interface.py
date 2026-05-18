@@ -21,7 +21,6 @@ from mate.testing.flash_attn import attention_ref
 
 _SUPPORTED_RECIPES = [
     (-1, -1, -1, -1),
-    # (1, 1, -1, 1),
     (128, 128, -1, 1),
     (128, 16, -1, 1),
     (128, 128, -1, 128),
@@ -60,6 +59,18 @@ def rmse(x: torch.Tensor, y: torch.Tensor) -> float:
     x_flat = x.reshape(-1).to(torch.float32)
     y_flat = y.reshape(-1).to(torch.float32)
     return torch.sqrt(torch.mean((x_flat - y_flat) ** 2)).item()
+
+
+def _fp8_quantize_per_channel(
+    x: torch.Tensor, *, reduceheaddim: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    reduce_dim = -1 if reduceheaddim else -2
+    amax = x.abs().amax(dim=reduce_dim, keepdim=True)
+    scale = finfo.max / amax.clamp(min=1e-12)
+    q = (x * scale).clamp(min=finfo.min, max=finfo.max).to(torch.float8_e4m3fn)
+    scale_inv = scale.float().reciprocal()
+    return q, scale_inv, q.to(torch.float32) * scale_inv
 
 
 def _to_bnhd(x: torch.Tensor, tensor_layout: str) -> torch.Tensor:
@@ -361,6 +372,89 @@ def test_smooth_k_toggle_changes_lse():
     )
 
     assert not torch.allclose(lse_smooth, lse_plain)
+
+
+def test_sageattn_fp8_output_matches_reference():
+    _manual_seed(1001)
+
+    tensor_layout = "HND"
+    qk_quant_dtype = "int8"
+    quant_recipe = (128, 16, -1, 1)
+    q, k, v = _make_inputs(
+        tensor_layout=tensor_layout,
+        batch=1,
+        heads=2,
+        seqlen_q=128,
+        seqlen_kv=1024,
+        headdim=128,
+        dtype=torch.float32,
+    )
+
+    q_ref, k_ref, v_ref = _build_quantized_reference(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        quant_recipe=quant_recipe,
+        qk_quant_dtype=qk_quant_dtype,
+        smooth_k=True,
+    )
+    out_ref, _, _ = attention_ref(q_ref, k_ref, v_ref, causal=False, upcast=True)
+    out_ref = _from_bnhd(out_ref, tensor_layout).to(torch.float32)
+    out_ref_fp8, out_scale_ref, out_ref_dequant = _fp8_quantize_per_channel(
+        out_ref, reduceheaddim=True
+    )
+
+    out_fp8, out_scale = sageattn_qk_int8_pv_fp8_cuda_sm90(
+        q.to(torch.bfloat16).to("musa"),
+        k.to(torch.bfloat16).to("musa"),
+        v.to(torch.bfloat16).to("musa"),
+        tensor_layout=tensor_layout,
+        qk_quant_dtype=qk_quant_dtype,
+        quant_recipe=quant_recipe,
+        fp8_output=True,
+    )
+
+    assert out_fp8.dtype == torch.float8_e4m3fn
+    assert out_scale.dtype == torch.float32
+    torch.testing.assert_close(
+        out_scale.cpu(), out_scale_ref.cpu(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        (out_fp8.to(torch.float32) * out_scale).cpu(),
+        out_ref_dequant.cpu(),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+def test_sageattn_fp8_output_with_lse_tuple_shape():
+    _manual_seed(1002)
+
+    q, k, v = _make_inputs(
+        tensor_layout="HND",
+        batch=1,
+        heads=1,
+        seqlen_q=64,
+        seqlen_kv=256,
+        headdim=128,
+        dtype=torch.bfloat16,
+        device="musa",
+    )
+
+    out_fp8, out_scale, lse = sageattn(
+        q,
+        k,
+        v,
+        tensor_layout="HND",
+        fp8_output=True,
+        return_lse=True,
+    )
+
+    assert out_fp8.dtype == torch.float8_e4m3fn
+    assert out_scale.dtype == torch.float32
+    assert out_scale.shape == (1, 1, 64, 1)
+    assert lse.shape == (1, 1, 64)
 
 
 @pytest.mark.parametrize("headdim", [96, 128])

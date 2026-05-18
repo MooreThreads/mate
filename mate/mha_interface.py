@@ -7,6 +7,7 @@ from .jit.flash_attention_ops import get_flash_attention_ops_module
 from .jit.mla_ops import get_mla_ops_module
 from .jit.attention.fmha import _fmha_get_metadata as jit_fmha_get_metadata  # noqa: F401
 from .jit.attention.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
+from .execution_context import raise_complete_if_dry_run
 
 
 @functools.cache
@@ -30,8 +31,11 @@ def _check_valid_asm_input(
     page_table,
     seqused_q,
     seqused_k,
+    qv,
     window_size,
     learnable_sink,
+    attention_chunk,
+    softcap,
     cp_world_size=1,
 ):
     enable_mubin = True
@@ -68,7 +72,10 @@ def _check_valid_asm_input(
     enable_mubin &= window_size_left is None or window_size_left < 0
     enable_mubin &= window_size_right is None or window_size_right <= 0
 
+    enable_mubin &= qv is None
+    enable_mubin &= softcap == 0.0
     enable_mubin &= learnable_sink is None
+    enable_mubin &= attention_chunk == 0
 
     enable_mubin &= cp_world_size == 1
 
@@ -355,8 +362,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 page_table=page_table,
                 seqused_q=seqused_q,
                 seqused_k=seqused_k,
+                qv=qv,
                 window_size=window_size,
                 learnable_sink=learnable_sink,
+                attention_chunk=attention_chunk,
+                softcap=softcap,
                 cp_world_size=cp_world_size,
             )
 
@@ -414,6 +424,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             )
 
         elif select_backend == "mubin":
+            # In dry run, don't run mubin kernels
+            raise_complete_if_dry_run()
+
             is_varlen = cu_seqlens_q is not None and cu_seqlens_k is not None
 
             window_size_left, window_size_right = window_size
@@ -423,7 +436,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             assert window_size_left is None or window_size_left < 0
             assert window_size_right is None or window_size_right < 0
 
+            assert qv is None
             assert learnable_sink is None
+            assert softcap == 0.0
+            assert attention_chunk == 0
+
+            assert q.dtype in [torch.float16, torch.bfloat16]
+            assert q.dtype == k.dtype and q.dtype == v.dtype
 
             assert page_table is None
 
@@ -803,25 +822,20 @@ def flash_attn_with_kvcache(
 
     rotary_cos: Optional[Tensor]
         Tensor with shape ``(seqlen_ro, rotary_dim / 2)``. If not None, we apply rotary embedding to k and q.
-        Only applicable if k and v are passed in. rotary_dim must be divisible by 16.
-
-        *Not supported now.*
+        Only applicable if k and v are passed in. ``rotary_dim`` must be ``<= headdim`` and divisible by 16.
+        ``rotary_cos`` must be on MUSA and have the same dtype as q.
     rotary_sin: Optional[Tensor]
-        Tensor with shape ``(seqlen_ro, rotary_dim / 2)``. Similar to rotary_cos.
-
-        *Not supported now.*
+        Tensor with shape ``(seqlen_ro, rotary_dim / 2)``. Similar to rotary_cos and must have the same shape and dtype.
     cache_seqlens: Union[int, Tensor]
         The sequence lengths of the KV cache, shape ``(batch_size)`` if it is tensor.
 
     cache_batch_idx: Optional[Tensor]
-        The indices used to index into the KV cache, shape ``(batch_size)``.
+        The int32 indices used to index into the KV cache, shape ``(batch_size,)``.
+        The tensor must be on MUSA and contiguous.
         If the indices are not distinct, and k and v are provided, the values updated in the cache might come from any of the duplicate indices.
-
-        *Not supported now.*
     cache_leftpad: Optional[Tensor]
-        The index that the KV cache starts. If None, assume 0.
-
-        *Not supported now.*
+        The int32 left padding offset where the KV cache starts for each batch, shape ``(batch_size,)``.
+        The tensor must be on MUSA and contiguous. If None, assume 0.
     page_table: Optional[Tensor]
         The page table tensor with shape ``(batch_size, max_num_blocks_per_seq)``
 
@@ -830,6 +844,9 @@ def flash_attn_with_kvcache(
 
     cu_seqlens_k_new: Optional[Tensor]
         The cumulative sequence lengths of the new KV, shape ``(batch_size + 1)``.
+
+    rotary_seqlens: Optional[Tensor]
+        Optional int32 tensor with shape ``(batch_size,)`` used as the rotary position length for each batch.
 
     softmax_scale: Optional[float]
         The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
@@ -846,11 +863,9 @@ def flash_attn_with_kvcache(
         ``logits = softcap * tanh(logits / softcap)`` before the softmax.
         0.0 (default) disables softcapping.
     rotary_interleaved: bool
-        If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
+        If True, rotary embedding uses GPT-J style and combines dimensions 0 & 1, 2 & 3, etc. If False,
         rotary embedding will combine dimensions 0 & rotary_dim / 2, 1 & rotary_dim / 2 + 1
         (i.e. GPT-NeoX style).
-
-        *Not supported now.*
     num_splits: int
         If > 1, split the key/value into this many chunks along the sequence.
         If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
@@ -1001,6 +1016,8 @@ def get_scheduler_metadata(
     pack_gqa=None,  # Can be tuned for speed
     mp_margin=0,  # Can be tuned if some MPs are used for communication):
 ):
+    if window_size is None:
+        window_size = (-1, -1)
     seqused_q = maybe_contiguous(seqused_q)
     seqused_k = maybe_contiguous(seqused_k)
     if headdim_v is None:
@@ -1018,7 +1035,11 @@ def get_scheduler_metadata(
         cu_seqlens_k=cu_seqlens_k,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
-        causal=causal,
+        is_causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        attention_chunk=attention_chunk,
+        leftpad_k=cache_leftpad,
         num_splits=num_splits,
         packgqa=pack_gqa,
         mp_margin=mp_margin,

@@ -3,7 +3,9 @@ from typing import Optional, Tuple, Union
 import torch
 
 from mate.api_logging import mate_api
-from mate.gdn_kernels.tilelang import gdn_prefill as gdn_prefill_tilelang
+from mate.gdn_kernels.tilelang.gdn_chunk_local_cumsum import chunk_local_cumsum
+from mate.gdn_kernels.tilelang.gdn_kkt_solve import kkt_solve
+from mate.gdn_kernels.tilelang.gdn_prefill import fused_chunk_gdn_prefill
 
 
 @mate_api
@@ -39,8 +41,11 @@ def chunk_gated_delta_rule(
             Values of shape ``[total_seq_len, num_v_heads, head_size]``.
             Must be contiguous and on MUSA.
         g (Optional[torch.Tensor]):
-            Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]`` where
+            Multiplicative forget gate (alpha) of shape
+            ``[total_seq_len, num_sab_heads]`` where
             ``num_sab_heads = max(num_q_heads, num_v_heads)``. Must be float32.
+            Values are interpreted as alpha in ``(0, 1]``; the TileLang kernel
+            converts alpha to log space before the local cumulative sum.
             If None, defaults to all ones. Default: ``None``.
         beta (Optional[torch.Tensor]):
             Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
@@ -81,73 +86,95 @@ def chunk_gated_delta_rule(
             ``num_v_heads % num_q_heads == 0``
         - The final state is in k-last layout ``[N, H, V, K]``.
     """
-    assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
 
-    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
-        raise ValueError("q, k, v must be 3D tensors: [total_tokens, heads, dim].")
-    if q.size(0) != k.size(0) or q.size(0) != v.size(0):
-        raise ValueError("q, k, v must have the same total token count.")
-    if q.size(2) != k.size(2):
-        raise ValueError("q and k must have the same dim_k.")
-    num_q_heads = q.size(1)
-    num_k_heads = k.size(1)
-    num_v_heads = v.size(1)
-    is_gqa = num_v_heads == num_k_heads and num_q_heads % num_k_heads == 0
-    is_gva = num_q_heads == num_k_heads and num_v_heads % num_q_heads == 0
-    if not (is_gqa or is_gva):
-        raise ValueError(
-            "Unsupported head configuration. "
-            "Supported: GQA (num_q_heads % num_k_heads == 0 and "
-            "num_v_heads == num_k_heads) or GVA "
-            "(num_q_heads == num_k_heads and "
-            "num_v_heads % num_q_heads == 0)."
-        )
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive.")
+    assert chunk_size == 64, "current implementation only support chunk_size==64"
+    assert q.dtype == k.dtype == v.dtype
+    assert q.dtype != torch.float32, (
+        "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16 or float16."
+    )
+    squeeze_varlen_output = False
 
-    num_seqs = cu_seqlens.size(0) - 1
-    total_seq_len = q.size(0)
-    head_k_size = q.size(2)
-    head_v_size = v.size(2)
-    num_o_heads = max(num_q_heads, num_v_heads)
-    num_sab_heads = num_o_heads
+    if cu_seqlens is not None:
+        if q.ndim == 3:
+            if k.ndim != 3 or v.ndim != 3:
+                raise ValueError(
+                    "q, k, and v must all be 3D tensors with shape [S, N, D] "
+                    "when using `cu_seqlens`."
+                )
+            if g is not None and g.ndim != 2:
+                raise ValueError(
+                    "g must be a 2D tensor with shape [S, N] when using `cu_seqlens`."
+                )
+            if beta is not None and beta.ndim != 2:
+                raise ValueError(
+                    "beta must be a 2D tensor with shape [S, N] when using `cu_seqlens`."
+                )
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+            if g is not None:
+                g = g.unsqueeze(0)
+            if beta is not None:
+                beta = beta.unsqueeze(0)
+            if output is not None:
+                if output.ndim != 3:
+                    raise ValueError(
+                        "output must be a 3D tensor with shape [S, N, D] "
+                        "when using unbatched varlen inputs."
+                    )
+                output = output.unsqueeze(0)
+            squeeze_varlen_output = True
+        elif q.ndim == 4:
+            if q.shape[0] != 1:
+                raise ValueError(
+                    f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+                    f"Please flatten variable-length inputs before processing."
+                )
+        else:
+            raise ValueError(
+                "q must be a 3D tensor with shape [S, N, D] when using `cu_seqlens`."
+            )
+        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
+            )
+
+    assert v.shape[2] % k.shape[2] == 0, (
+        "num_qk_heads must be divisible to num_v_heads."
+    )
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
 
     if use_qk_l2norm_in_kernel:
-        # note: better to do this via a fused kernel.
         q = torch.nn.functional.normalize(q, p=2, dim=-1)
         k = torch.nn.functional.normalize(k, p=2, dim=-1)
 
-    # Allocate output if not provided
-    if output is None:
-        output = torch.empty(
-            (total_seq_len, num_o_heads, head_v_size),
-            dtype=q.dtype,
-            device=q.device,
-        )
-
-    # Allocate output_state if needed
-    if output_state is None:
-        output_state = torch.empty(
-            (num_seqs, num_sab_heads, head_v_size, head_k_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-    gdn_prefill_tilelang.gdn_prefill(
-        output,
-        output_state,
-        q,
-        k,
-        v,
-        cu_seqlens,
-        initial_state,
-        g,
-        beta,
-        scale,
-        chunk_size,
+    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    A = kkt_solve(
+        k=k,
+        b=beta,
+        cu_seqlens=cu_seqlens,
     )
 
-    if output_final_state:
-        return output, output_state
-    else:
-        return output
+    o, _, final_state = fused_chunk_gdn_prefill(
+        q=q,
+        k=k,
+        v=v,
+        a=A,
+        g=g,
+        b=beta,
+        output=output,
+        output_state=output_state,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        output_h=False,
+        output_o=True,
+        cu_seqlens=cu_seqlens,
+    )
+    o = o.to(q.dtype)
+    if squeeze_varlen_output:
+        o = o.squeeze(0)
+    return o, final_state

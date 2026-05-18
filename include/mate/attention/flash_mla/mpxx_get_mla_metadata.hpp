@@ -25,7 +25,25 @@ __global__ void __launch_bounds__(32, 1) get_mla_metadata_kernel(const GetDecodi
 
   int total_num_blocks = 0;
   for (int i = threadIdx.x; i < batch_size; i += 32) {
-    int cur_s_k             = params.topk == -1 ? __ldg(seqlens_k_ptr + i) : params.topk;
+    int cur_s_k = 0;
+    if (params.topk_length_ptr != nullptr) {
+      cur_s_k = max(__ldg(params.topk_length_ptr + i), 0);
+      if (cur_s_k == 0) {
+        cur_s_k = 1;
+      }
+      if (params.extra_topk != -1 || params.extra_topk_length_ptr != nullptr) {
+        cur_s_k = mutlass::ceil_div(cur_s_k, block_size_n) * block_size_n;
+        cur_s_k += params.extra_topk_length_ptr != nullptr ? max(__ldg(params.extra_topk_length_ptr + i), 0)
+                                                           : params.extra_topk;
+      }
+    } else {
+      cur_s_k = params.topk == -1 ? __ldg(seqlens_k_ptr + i) : params.topk;
+      if (params.topk != -1 && (params.extra_topk != -1 || params.extra_topk_length_ptr != nullptr)) {
+        cur_s_k = mutlass::ceil_div(max(cur_s_k, 1), block_size_n) * block_size_n;
+        cur_s_k += params.extra_topk_length_ptr != nullptr ? max(__ldg(params.extra_topk_length_ptr + i), 0)
+                                                           : params.extra_topk;
+      }
+    }
     seqlens_k_shared[i]     = cur_s_k;
     int first_token_idx     = 0;
     int last_token_idx      = max(cur_s_k - 1, 0);

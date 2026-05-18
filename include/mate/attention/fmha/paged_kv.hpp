@@ -97,7 +97,7 @@ struct PagedKVManager {
                  int const                  seqlen_k,
                  int const                  leftpad_k,
                  int const                  thread_idx,
-                 int const                  bidb_kv,
+                 int const                  bidb,
                  int const                  bidh_kv,
                  int                        bidb_kv_idx)
       : ptr_page_table(ptr_page_table),
@@ -111,7 +111,7 @@ struct PagedKVManager {
         leftpad_k(leftpad_k),
         thread_idx(thread_idx),
         page_size_divmod(page_size_divmod) {
-    mPageTable   = make_tensor(make_gmem_ptr(ptr_page_table), shape_page_table, stride_page_table)(bidb_kv, _);
+    mPageTable   = make_tensor(make_gmem_ptr(ptr_page_table), shape_page_table, stride_page_table)(bidb, _);
     mK           = make_tensor(make_gmem_ptr(ptr_K), shape_K, stride_K)(_, _, bidh_kv, _);
     auto shape_V = make_shape(get<0>(shape_K), headdim_v, get<2>(shape_K), get<3>(shape_K));
     mV           = make_tensor(make_gmem_ptr(ptr_V), shape_V, stride_V)(_, _, bidh_kv, _);

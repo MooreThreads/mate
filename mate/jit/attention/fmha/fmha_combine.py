@@ -14,6 +14,7 @@ from .fmha_utils import (
     fmha_extra_include_paths,
     get_fmha_template,
 )
+from ....execution_context import raise_complete_if_dry_run
 
 
 def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
@@ -169,6 +170,9 @@ def _fmha_fwd_combine(
     num_split: int = 0,
     metadata: Optional[torch.Tensor] = None,
 ) -> None:
+    # Exit in dry run because combine is AOT.
+    raise_complete_if_dry_run()
+
     if metadata is None:
         return
 

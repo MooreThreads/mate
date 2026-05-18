@@ -9,12 +9,13 @@ import json
 
 from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
+from ....utils import ceil_div
 from .fmha_utils import (
     FMHA_EXTRA_CUDA_CFLAGS,
     _get_fwd_kernel_config,
-    ceil_div,
     fmha_extra_include_paths,
     get_fmha_template,
+    _resolve_mask,
 )
 from .fmha_combine import _fmha_fwd_combine
 from ...utils import (
@@ -24,42 +25,10 @@ from ...utils import (
     EXPORT_FUNC,
 )
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
+from ....execution_context import raise_complete_if_dry_run, is_fake_mode
 
 
 kern_fwd = get_fmha_template("fwd_kern.j2")
-
-
-def _resolve_mask(
-    seqlen_q,
-    seqlen_k,
-    is_causal,
-    window_size_left,
-    window_size_right,
-    attention_chunk=0,
-):
-    if window_size_left is None or window_size_left >= seqlen_k - 1:
-        window_size_left = -1
-    if window_size_right is None or window_size_right >= seqlen_q - 1:
-        window_size_right = -1
-
-    if is_causal:
-        window_size_right = 0
-
-    is_causal = window_size_left < 0 and window_size_right == 0 and attention_chunk == 0
-    is_local = (
-        window_size_left >= 0 or window_size_right >= 0 or attention_chunk >= 1
-    ) and not is_causal
-
-    # chunk
-    if window_size_left < 0:
-        window_size_left = seqlen_k - 1
-    if window_size_right < 0:
-        window_size_right = seqlen_q - 1
-    if attention_chunk > 0:
-        window_size_left = min(window_size_left, attention_chunk - 1)
-        window_size_right = min(window_size_right, attention_chunk - 1)
-
-    return is_causal, is_local, window_size_left, window_size_right
 
 
 def _fmha_fwd_encode(config: Mapping[str, object]) -> str:
@@ -195,15 +164,17 @@ mode_k = [
         meaningful_if=lambda cfg: bool(cfg["is_append_kv"]),
         depends_on=("is_append_kv",),
     ),
-    ParamSpec(  # NOTE:  Change me when supported.
+    ParamSpec(
         name="has_leftpad_k",
-        domain=[False],
+        domain=[False, True],
         default=False,
     ),
     ParamSpec(  # NOTE:  Change me when supported.
         name="has_kv_batch_idx",
-        domain=[False],
+        domain=[False, True],
         default=False,
+        meaningful_if=lambda cfg: bool(cfg["has_seqused_k"]),
+        depends_on=("has_seqused_k",),
     ),
 ]
 mode_mask = [
@@ -234,6 +205,28 @@ mode_mask = [
         default=False,
         meaningful_if=lambda cfg: bool(cfg["is_local"]),
         depends_on=("is_local",),
+    ),
+]
+mode_rope = [
+    ParamSpec(  # No RoPE in AOT.
+        name="is_rotary",
+        domain=[
+            False,
+        ],
+    ),
+    ParamSpec(  # No RoPE in AOT.
+        name="is_rotary_interleaved",
+        domain=[False, True],
+        default=False,
+        meaningful_if=lambda cfg: bool(cfg["is_rotary"]),
+        depends_on=("is_rotary",),
+    ),
+    ParamSpec(  # No RoPE in AOT.
+        name="has_seqlens_rotary",
+        domain=[False, True],
+        default=False,
+        meaningful_if=lambda cfg: bool(cfg["is_rotary"]),
+        depends_on=("is_rotary",),
     ),
 ]
 score_mode = [
@@ -386,6 +379,7 @@ specs_sel = [
 base_specs.extend(mode_q)
 base_specs.extend(mode_k)
 base_specs.extend(mode_mask)
+base_specs.extend(mode_rope)
 base_specs.extend(score_mode)
 base_specs.extend(specs_attn)
 base_specs.extend(specs_sel)
@@ -477,8 +471,6 @@ def _fmha_fwd(
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
 ):
     # Feature gates.
-    assert leftpad_k is None, "leftpad_k parameter is not supported yet"
-    assert rotary_cos is None, "rotary_cos parameter is not supported yet"
     assert q_v is None, "qv parameter is not supported yet"
     assert attention_chunk == 0, "attention_chunk parameter is not supported yet"
     assert not ((k_new is None) ^ (v_new is None)), (
@@ -535,6 +527,9 @@ def _fmha_fwd(
             learnable_sink,
             k_new,
             v_new,
+            rotary_cos,
+            rotary_sin,
+            leftpad_k,
             kv_batch_idx,
         )
     ), "inputs must be on MUSA device"
@@ -548,13 +543,20 @@ def _fmha_fwd(
             "k_new and v_new must have the same dtype as q, k and v"
         )
 
-    for t in [cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k]:
+    for t in [
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        seqused_k,
+        leftpad_k,
+    ]:
         if t is not None:
             assert t.dtype == torch.int32, (
-                "cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k must be int32"
+                "cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, leftpad_k must be int32"
             )
             assert t.stride(0) == 1, (
-                "cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k must be contiguous"
+                "cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, leftpad_k must be contiguous"
             )
 
     if page_table is not None:
@@ -563,11 +565,20 @@ def _fmha_fwd(
         assert page_table.stride(-1) == 1, "page_table must be contiguous"
 
     if kv_batch_idx is not None:
+        assert kv_batch_idx.is_musa, "kv_batch_idx must be on MUSA device"
         assert kv_batch_idx.dtype == torch.int32, "kv_batch_idx must be int32"
         assert kv_batch_idx.shape == (batch_size,), (
             "kv_batch_idx must have shape (batch_size,)"
         )
         assert kv_batch_idx.stride(0) == 1, "kv_batch_idx must be contiguous"
+
+    if leftpad_k is not None:
+        assert leftpad_k.is_musa, "leftpad_k must be on MUSA device"
+        assert leftpad_k.dtype == torch.int32, "leftpad_k must be int32"
+        assert leftpad_k.shape == (batch_size,), (
+            "leftpad_k must have shape (batch_size,)"
+        )
+        assert leftpad_k.stride(0) == 1, "leftpad_k must be contiguous"
 
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
@@ -629,9 +640,40 @@ def _fmha_fwd(
             assert cu_seqlens_k_new.shape == (batch_size + 1,), (
                 "cu_seqlens_k_new must have shape (batch_size + 1,)"
             )
-            assert cu_seqlens_k_new[-1].item() == total_k_new, (
-                "cu_seqlens_k_new[-1] must equal total_k_new"
+            if not is_fake_mode():
+                assert cu_seqlens_k_new[-1].item() == total_k_new, (
+                    "cu_seqlens_k_new[-1] must equal total_k_new"
+                )
+
+    # RoPE
+    if rotary_cos is not None:
+        assert k_new is not None, (
+            "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided"
+        )
+        assert rotary_sin is not None, (
+            "If rotary cos is provided, rotary sin must also be provided"
+        )
+        rotary_dim = rotary_cos.shape[1] * 2
+        assert rotary_dim <= head_dim, "rotary_dim must be <= headdim"
+        assert rotary_dim % 16 == 0, (
+            "Only rotary dimensions divisible by 16 are currently supported"
+        )
+
+        seqlen_ro = rotary_cos.shape[0]
+        if page_table is not None:
+            assert seqlen_ro >= seqlen_k, (
+                "cos/sin seqlen must be at least the seqlen of KV cache"
             )
+        assert rotary_cos.dtype == rotary_sin.dtype == q.dtype, (
+            "rotary_cos must have the same dtype as query"
+        )
+        assert rotary_cos.shape == rotary_sin.shape == (seqlen_ro, rotary_dim // 2)
+
+        if seqlens_rotary is not None:
+            assert seqlens_rotary.dtype == torch.int32, (
+                "seqlens_rotary must have dtype torch.int32"
+            )
+            assert seqlens_rotary.shape == (batch_size,)
 
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
 
@@ -743,7 +785,7 @@ def _fmha_fwd(
         "has_seqused_k": seqused_k is not None,
         "has_cu_seqlens_k_new": cu_seqlens_k_new is not None,
         "has_kv_batch_idx": kv_batch_idx is not None,
-        "has_leftpad_k": False,
+        "has_leftpad_k": leftpad_k is not None,
         "paged_kv": page_table is not None,
         "has_softcap": softcap != 0.0,
         "is_append_kv": k_new is not None,
@@ -753,7 +795,8 @@ def _fmha_fwd(
         "is_packgqa": enable_packgqa,
         "head_ratio": qhead_per_kvhead,
         "element": dtype_torch2mutlass_map[q.dtype],
-        "force_lsu_kv": page_table is not None and page_size != 64,
+        "force_lsu_kv": (page_table is not None and page_size != 64)
+        or leftpad_k is not None,
         "tile_m": tile_m,
         "tile_n": tile_n,
         "stages_k": stages_k,
@@ -765,11 +808,17 @@ def _fmha_fwd(
         "is_even_headdim": headdim_v_rounded == head_dim_v,
         "has_metadata": scheduler_metadata is not None,
         "enable_cp": cp_world_size > 1,
+        "is_rotary": rotary_cos is not None,
+        "is_rotary_interleaved": is_rotary_interleaved and rotary_cos is not None,
+        "has_seqlens_rotary": seqlens_rotary is not None,
     }
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 
     dispatch_name, mod = _fmha_fwd_module(constexpr_dict)
     fmha_fwd_impl = mod.get_function(dispatch_name)
+
+    # Short-circuit kernel call in fake mode.
+    raise_complete_if_dry_run()
 
     accums, num_splits = fmha_fwd_impl(
         q,
@@ -800,7 +849,7 @@ def _fmha_fwd(
         window_size_right,
         attention_chunk,
         softcap,
-        is_rotary_interleaved,
+        # is_rotary_interleaved,  # Not used
         mp_margin,
         num_splits,
         num_splits_dynamic,

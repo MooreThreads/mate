@@ -76,6 +76,11 @@ def _setup_logger():
 _setup_logger()
 
 
+def get_api_logger() -> logging.Logger:
+    """Return the configured MATE API logger."""
+    return _logger
+
+
 def _get_timestamp() -> str:
     """Get current timestamp in the format [YYYY-MM-DD HH:MM:SS]."""
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -141,6 +146,29 @@ def _read_jsonl_last_record(filepath: Path) -> Optional[Dict[str, Any]]:
 def _get_tensor_size_bytes(tensor: torch.Tensor) -> int:
     """Calculate the size of a tensor in bytes."""
     return tensor.element_size() * tensor.nelement()
+
+
+def _get_tensor_va_range(tensor: torch.Tensor) -> Tuple[int, int]:
+    """Calculate the half-open virtual address range used by a tensor view."""
+    data_ptr = int(tensor.data_ptr())
+    if tensor.numel() == 0:
+        return data_ptr, data_ptr
+
+    min_offset = 0
+    max_offset = 0
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        if size <= 1:
+            continue
+        extent = (int(size) - 1) * int(stride)
+        if extent < 0:
+            min_offset += extent
+        else:
+            max_offset += extent
+
+    element_size = int(tensor.element_size())
+    va_start = data_ptr + min_offset * element_size
+    va_end = data_ptr + max_offset * element_size + element_size
+    return va_start, va_end
 
 
 def _serialize_value(value: Any) -> Any:
@@ -744,6 +772,11 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
         lines.append(f"{indent_str}  stride={tuple(value.stride())}")
         lines.append(f"{indent_str}  dtype={value.dtype}")
         lines.append(f"{indent_str}  device={value.device}")
+        try:
+            va_start, va_end = _get_tensor_va_range(value)
+            lines.append(f"{indent_str}  va_range=[0x{va_start:x}, 0x{va_end:x})")
+        except Exception as e:
+            lines.append(f"{indent_str}  va_range=<unavailable: {e}>")
         lines.append(f"{indent_str}  requires_grad={value.requires_grad}")
         lines.append(f"{indent_str}  is_contiguous={value.is_contiguous()}")
 
@@ -997,8 +1030,9 @@ def mate_api(func: Optional[Callable] = None) -> Callable:
         MATE_LOGLEVEL (int, default: 0):
             - 0: No logging (zero overhead - decorator returns original function)
             - 1: Log function name only (logged BEFORE execution - crash-safe)
-            - 3: Log function name + inputs/outputs with metadata
-            - 5: Log function name + inputs/outputs with metadata + tensor statistics
+            - 3: Log function name + inputs/outputs with metadata,
+                 including tensor shape/stride/dtype/device/VA range
+            - 5: Level 3 logging + tensor statistics
             - 10: Level 5 logging + dump metadata and input/output tensors to disk
                   for reproducibility (preserves stride/contiguity)
 

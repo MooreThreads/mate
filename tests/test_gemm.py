@@ -3,13 +3,14 @@ import torch_musa  # noqa: F401
 import pytest
 
 import mate
+from mate.utils import ceil_div
 from mate.testing.utils import (
     group_quantize_fp8,
     group_dequantize_fp8,
     align,
-    ceil_div,
     check_gemm_sbo_signal,
 )
+from mate.testing import supported_musa_compute_capability
 
 
 def get_ragged_moe_gemm_16bit_cases():
@@ -21,6 +22,7 @@ def get_ragged_moe_gemm_16bit_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_ragged_moe_gemm_16bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
@@ -99,6 +101,7 @@ def get_masked_moe_gemm_16bit_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_masked_moe_gemm_16bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
@@ -185,6 +188,7 @@ def get_ragged_moe_gemm_8bit_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_ragged_moe_gemm_8bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
@@ -297,6 +301,7 @@ def get_masked_moe_gemm_8bit_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_masked_moe_gemm_8bit_cases())
 @pytest.mark.parametrize("n", [128, 4096, 7168])
 @pytest.mark.parametrize("k", [512, 4096, 7168])
@@ -425,6 +430,7 @@ def k_grouped_contig_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ks_per_group", k_grouped_contig_cases())
 @pytest.mark.parametrize("m", [2048, 4096, 7168])
 @pytest.mark.parametrize("n", [2048, 4096, 7168])
@@ -448,8 +454,6 @@ def test_k_grouped_contig_gemm_8bit(
     scale_b_ = []
     d = torch.rand((num_expert, m, n), device="musa", dtype=out_dtype)
     d_ref = d.clone()
-
-    ceil_div = lambda m, n: (m + n - 1) // n
 
     for i in range(num_expert):
         if ks_per_group[i] == 0:
@@ -506,6 +510,7 @@ def test_k_grouped_contig_gemm_8bit(
         )
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ks_per_group", k_grouped_contig_cases())
 @pytest.mark.parametrize("m", [2048, 4096, 7168])
 @pytest.mark.parametrize("n", [2048, 4096, 7168])
@@ -559,6 +564,7 @@ def test_k_grouped_contig_gemm_16bit(
         )
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_ragged_moe_gemm_8bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
@@ -575,8 +581,6 @@ def test_m_contig_gemm_8bit(
 ):
     quant_tile = 128
     scale_granularity_mnk = (1, quant_tile, quant_tile)
-    ceil_div = lambda m, n: (m + n - 1) // n
-
     num_expert = len(ms_per_group)
     m = sum(ms_per_group)
 
@@ -622,6 +626,7 @@ def test_m_contig_gemm_8bit(
     )
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_ragged_moe_gemm_16bit_cases())
 @pytest.mark.parametrize("n", [4096, 6144, 7168])
 @pytest.mark.parametrize("k", [2048, 3072, 7168])
@@ -664,6 +669,7 @@ def test_m_contig_gemm_16bit(
     )
 
 
+@supported_musa_compute_capability([31])
 def test_m_contig_gemm_8bit_zero_k_fills_output():
     num_expert = 2
     m = 8
@@ -691,6 +697,7 @@ def test_m_contig_gemm_8bit_zero_k_fills_output():
     torch.testing.assert_close(out, torch.zeros_like(out))
 
 
+@supported_musa_compute_capability([31])
 def test_m_contig_gemm_16bit_zero_k_fills_output():
     num_expert = 2
     m = 8

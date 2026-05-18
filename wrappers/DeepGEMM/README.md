@@ -10,7 +10,7 @@ This wrapper is intended for projects that already target DeepGEMM-style Python 
 - Import path: `deep_gemm`
 - Runtime backend: MATE GEMM and logits operators on MUSA
 
-The package currently covers grouped GEMM, dense FP8 GEMM, and MQA-logits-related helper APIs.
+The package currently covers grouped GEMM, dense BF16/FP8 GEMM, HyperConnection prenorm GEMM, and MQA logits APIs.
 
 ## Requirements
 
@@ -69,11 +69,13 @@ Import individual APIs:
 
 ```python
 from deep_gemm import (
+    bf16_gemm_nt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
     fp8_gemm_nt,
+    tf32_hc_prenorm_gemm,
     get_paged_mqa_logits_metadata,
     fp8_paged_mqa_logits,
     fp8_mqa_logits,
@@ -81,6 +83,10 @@ from deep_gemm import (
 ```
 
 ## Public APIs
+
+Dense BF16 GEMM:
+
+- `bf16_gemm_nt`
 
 Grouped GEMM:
 
@@ -94,7 +100,11 @@ Dense FP8 GEMM:
 
 - `fp8_gemm_nt`
 
-MQA logits helpers:
+HyperConnection prenorm GEMM:
+
+- `tf32_hc_prenorm_gemm`
+
+MQA logits APIs:
 
 - `get_paged_mqa_logits_metadata`
 - `fp8_paged_mqa_logits`

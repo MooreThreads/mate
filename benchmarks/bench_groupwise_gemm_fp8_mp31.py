@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+from mate.utils import ceil_div
 from mate.testing.utils import (
     bench_gpu_time,
     group_quantize_fp8,
@@ -163,7 +164,6 @@ def bench_k_grouped_contig_fp8_tn_groupwise(
     b_ = []
     scale_a_ = []
     scale_b_ = []
-    ceil_div = lambda m, n: (m + n - 1) // n
     d = torch.rand((num_expert, m, n), device="musa", dtype=out_dtype)
     for i in range(num_expert):
         if ks_per_group[i] == 0:

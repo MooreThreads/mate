@@ -2,31 +2,17 @@ import torch
 import mate
 import pytest
 import random
+from mate.utils import ceil_div
 from mate.testing.utils import (
     align,
     bench_kineto,
-    ceil_div,
     group_quantize_fp8,
     group_dequantize_fp8,
     check_gemm_sbo_signal,
+    calc_diff,
+    count_bytes,
 )
-
-
-def calc_diff(x: torch.Tensor, y: torch.Tensor):
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    return 1 - sim
-
-
-def count_bytes(*tensors):
-    total = 0
-    for t in tensors:
-        if isinstance(t, (tuple, list)):
-            total += count_bytes(*t)
-        elif t is not None:
-            total += t.numel() * t.element_size()
-    return total
+from mate.testing import supported_musa_compute_capability
 
 
 def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
@@ -124,6 +110,7 @@ def ref_fp8_paged_mqa_logits(
     return logits
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("batch_size, next_n", [(64, 1), (64, 4), (64, 2), (128, 1)])
 @pytest.mark.parametrize("avg_kv", [8192, 32768])
 @pytest.mark.parametrize("is_context_lens_2d", [False, True])
@@ -280,6 +267,7 @@ def get_deepgemm_group_gemm_contig_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_deepgemm_group_gemm_contig_cases())
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("k", [2048])
@@ -339,6 +327,7 @@ def test_m_grouped_fp8_gemm_nt_contiguous(
     torch.testing.assert_close(d.to(torch.float), ref_d, rtol=5e-3, atol=5e-3)
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_deepgemm_group_gemm_contig_cases())
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("k", [2048])
@@ -383,6 +372,7 @@ def get_m_grouped_gemm_nt_masked_cases():
     ]
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_m_grouped_gemm_nt_masked_cases())
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("k", [4096])
@@ -481,8 +471,8 @@ def kv_cache_cast_to_fp8_for_nonpaged(kv: torch.Tensor, block_size: int = 64):
 
 
 def generate_cp_test_data(seq_len, seq_len_kv, device):
-    assert seq_len % 2 == 0
-    chunk_size = seq_len // 2
+    chunk_size0 = seq_len // 2
+    chunk_size1 = seq_len - chunk_size0
 
     ks = torch.zeros(seq_len, dtype=torch.int32, device=device)
     ke = torch.empty(seq_len, dtype=torch.int32, device=device)
@@ -490,15 +480,16 @@ def generate_cp_test_data(seq_len, seq_len_kv, device):
     base0 = seq_len_kv // 3
     base1 = (seq_len_kv * 2) // 3
 
-    t = torch.arange(chunk_size, dtype=torch.int32, device=device)
-    ke0 = base0 + t
-    ke1 = base1 + t
+    t0 = torch.arange(chunk_size0, dtype=torch.int32, device=device)
+    t1 = torch.arange(chunk_size1, dtype=torch.int32, device=device)
+    ke0 = base0 + t0
+    ke1 = base1 + t1
 
     ke0 = ke0.clamp(min=0, max=seq_len_kv)
     ke1 = ke1.clamp(min=0, max=seq_len_kv)
 
-    ke[:chunk_size] = ke0
-    ke[chunk_size:] = ke1
+    ke[:chunk_size0] = ke0
+    ke[chunk_size0:] = ke1
     return ks, ke
 
 
@@ -569,11 +560,12 @@ def ref_fp8_mqa_logits(
     return logits, cost
 
 
-@pytest.mark.parametrize("seq_q", [2048, 4096])
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("seq_q", [613, 2049, 3889])
 @pytest.mark.parametrize("compressed_logits", [True, False])
 @pytest.mark.parametrize(
     "seq_kv",
-    [4000, 8192],
+    [4001, 4096],
 )
 @pytest.mark.parametrize("disable_cp", [False, True])
 def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
@@ -720,6 +712,7 @@ def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
         )
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("ms_per_group", get_m_grouped_gemm_nt_masked_cases())
 @pytest.mark.parametrize("n", [4096])
 @pytest.mark.parametrize("k", [4096])

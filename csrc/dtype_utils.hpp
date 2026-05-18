@@ -50,6 +50,11 @@ inline bool is_bf16_or_fp16_dtype(DLDataType dtype) {
   return code == float16_code || code == bfloat16_code;
 }
 
+inline bool is_bf16_or_fp16_or_fp32_dtype(DLDataType dtype) {
+  const int64_t code = encode_dlpack_dtype(dtype);
+  return code == float16_code || code == bfloat16_code || code == float32_code;
+}
+
 inline bool is_fp8_dtype(DLDataType dtype) {
   const int64_t code = encode_dlpack_dtype(dtype);
   return code == float8_e4m3fn_code || code == float8_e5m2_code;

@@ -1,3 +1,5 @@
+
+
 #pragma once
 
 #include <mutex>
@@ -5,31 +7,37 @@
 #include <unordered_map>
 
 #include "dtype_utils.hpp"
+// #include "mp31_sage_attention_mubin.hpp"
 #include "mp31_sage_attention_mubin.hpp"
-
 #define STRING(s) #s
 #define STRINGIFY(a) STRING(a)
-#define REGISTER_SAGE_FA_ASM_KERNEL(IS_CAUSAL, DTYPE, HEADDIM_QK, IS_KV_CACHE, QUANT_MODE, IS_QK_INT8, KERN_NAME) \
-  {                                                                                                               \
-    auto           fa_id = FlashAttenAsmID{IS_CAUSAL, 0, DTYPE, HEADDIM_QK, IS_KV_CACHE, QUANT_MODE, IS_QK_INT8}; \
-    unsigned char* ptr   = KERN_NAME;                                                                             \
-    std::pair<unsigned char*, const char*> p = std::make_pair(ptr, STRINGIFY(KERN_NAME));                         \
-    fa_asm_kern_registry[fa_id]              = p;                                                                 \
+#define REGISTER_FA_ASM_KERNEL(                                                                                    \
+    IS_CAUSAL, IS_VARLEN, DTYPE, HEADDIM_QK, IS_KV_CACHE, QUANT_MODE, IS_QK_INT8, FP8_OUTPUT, KERN_NAME)           \
+  {                                                                                                                \
+    auto fa_id =                                                                                                   \
+        FlashAttenAsmID{IS_CAUSAL, IS_VARLEN, DTYPE, HEADDIM_QK, IS_KV_CACHE, QUANT_MODE, IS_QK_INT8, FP8_OUTPUT}; \
+    unsigned char*                         ptr = KERN_NAME;                                                        \
+    std::pair<unsigned char*, const char*> p   = std::make_pair(ptr, STRINGIFY(KERN_NAME));                        \
+    fa_asm_kern_registry[fa_id]                = p;                                                                \
   }
 
 struct FlashAttenAsmID {
   int is_causal;
   int is_varlen;
+
   int dtype;
+
   int headdim_qk;
+
   int is_kv_cache;
   int quant_mode;
   int is_qk_int8;
+  int fp8_output{};
 
   bool operator==(const FlashAttenAsmID& other) const {
     return is_causal == other.is_causal && is_varlen == other.is_varlen && dtype == other.dtype &&
            headdim_qk == other.headdim_qk && is_kv_cache == other.is_kv_cache && quant_mode == other.quant_mode &&
-           is_qk_int8 == other.is_qk_int8;
+           is_qk_int8 == other.is_qk_int8 && fp8_output == other.fp8_output;
   }
 };
 
@@ -39,7 +47,7 @@ struct std::hash<FlashAttenAsmID> {
     return static_cast<std::size_t>(id.is_causal) | static_cast<std::size_t>(id.is_varlen) << 1 |
            static_cast<std::size_t>(id.dtype) << 2 | static_cast<std::size_t>(id.headdim_qk) << 3 |
            static_cast<std::size_t>(id.is_kv_cache) << 4 | static_cast<std::size_t>(id.quant_mode) << 5 |
-           static_cast<std::size_t>(id.is_qk_int8) << 9;
+           static_cast<std::size_t>(id.is_qk_int8) << 9 | static_cast<std::size_t>(id.fp8_output) << 10;
   }
 };
 
@@ -70,75 +78,807 @@ static std::once_flag                               fa_asm_kern_registry_init_fl
 
 inline void init_fa_asm_kern_registry() {
   std::call_once(fa_asm_kern_registry_init_flag, []() {
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 0, 0, e4m3tce_flash_atten_quant_mode_0_512_256x128x128)
+    // clang-format off
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 1, 0, e4m3tce_flash_atten_quant_mode_1_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      0,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 2, 0, e4m3tce_flash_atten_quant_mode_2_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      0,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 6, 0, e4m3tce_flash_atten_quant_mode_6_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      0,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 7, 0, e4m3tce_flash_atten_quant_mode_7_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      0,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(1, 2, 0, 0, 0, 0, e4m3tce_flash_atten_quant_mode_0_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      1,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(1, 2, 0, 0, 1, 0, e4m3tce_flash_atten_quant_mode_1_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      1,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(1, 2, 0, 0, 2, 0, e4m3tce_flash_atten_quant_mode_2_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      1,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(1, 2, 0, 0, 6, 0, e4m3tce_flash_atten_quant_mode_6_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      1,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(1, 2, 0, 0, 7, 0, e4m3tce_flash_atten_quant_mode_7_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      2,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 1, 0, 0, e4m3tce_flash_atten_quant_mode_0_512_256x128x128_kvcache)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      2,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 1, 1, 0, e4m3tce_flash_atten_quant_mode_1_512_256x128x128_kvcache)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 1, 2, 0, e4m3tce_flash_atten_quant_mode_2_512_256x128x128_kvcache)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      2,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 1, 6, 0, e4m3tce_flash_atten_quant_mode_6_512_256x128x128_kvcache)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      6,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 1, 0, 0, e4m3tce_flash_atten_quant_mode_0_512_256x128x128_kvcache_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      6,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 1, 1, 0, e4m3tce_flash_atten_quant_mode_1_512_256x128x128_kvcache_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      6,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_kvcache_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 1, 2, 0, e4m3tce_flash_atten_quant_mode_2_512_256x128x128_kvcache_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      1,
+      6,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_kvcache_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 1, 6, 0, e4m3tce_flash_atten_quant_mode_6_512_256x128x128_kvcache_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      0,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 0, 1, e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      0,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 1, 1, e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 2, 1, e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 6, 1, e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      1,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(0, 2, 0, 0, 7, 1, e4m3tce_flash_atten_qk_int8_quant_mode_7_512_256x128x128)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      1,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 0, 0, 1, e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      1,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 0, 1, 1, e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      1,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 0, 2, 1, e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      2,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_causal_persistence_fp8out
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 0, 6, 1, e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_causal_persistence)
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      2,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_causal_persistence
+    )
 
-    REGISTER_SAGE_FA_ASM_KERNEL(
-        1, 2, 0, 0, 7, 1, e4m3tce_flash_atten_qk_int8_quant_mode_7_512_256x128x128_causal_persistence)
-  });
-}
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      2,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_causal_persistence_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      2,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      6,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_causal_persistence_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      6,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      6,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_causal_persistence_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      6,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      7,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_7_512_256x128x128_causal_persistence_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      7,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_7_512_256x128x128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      7,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_7_512_256x128x128_causal_persistence_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      1, 0,
+      2,
+      0,
+      0,
+      7,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_7_512_256x128x128_causal_persistence
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      0,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      0,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      0,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      0,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      1,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      1,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      1,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      1,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      2,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      2,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      2,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      2,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      6,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      6,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      6,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_kvcache_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      1,
+      6,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_kvcache
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      0,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      0,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_0_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_0_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      1,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      1,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_1_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      1,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      1,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_1_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      2,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      2,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_2_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      2,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      2,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_2_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      6,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      6,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_6_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      6,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      6,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_6_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      7,
+      1,
+      1,
+      e4m3tce_flash_atten_qk_int8_quant_mode_7_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      7,
+      1,
+      0,
+      e4m3tce_flash_atten_qk_int8_quant_mode_7_512_256x128x128
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      7,
+      0,
+      1,
+      e4m3tce_flash_atten_quant_mode_7_512_256x128x128_fp8out
+    )
+
+    REGISTER_FA_ASM_KERNEL(
+      0, 0,
+      2,
+      0,
+      0,
+      7,
+      0,
+      0,
+      e4m3tce_flash_atten_quant_mode_7_512_256x128x128
+    )
+
+    // clang-format on
+  });  // call_once
+
+}  // init_fa_asm_kern_registry
 
 }  // namespace
 
 #undef STRING
 #undef STRINGIFY
-#undef REGISTER_SAGE_FA_ASM_KERNEL
+#undef REGISTER_FA_ASM_KERNEL

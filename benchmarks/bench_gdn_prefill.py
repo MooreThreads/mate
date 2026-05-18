@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from mate.gdn_prefill import chunk_gated_delta_rule
 from mate.testing.utils import bench_kineto
 
-
 HEAD_CONFIGS = [
     # (h_qk, h_v, d, label)
     # Qwen3.5-397B and 122B (h_k=16, h_v=64, d=128) under different TP
@@ -51,7 +50,6 @@ def bench_mate(
     h_qk: int,
     h_v: int,
     d: int,
-    chunk_size: int,
     dtype: torch.dtype,
     num_tests: int,
 ) -> float:
@@ -62,60 +60,57 @@ def bench_mate(
 
     cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int32, device=device)
 
-    q = torch.randn((total_tokens, h_qk, d), dtype=dtype, device=device)
+    q = torch.randn((1, total_tokens, h_qk, d), dtype=dtype, device=device)
     k = F.normalize(
-        torch.randn((total_tokens, h_qk, d), dtype=torch.float32, device=device),
+        torch.randn((1, total_tokens, h_qk, d), dtype=torch.float32, device=device),
         p=2,
         dim=-1,
     ).to(dtype)
-    v = torch.randn((total_tokens, h_v, d), dtype=dtype, device=device)
+    v = torch.randn((1, total_tokens, h_v, d), dtype=dtype, device=device)
     alpha = torch.exp(
-        -torch.rand(total_tokens, head_o, dtype=torch.float32, device=device)
+        -torch.rand(1, total_tokens, head_o, dtype=torch.float32, device=device)
     )
     beta = torch.sigmoid(
-        torch.randn(total_tokens, head_o, dtype=torch.float32, device=device)
+        torch.randn(1, total_tokens, head_o, dtype=torch.float32, device=device)
     )
     h0 = torch.randn((num_seqs, head_o, d, d), dtype=torch.float32, device=device)
-    out = torch.empty((total_tokens, head_o, d), dtype=dtype, device=device)
-    state_out = torch.empty_like(h0)
+
+    run = lambda: chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=alpha,
+        beta=beta,
+        scale=None,
+        initial_state=h0,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+    )
+    kernel_names = (
+        "tilelang_chunk_local_cumsum_kernel_kernel",
+        "tilelang_kkt_solve_kernel_kernel",
+        "tilelang_fused_chunk_gdn_prefill_kernel_",
+    )
 
     kernel_times = bench_kineto(
-        lambda: chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=alpha,
-            beta=beta,
-            scale=None,
-            initial_state=h0,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-            chunk_size=chunk_size,
-            output=out,
-            output_state=state_out,
-        ),
-        kernel_names=(
-            "fused_prepare_compute_w_u_kernel",
-            "h_recurrence_kernel",
-            "output_o_kernel",
-        ),
+        run,
+        kernel_names=kernel_names,
         num_tests=num_tests,
         suppress_kineto_output=True,
         flush_l2=True,
         with_multiple_kernels=True,
     )
-    return float(np.sum(np.asarray(kernel_times, dtype=np.float64)))
+    return float(np.sum(np.asarray(kernel_times, dtype=np.float64))) * 1e3
 
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark mate.gdn_prefill")
-    parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument(
         "--num-tests",
         type=int,
         default=10,
-        help="Number of profiling iterations for bench_kineto",
+        help="Number of timing iterations",
     )
     parser.add_argument(
         "--dtype",
@@ -133,7 +128,7 @@ def main():
 
     print(f"\nMUSA: {torch.musa.get_device_name(0)}")
     print("Kernel: mate.gdn_prefill.chunk_gated_delta_rule")
-    print(f"chunk_size={args.chunk_size}, dtype={args.dtype}")
+    print(f"dtype={args.dtype}")
     print()
 
     header = (
@@ -151,7 +146,6 @@ def main():
                 h_qk=h_qk,
                 h_v=h_v,
                 d=d,
-                chunk_size=args.chunk_size,
                 dtype=dtype,
                 num_tests=args.num_tests,
             )

@@ -77,8 +77,8 @@ struct PackGQAManager {
     for (int m = 0; m < size<1>(tQsQ); ++m) {
       int const row = row_base + get<0>(tQcQ_m(m));
 
-      Element const *ptrQ = reinterpret_cast<Element const *>(__shfl_sync(
-          0xffffffff, reinterpret_cast<uint64_t>(rPtr(m / GmemThreadPerRow)), m % GmemThreadPerRow, GmemThreadPerRow));
+      Element const *ptrQ = (Element *)__musa_ptr_gen_to_global((void *)(__shfl_sync(
+          0xffffffff, reinterpret_cast<uint64_t>(rPtr(m / GmemThreadPerRow)), m % GmemThreadPerRow, GmemThreadPerRow)));
 
       Tensor gQ_n   = make_tensor(make_gmem_ptr(ptrQ), Shape<Int<HeadDim>>{});
       Tensor tQgQ_n = tiled_divide(gQ_n, Shape<Int<GmemElemsPerLoad>>{});

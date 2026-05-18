@@ -61,6 +61,7 @@ struct FmhaFwdKernelWarpSpecialized {
   using SeqlenInfo = typename CollectiveMainloop::SeqlenInfo;
 
   using NamedBarrier = mutlass::arch::AsyncBarrier;
+  using Element      = typename CollectiveMainloop::Element;
 
   struct MUTE_ALIGNAS(1) BarrierStorage {
     uint8_t NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::NumFwdNamedBarriers)];
@@ -177,8 +178,10 @@ struct FmhaFwdKernelWarpSpecialized {
     pipeline_params_k_new.num_consumers     = NumQKMmaWarps;
     MainloopPipelineKVNew      pipeline_k_new(pipeline_params_k_new,
                                          reinterpret_cast<uint64_t>(&barrier_storage->PipelineKNew));
-    MainloopPipelineKVNewState mainloop_pipe_write_new = mutlass::make_producer_start_state<MainloopPipelineKVNew>();
-    MainloopPipelineKVNewState mainloop_pipe_read_new;
+    MainloopPipelineKVNewState mainloop_pipe_kv_new_producer_state;
+    // MainloopPipelineKVNewState mainloop_pipe_kv_new_producer_state =
+    // mutlass::make_producer_start_state<MainloopPipelineKVNew>();
+    MainloopPipelineKVNewState mainloop_pipe_kv_new_consumer_state;
 
     MainloopPipelineKVNewParams pipeline_params_v_new;
     pipeline_params_v_new.transaction_bytes = CollectiveMainloop::TmeTransactionBytesV;
@@ -186,12 +189,20 @@ struct FmhaFwdKernelWarpSpecialized {
     MainloopPipelineKVNew pipeline_v_new(pipeline_params_v_new,
                                          reinterpret_cast<uint64_t>(&barrier_storage->PipelineVNew));
 
-    NamedBarrier consumer_sync(reinterpret_cast<uint64_t>(&barrier_storage->ConsumerSync));
+    NamedBarrier barrier_kv(
+        reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::BarrierKV)]));
     NamedBarrier appendkv(
         reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::AppendKV)]));
+    NamedBarrier rotary_q(
+        reinterpret_cast<uint64_t>(&barrier_storage->NamedBarriers[static_cast<int32_t>(FwdNamedBarriers::RotaryQ)]));
     if (warp_idx == 0) {
-      consumer_sync.init(NumQKMmaWarps);            // QK Warps == PV Warps
+      if constexpr (IsAppendKV) {
+        barrier_kv.init(NumLoadWarps + NumQKMmaWarps);  // QK Warps == PV Warps
+      } else {
+        barrier_kv.init(NumQKMmaWarps);
+      }
       appendkv.init(NumLoadWarps + NumQKMmaWarps);  // QK Warps == PV Warps
+      rotary_q.init(NumQKMmaWarps);                 // QK Warps == PV Warps
     }
 
     CollectiveMainloop mainloop;
@@ -243,17 +254,18 @@ struct FmhaFwdKernelWarpSpecialized {
             params.mainloop.cu_seqlens_k_new /* cu_seqlens_k_new */,
             params.mainloop.seqused_q /* seqused_q */,
             params.mainloop.seqused_k /* seqused_k */,
-            // params.mainloop.ptr_leftpad_k /* ptr_leftpad_k */,
-            // params.mainloop.seqlens_rotary /* seqlens_rotary */,
+            params.mainloop.leftpad_k /* ptr_leftpad_k */,
+            params.mainloop.seqlens_rotary /* seqlens_rotary */,
             params.mainloop.cp_world_size /* cp_world_size */,
             params.mainloop.cp_rank /* cp_rank */,
             params.mainloop.cp_tot_seqused_k /* cp_tot_seqused_k */};
 
         if constexpr (IsAppendKV) {
+          barrier_kv.sync();
           bool is_valid_new = mainloop.load_kv_new(params.mainloop,
                                                    pipeline_k_new,
                                                    pipeline_v_new,
-                                                   mainloop_pipe_write_new,
+                                                   mainloop_pipe_kv_new_producer_state,
                                                    shared_storage,
                                                    seqlen_info,
                                                    block_coord,
@@ -285,6 +297,8 @@ struct FmhaFwdKernelWarpSpecialized {
       auto state_k = mainloop_pipe_k_consumer_state;
       auto state_v = mainloop_pipe_v_consumer_state;
 
+      auto state_kv_new = mainloop_pipe_kv_new_consumer_state;
+
       MUTE_UNROLL
       for (int i = 0; i < StagesQ; ++i) {
         pipeline_q.consumer_release(state_q);
@@ -299,6 +313,14 @@ struct FmhaFwdKernelWarpSpecialized {
       for (int i = 0; i < StagesV; ++i) {
         pipeline_v.consumer_release(state_v);
         ++state_v;
+      }
+      if constexpr (IsAppendKV) {
+        MUTE_UNROLL
+        for (int i = 0; i < StagesK; ++i) {
+          pipeline_k_new.consumer_release(state_kv_new);
+          pipeline_v_new.consumer_release(state_kv_new);
+          ++state_kv_new;
+        }
       }
 
       // Consumer
@@ -323,6 +345,17 @@ struct FmhaFwdKernelWarpSpecialized {
         }
         auto block_coord = make_shape(block_idx, head_idx, batch_idx, split_idx);
 
+        // if (threadIdx.x == 128) {
+        //   printf("MP[%2d], tile %d, bidm=%d, bidb=%d, bidh=%d, bids=%d, num_splits=%d\n",
+        //          blockIdx.x,
+        //          work_tile_info.tile_idx,
+        //          block_idx,
+        //          batch_idx,
+        //          head_idx,
+        //          split_idx,
+        //          num_splits);
+        // }
+
         SeqlenInfo seqlen_info{
             static_cast<uint32_t>(get<2>(block_coord)) /* batch_idx */,
             static_cast<uint32_t>(get<0>(params.mainloop.shape_Q)) /* seqlen_q_static */,
@@ -335,23 +368,25 @@ struct FmhaFwdKernelWarpSpecialized {
             params.mainloop.cu_seqlens_k_new /* cu_seqlens_k_new */,
             params.mainloop.seqused_q /* seqused_q */,
             params.mainloop.seqused_k /* seqused_k */,
-            // params.mainloop.ptr_leftpad_k /* ptr_leftpad_k */,
-            // params.mainloop.seqlens_rotary /* seqlens_rotary */,
+            params.mainloop.leftpad_k /* ptr_leftpad_k */,
+            params.mainloop.seqlens_rotary /* seqlens_rotary */,
             params.mainloop.cp_world_size /* cp_world_size */,
             params.mainloop.cp_rank /* cp_rank */,
             params.mainloop.cp_tot_seqused_k /* cp_tot_seqused_k */};
 
+        barrier_kv.sync();
         if constexpr (IsAppendKV) {
           bool is_valid_new = mainloop.store_kv_new(params.mainloop,
                                                     pipeline_k_new,
                                                     pipeline_v_new,
-                                                    mainloop_pipe_read_new,
+                                                    mainloop_pipe_kv_new_consumer_state,
                                                     threadIdx.x - MmaThreadOffset,
                                                     shared_storage,
                                                     seqlen_info,
                                                     block_coord,
                                                     num_splits);
           if (is_valid_new) {
+            __threadfence();
             named_barrier_arrive(static_cast<uint32_t>(FwdNamedBarriers::AppendKV));
           }
         }
@@ -402,7 +437,7 @@ struct FmhaFwdKernelWarpSpecialized {
             do_store(/* StoreZero */ mute::false_type{}, /* SplitKV */ mute::false_type{});
           }
         }
-        consumer_sync.sync();
+        // barrier_kv.sync();
       }
     }
   }

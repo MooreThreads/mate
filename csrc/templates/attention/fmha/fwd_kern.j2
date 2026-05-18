@@ -46,7 +46,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const window_size_right,
   int const attention_chunk,
   float const softcap,
-  bool const is_rotary_interleaved,
+  // bool const is_rotary_interleaved,  // Not used
   int const mp_margin,
   int const num_splits,
   ffi::Optional<ffi::TensorView> num_splits_dynamic,
@@ -76,6 +76,9 @@ ffi::Array<ffi::Any> {{ func_name }} (
   constexpr bool IsLocal = {{ 'true' if is_local else 'false' }};
   constexpr int HeadRatio = {{ head_ratio }};
   constexpr bool ForceLsuKV = {{ 'true' if force_lsu_kv else 'false' }};
+  constexpr bool IsRotary = {{ 'true' if is_rotary else 'false' }};
+  constexpr bool IsRotaryInterleaved = {{ 'true' if is_rotary_interleaved else 'false' }};
+  constexpr bool HasSeqlensRotary = {{ 'true' if has_seqlens_rotary else 'false' }};
 
   constexpr int TileM = {{ tile_m }};
   constexpr int TileN = {{ tile_n }};
@@ -115,6 +118,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          HasKvBatchIdx,
                                                          HasSequsedQ,
                                                          HasSequsedK,
+                                                         HasLeftpadK,
                                                          PagedKV,
                                                          ForceLsuKV,
                                                          IsCausal,
@@ -125,6 +129,9 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          HeadRatio,
                                                          IsPackGQA,
                                                          IsSplit /*Split*/,
+                                                         IsRotary,
+                                                         IsRotaryInterleaved,
+                                                         HasSeqlensRotary,
                                                          EnableCP,
                                                          NumPVConsumers>;
   using CollectiveEpilogue =
@@ -171,7 +178,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const seqlen_k_new = !IsAppendKV ? 0 : (!is_varlen_k_new ? static_cast<int>(k_new.value().size(1)) : 0);
   int const total_k_new = !IsAppendKV ? 0 : (!is_varlen_k_new ? batch_size * static_cast<int>(k_new.value().size(1))
                                                                 : static_cast<int>(k_new.value().size(0)));
-  int mp_count = mutlass::KernelHardwareInfo::query_device_multiprocessor_count() - mp_margin;
+  int mp_count = mutlass::KernelHardwareInfo::query_device_multiprocessor_count();
+  int num_mp = mp_count - mp_margin;
 
   // Set Params
   mate::attention::fmha::FmhaFwdParams params {
@@ -216,6 +224,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .d_rounded = headdim_rounded,
     .dv = headdim_v,
     .dv_rounded = headdim_v_rounded,
+    .rotary_dim = IsRotary ? static_cast<int>(rotary_cos.value().size(1) * 2) : 0,
 
     .b_k = HasKvBatchIdx ? static_cast<int>(PagedKV ? page_table.value().size(0) : k.size(0)) : batch_size,
 
@@ -226,6 +235,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .cu_seqlens_q = HasCuseqlensQ ? static_cast<uint32_t*>(cu_seqlens_q.value().data_ptr()) : nullptr,
     .cu_seqlens_k = HasCuseqlensK ? static_cast<uint32_t*>(cu_seqlens_k.value().data_ptr()) : nullptr,
     .cu_seqlens_knew = is_varlen_k_new ? static_cast<uint32_t*>(cu_seqlens_k_new.value().data_ptr()) : nullptr,
+    .leftpad_k = HasLeftpadK ? static_cast<uint32_t*>(leftpad_k.value().data_ptr()) : nullptr,
     .seqused_q = HasSequsedQ ? static_cast<uint32_t*>(seqused_q.value().data_ptr()) : nullptr,
     .seqused_k = HasSequsedK ? static_cast<uint32_t*>(seqused_k.value().data_ptr()) : nullptr,
 
@@ -238,6 +248,18 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .vnew_row_stride = IsAppendKV ? v_new.value().stride(-3) : 0,
     .knew_head_stride = IsAppendKV ? k_new.value().stride(-2) : 0,
     .vnew_head_stride = IsAppendKV ? v_new.value().stride(-2) : 0,
+
+    // Qv
+    // .qv_ptr
+    // .qv_batch_stride
+    // .qv_row_stride
+    // .qv_head_stride
+
+    // Rotary
+    .rotary_cos_ptr = IsRotary ? (rotary_cos.value().data_ptr()) : nullptr,
+    .rotary_sin_ptr = IsRotary ? (rotary_sin.value().data_ptr()) : nullptr,
+    .seqlens_rotary = IsRotary && HasSeqlensRotary ? static_cast<uint32_t*>(seqlens_rotary.value().data_ptr()) : nullptr,
+
     .kv_batch_idx = HasKvBatchIdx ? static_cast<uint32_t*>(kv_batch_idx.value().data_ptr()) : nullptr,
 
     // Learnable Sink
@@ -249,13 +271,14 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .page_size = page_size,
     .num_pages = num_pages,
 
-    .num_mp = mp_count,
+    .num_mp = num_mp,
     .num_splits = num_split,
     .num_splits_dynamic_ptr = HasMetadata ? static_cast<int*>(num_splits_dynamic.value().data_ptr()) : nullptr,
     .batch_table_ptr = HasMetadata ? static_cast<int*>(batch_table.value().data_ptr()) : nullptr,
 
     .is_causal = IsCausal,
     .is_local = IsLocal,
+    .is_rotary_interleaved = IsRotaryInterleaved,
     .window_size_left = window_size_left,
     .window_size_right = window_size_right,
   };
@@ -323,7 +346,18 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .stride_K_new = {params.knew_row_stride, _1{}, params.knew_head_stride, HasCuseqlensKNew ? 0 : params.knew_batch_stride},
     .ptr_V_new = static_cast<Element const*>(params.vnew_ptr),
     .stride_V_new = {params.vnew_row_stride, _1{}, params.vnew_head_stride, HasCuseqlensKNew ? 0 : params.vnew_batch_stride},
+
+    // QV
+    // .ptr_Qv = ,
+    // .stride_Qv = ,
+
     // Rotary
+    .ptr_rotary_cos = static_cast<Element const*>(params.rotary_cos_ptr),
+    .shape_rotary = {params.seqlen_k, params.rotary_dim / 2},
+    .stride_rotary_cos = {params.rotary_dim / 2, _1{}},
+    .ptr_rotary_sin = static_cast<Element const*>(params.rotary_sin_ptr),
+    .stride_rotary_sin = {params.rotary_dim / 2, _1{}},
+    // .is_rotary_interleaved = params.is_rotary_interleaved,  // Not used.
 
     // PageTable Args
     .ptr_pagetable = params.page_table,
@@ -349,6 +383,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .cu_seqlens_k_new = static_cast<uint32_t const*>(params.cu_seqlens_knew),
     .seqused_q = static_cast<uint32_t const*>(params.seqused_q),
     .seqused_k = static_cast<uint32_t const*>(params.seqused_k),
+    .leftpad_k = static_cast<uint32_t const*>(params.leftpad_k),
+    .seqlens_rotary = static_cast<uint32_t const*>(params.seqlens_rotary),
 
     // CP params
     .cp_world_size    = cp_world_size,

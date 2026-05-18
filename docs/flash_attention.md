@@ -9,6 +9,8 @@ This document is a quick reference for the current FlashAttention-3-compatible *
 | Q Mode | ✅ Supported | `Normal`, `Ragged`, `Padded` |
 | KV Mode | ✅ Supported | `Normal`, `Ragged`, `Padded`, `Paged` |
 | Append New KV | ✅ Supported | `flash_attn_with_kvcache` appends via `k` / `v`; packed new KV is supported via `cu_seqlens_k_new` |
+| RoPE Input | ✅ Supported | `flash_attn_with_kvcache` supports `rotary_cos` / `rotary_sin`, `Interleaved`, and `Non-interleaved` |
+| Cache Index Options | ✅ Supported | `cache_batch_idx`, `cache_leftpad` |
 | Mask Mode | ⚠️ Partially supported | `None`, `Causal`, `Local`; `Local + attention_chunk` is not supported |
 | Score Mode | ✅ Supported | Standard softmax and `softcap` |
 | Page Size | ✅ Supported | `1`, `16`, `64`, and arbitrary page sizes |
@@ -28,8 +30,6 @@ This document is a quick reference for the current FlashAttention-3-compatible *
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| RoPE Input | ❌ Not supported | `Interleaved`, `Non-interleaved` |
-| Cache Index Options | ❌ Not supported | `cache_batch_idx`, `cache_leftpad` |
 | Chunked Attention | ❌ Not supported | `attention_chunk > 0` |
 | Standard FMHA FP8 Input | ❌ Not supported | Forward FMHA path only |
 
@@ -37,4 +37,5 @@ This document is a quick reference for the current FlashAttention-3-compatible *
 
 - This page summarizes the compatibility surface, not every internal kernel detail.
 - The statement `Any headdim <= 512` refers to the supported forward-path head-dimension range.
+- RoPE is supported only when appending new KV through `k` / `v`; `rotary_dim` must be `<= headdim` and divisible by 16.
 - For wrapper-level usage, see the `flash_attn_3` wrapper at [../wrappers/flash-attention/README.md](../wrappers/flash-attention/README.md).

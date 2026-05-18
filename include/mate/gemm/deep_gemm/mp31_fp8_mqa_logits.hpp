@@ -12,6 +12,12 @@ namespace mate::deep_gemm {
 
 using namespace mute;
 
+struct MqaLogitsTask {
+  uint32_t q_group_idx;
+  uint32_t kv_start_block;
+  uint32_t num_kv_blocks;
+};
+
 template <uint32_t kBlockKV, uint32_t kBlockQ>
 __device__ inline bool next_q_block(uint32_t       seq_q_groups,
                                     uint32_t       total_seq_q,
@@ -22,9 +28,7 @@ __device__ inline bool next_q_block(uint32_t       seq_q_groups,
                                     uint32_t       mp_idx,
                                     uint32_t       num_mps,
                                     uint32_t&      q_iter_idx,
-                                    uint32_t&      q_group_idx,
-                                    uint32_t&      kv_start_block,
-                                    uint32_t&      num_kv_blocks) {
+                                    MqaLogitsTask& task) {
   while (true) {
     uint32_t q_group = mp_idx + q_iter_idx * num_mps;
     if (q_group >= seq_q_groups) {
@@ -43,8 +47,8 @@ __device__ inline bool next_q_block(uint32_t       seq_q_groups,
       int32_t ks_i = __ldg(ks + q_row);
       int32_t ke_i = __ldg(ke + q_row);
 
-      ks_i = min(ks_i, static_cast<int32_t>(seq_kv));
-      ke_i = min(ke_i, static_cast<int32_t>(seq_kv));
+      ks_i = max(int32_t(0), min(ks_i, static_cast<int32_t>(seq_kv)));
+      ke_i = max(int32_t(0), min(ke_i, static_cast<int32_t>(seq_kv)));
 
       start = min(start, static_cast<uint32_t>(ks_i));
       end   = max(end, static_cast<uint32_t>(ke_i));
@@ -64,12 +68,12 @@ __device__ inline bool next_q_block(uint32_t       seq_q_groups,
       continue;
     }
 
-    uint32_t kv_len     = end - start;
-    uint32_t num_blocks = (kv_len + kBlockKV - 1u) / kBlockKV;
+    uint32_t start_block = start / kBlockKV;
+    uint32_t end_block   = (end + kBlockKV - 1u) / kBlockKV;
 
-    q_group_idx    = q_group;
-    kv_start_block = start / kBlockKV;
-    num_kv_blocks  = num_blocks;
+    task.q_group_idx    = q_group;
+    task.kv_start_block = start_block;
+    task.num_kv_blocks  = end_block - start_block;
 
     ++q_iter_idx;
     return true;
@@ -143,10 +147,6 @@ struct Mp31Fp8NonPagedMqaLogits {
     mute::array_aligned<Element, cosize_v<SmemLayoutK>, 256> smem_k;
     mute::array_aligned<float, cosize_v<SmemLayoutW>, 256>   smem_weights;
     mute::array_aligned<float, cosize_v<SmemLayoutSFK>, 256> smem_sfk;
-
-    uint32_t sched_q_group[kStagesQ];
-    uint32_t sched_kv_start_blk[kStagesQ];
-    uint32_t sched_num_kv_blks[kStagesQ];
   };
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -268,19 +268,19 @@ struct Mp31Fp8NonPagedMqaLogits {
         make_tensor(make_gmem_ptr(args.ptr_q), make_shape(total_seq_q * num_heads, head_dim), args.stride_q),
         take<0, 2>(typename CollectiveMma::SmemLayoutB{}));
 
-    TME_K tme_k = make_tme_copy(
-        MP31_TME_LOAD{},
-        make_tensor(make_gmem_ptr(args.ptr_k), make_shape(kBlockKV, kHeadDim, num_kv_blocks), args.stride_k),
-        take<0, 2>(typename CollectiveMma::SmemLayoutA{}));
+    TME_K tme_k = make_tme_copy(MP31_TME_LOAD{},
+                                make_tensor(make_gmem_ptr(args.ptr_k), make_shape(seq_kv, head_dim), args.stride_k),
+                                take<0, 2>(typename CollectiveMma::SmemLayoutA{}));
 
     TME_SFK tme_sfk =
         make_tme_copy(MP31_TME_LOAD{},
-                      make_tensor(make_gmem_ptr(args.ptr_sfk), make_shape(kBlockKV, num_kv_blocks), args.stride_sfk),
+                      make_tensor(make_gmem_ptr(args.ptr_sfk), make_shape(seq_kv, int32_t(1)), args.stride_sfk),
                       take<0, 2>(SmemLayoutSFK{}));
 
     TME_W tme_w = make_tme_copy(
         MP31_TME_LOAD{},
-        make_tensor(make_gmem_ptr(args.ptr_weights), make_shape(kBlockQ * kNumHeads, q_group), args.stride_weights),
+        make_tensor(
+            make_gmem_ptr(args.ptr_weights), make_shape(total_seq_q * num_heads, int32_t(1)), args.stride_weights),
         take<0, 2>(SmemLayoutW{}));
 
     return Params{
@@ -458,42 +458,39 @@ struct Mp31Fp8NonPagedMqaLogits {
       auto cta_tme_w   = params.tme_w.get_slice(0);
 
       // ---------------- Q ----------------
-      Tensor mQ      = params.tme_q.get_tme_tensor(make_shape(params.q_group * kBlockQ * kNumHeads, kHeadDim));
+      Tensor mQ      = params.tme_q.get_tme_tensor(make_shape(params.total_seq_q * params.num_heads, params.head_dim));
       Tensor gQ_full = local_tile(mQ, select<1, 2>(TileShape{}), make_coord(_, _));
       Tensor sQ      = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
       Tensor tQgQ    = cta_tme_q.partition_S(gQ_full(_, _, _, _0{}));
       Tensor tQsQ    = cta_tme_q.partition_D(sQ);
 
       // ---------------- K ----------------
-      Tensor mK      = params.tme_k.get_tme_tensor(make_shape(kBlockKV, kHeadDim, params.num_kv_blocks));
-      Tensor gK_full = local_tile(mK, select<0, 2>(TileShape{}), make_coord(_, _, _));
+      Tensor mK      = params.tme_k.get_tme_tensor(make_shape(params.seq_kv, params.head_dim));
+      Tensor gK_full = local_tile(mK, select<0, 2>(TileShape{}), make_coord(_, _));
       Tensor sK      = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
-      Tensor tKgK    = cta_tme_k.partition_S(gK_full(_, _, _0{}, _0{}, _));
+      Tensor tKgK    = cta_tme_k.partition_S(gK_full(_, _, _, _0{}));
       Tensor tKsK    = cta_tme_k.partition_D(sK(make_coord(_, kv_group_idx), _, _));
 
       // ---------------- SFK ----------------
-      Tensor mSFK      = params.tme_sfk.get_tme_tensor(make_shape(kBlockKV, params.num_kv_blocks));
+      Tensor mSFK      = params.tme_sfk.get_tme_tensor(make_shape(params.seq_kv, Int<1>{}));
       Tensor gSFK_full = local_tile(mSFK, Shape<Int<kBlockKV>, _1>{}, make_coord(_, _));
       Tensor sSFK      = make_tensor(make_smem_ptr(shared_storage.smem_sfk.data()), SmemLayoutSFK{});
-      Tensor tSFKgSFK  = cta_tme_sfk.partition_S(gSFK_full(_, _, _0{}, _));
+      Tensor tSFKgSFK  = cta_tme_sfk.partition_S(gSFK_full(_, _, _, _0{}));
       Tensor tSFKsSFK  = cta_tme_sfk.partition_D(sSFK(_, _, _, kv_group_idx));
 
       // ---------------- Weights ----------------
-      Tensor mW      = params.tme_w.get_tme_tensor(make_shape(kBlockQ * kNumHeads, params.q_group));
+      Tensor mW      = params.tme_w.get_tme_tensor(make_shape(params.total_seq_q * params.num_heads, Int<1>{}));
       Tensor gW_full = local_tile(mW, Shape<Int<kBlockQ * kNumHeads>, _1>{}, make_coord(_, _));
       Tensor sW      = make_tensor(make_smem_ptr(shared_storage.smem_weights.data()), SmemLayoutW{});
-      Tensor tWgW    = cta_tme_w.partition_S(gW_full(_, _, _0{}, _));
+      Tensor tWgW    = cta_tme_w.partition_S(gW_full(_, _, _, _0{}));
       Tensor tWsW    = cta_tme_w.partition_D(sW);
 
-      auto issue_tme_q = [&](uint32_t issued_q_group, uint32_t kv_start_blk, uint32_t num_kv_blks) {
+      auto issue_tme_q = [&](uint32_t issued_q_group) {
         if (kv_group_idx == 0 && lane_idx == 0) {
           pipeline_q.producer_acquire(pipe_q_write);
           const uint32_t bar_id = pipeline_q.producer_get_barrier_id(pipe_q_write);
 
-          const int stage                          = pipe_q_write.index();
-          shared_storage.sched_q_group[stage]      = issued_q_group;
-          shared_storage.sched_kv_start_blk[stage] = kv_start_blk;
-          shared_storage.sched_num_kv_blks[stage]  = num_kv_blks;
+          const int stage = pipe_q_write.index();
 
           copy(params.tme_q.with(bar_id), tQgQ(_, _, _, issued_q_group), tQsQ(_, _, _, stage));
           copy(params.tme_w.with(bar_id), tWgW(_, _, _, issued_q_group), tWsW(_, _, _, stage));
@@ -502,21 +499,14 @@ struct Mp31Fp8NonPagedMqaLogits {
         }
       };
 
-      auto issue_q_sentinel = [&]() { issue_tme_q(/*q_group*/ 0u, /*kv_start*/ 0u, /*num_kv*/ 0u); };
-
       const uint32_t mp_idx       = (uint32_t)blockIdx.x;
       const uint32_t num_mps      = (uint32_t)gridDim.x;
       const uint32_t seq_q_groups = (uint32_t)params.q_group;
 
       uint32_t q_iter_idx = 0;
 
-      uint32_t curr_q_group      = 0;
-      uint32_t curr_kv_start_blk = 0;
-      uint32_t curr_num_kv_blks  = 0;
-
-      uint32_t next_q_group      = 0;
-      uint32_t next_kv_start_blk = 0;
-      uint32_t next_num_kv_blks  = 0;
+      MqaLogitsTask curr_task{};
+      MqaLogitsTask next_task{};
 
       bool has_curr = next_q_block<kBlockKV, kBlockQ>(seq_q_groups,
                                                       (uint32_t)params.total_seq_q,
@@ -527,16 +517,13 @@ struct Mp31Fp8NonPagedMqaLogits {
                                                       mp_idx,
                                                       num_mps,
                                                       q_iter_idx,
-                                                      curr_q_group,
-                                                      curr_kv_start_blk,
-                                                      curr_num_kv_blks);
+                                                      curr_task);
 
       if (!has_curr) {
-        issue_q_sentinel();
         return;
       }
 
-      issue_tme_q(curr_q_group, curr_kv_start_blk, curr_num_kv_blks);
+      issue_tme_q(curr_task.q_group_idx);
 
       bool has_next = next_q_block<kBlockKV, kBlockQ>(seq_q_groups,
                                                       (uint32_t)params.total_seq_q,
@@ -547,18 +534,16 @@ struct Mp31Fp8NonPagedMqaLogits {
                                                       mp_idx,
                                                       num_mps,
                                                       q_iter_idx,
-                                                      next_q_group,
-                                                      next_kv_start_blk,
-                                                      next_num_kv_blks);
+                                                      next_task);
 
       if (has_next) {
-        issue_tme_q(next_q_group, next_kv_start_blk, next_num_kv_blks);
+        issue_tme_q(next_task.q_group_idx);
       }
 
-      while (true) {
-        for (uint32_t kv_block_in_group = (uint32_t)kv_group_idx; kv_block_in_group < curr_num_kv_blks;
+      while (has_curr) {
+        for (uint32_t kv_block_in_group = (uint32_t)kv_group_idx; kv_block_in_group < curr_task.num_kv_blocks;
              kv_block_in_group += (uint32_t)NumMmaWarpSquads) {
-          const uint32_t kv_block_idx = curr_kv_start_blk + kv_block_in_group;
+          const uint32_t kv_block_idx = curr_task.kv_start_block + kv_block_in_group;
 
           if (lane_idx == 0) {
             pipeline_k.producer_acquire(pipe_k_write);
@@ -572,11 +557,11 @@ struct Mp31Fp8NonPagedMqaLogits {
           }
         }
 
-        if (!has_next) break;
+        if (!has_next) {
+          break;
+        }
 
-        curr_q_group      = next_q_group;
-        curr_kv_start_blk = next_kv_start_blk;
-        curr_num_kv_blks  = next_num_kv_blks;
+        curr_task = next_task;
 
         has_next = next_q_block<kBlockKV, kBlockQ>(seq_q_groups,
                                                    (uint32_t)params.total_seq_q,
@@ -587,16 +572,13 @@ struct Mp31Fp8NonPagedMqaLogits {
                                                    mp_idx,
                                                    num_mps,
                                                    q_iter_idx,
-                                                   next_q_group,
-                                                   next_kv_start_blk,
-                                                   next_num_kv_blks);
+                                                   next_task);
 
         if (has_next) {
-          issue_tme_q(next_q_group, next_kv_start_blk, next_num_kv_blks);
+          issue_tme_q(next_task.q_group_idx);
         }
       }
 
-      issue_q_sentinel();
       return;
     }
 
@@ -623,15 +605,27 @@ struct Mp31Fp8NonPagedMqaLogits {
       Tensor tKsK = thr_mma.partition_A(sK(make_coord(_, kv_group_idx), _, _));
       Tensor tKrK = thr_mma.make_fragment_A(tKsK);
 
-      const int64_t stride_row = static_cast<int64_t>(get<0>(params.stride_logits));
+      const auto stride_row = get<0>(params.stride_logits);
 
-      while (true) {
+      const uint32_t mp_idx       = (uint32_t)blockIdx.x;
+      const uint32_t num_mps      = (uint32_t)gridDim.x;
+      const uint32_t seq_q_groups = (uint32_t)params.q_group;
+
+      uint32_t      q_iter_idx = 0;
+      MqaLogitsTask task{};
+
+      while (next_q_block<kBlockKV, kBlockQ>(seq_q_groups,
+                                             (uint32_t)params.total_seq_q,
+                                             (uint32_t)params.seq_kv,
+                                             (uint32_t)params.max_seq_kv,
+                                             params.ptr_ks,
+                                             params.ptr_ke,
+                                             mp_idx,
+                                             num_mps,
+                                             q_iter_idx,
+                                             task)) {
         pipeline_q.consumer_wait(pipe_q_read);
         const int q_stage = pipe_q_read.index();
-
-        const uint32_t q_group_idx    = shared_storage.sched_q_group[q_stage];
-        const uint32_t kv_start_block = shared_storage.sched_kv_start_blk[q_stage];
-        const uint32_t num_kv_for_q   = shared_storage.sched_num_kv_blks[q_stage];
 
         const int J = int(kNumHeads / reduction_target);
 
@@ -643,15 +637,9 @@ struct Mp31Fp8NonPagedMqaLogits {
           }
         }
 
-        if (num_kv_for_q == 0) {
-          pipeline_q.consumer_release(pipe_q_read);
-          ++pipe_q_read;
-          break;
-        }
-
-        for (uint32_t kv_block_in_group = (uint32_t)kv_group_idx; kv_block_in_group < num_kv_for_q;
+        for (uint32_t kv_block_in_group = (uint32_t)kv_group_idx; kv_block_in_group < task.num_kv_blocks;
              kv_block_in_group += (uint32_t)NumMmaWarpSquads) {
-          const uint32_t kv_block_idx = kv_start_block + kv_block_in_group;
+          const uint32_t kv_block_idx = task.kv_start_block + kv_block_in_group;
 
           pipeline_k.consumer_wait(pipe_k_read);
           const uint32_t kv_stage_idx = pipe_k_read.index();
@@ -695,13 +683,16 @@ struct Mp31Fp8NonPagedMqaLogits {
           pipeline_k.consumer_release(pipe_k_read);
           ++pipe_k_read;
 
-          const int q_block_base  = int(q_group_idx) * kBlockQ;
+          const int q_block_base  = int(task.q_group_idx) * kBlockQ;
           const int kv_block_base = int(kv_block_idx) * kBlockKV + sub_warp_offset;
 
           MUTE_UNROLL
           for (int row_base = 0; row_base + (kBurst - 1) < kRows; row_base += kBurst) {
             MUTE_UNROLL
             for (int ni = 0; ni < kBlockQ; ++ni) {
+              const int q_row = q_block_base + ni;
+              if (q_row >= params.total_seq_q) continue;
+
               f4        accv     = f4{0.f, 0.f, 0.f, 0.f};
               const int col_base = ni * J;
 
@@ -729,8 +720,7 @@ struct Mp31Fp8NonPagedMqaLogits {
               accv    = bst4_mul_vv(sc, accv);
               f4 sum4 = warp_group_reduce_sum_f4<reduction_target>(accv);
 
-              const int q_row   = q_block_base + ni;
-              float*    out_row = params.ptr_logits + (int64_t)q_row * stride_row;
+              float* out_row = params.ptr_logits + q_row * stride_row;
 
               const int kv_base = kv_block_base + base_v_offset + row_base * kKVPack;
 
@@ -749,22 +739,22 @@ struct Mp31Fp8NonPagedMqaLogits {
                 const int32_t ks_row  = __ldg(params.ptr_ks + q_row);
                 const int32_t lc_base = (int32_t)kv_base - ks_row;
 
-                if (lc_base >= 0) {
-                  float* p       = out_row + lc_base;
+                const int32_t lc0 = lc_base + 0;
+                const int32_t lc1 = lc_base + kKVPack;
+                const int32_t lc2 = lc_base + 2 * kKVPack;
+                const int32_t lc3 = lc_base + 3 * kKVPack;
+
+                if (lc0 >= 0 && lc3 < params.max_seq_kv) {
+                  float* p       = out_row + lc0;
                   p[0]           = s0;
                   p[1 * kKVPack] = s1;
                   p[2 * kKVPack] = s2;
                   p[3 * kKVPack] = s3;
                 } else {
-                  const int32_t lc0 = lc_base + 0;
-                  const int32_t lc1 = lc_base + kKVPack;
-                  const int32_t lc2 = lc_base + 2 * kKVPack;
-                  const int32_t lc3 = lc_base + 3 * kKVPack;
-
-                  if (lc0 >= 0) out_row[lc0] = s0;
-                  if (lc1 >= 0) out_row[lc1] = s1;
-                  if (lc2 >= 0) out_row[lc2] = s2;
-                  if (lc3 >= 0) out_row[lc3] = s3;
+                  if (lc0 >= 0 && lc0 < params.max_seq_kv) out_row[lc0] = s0;
+                  if (lc1 >= 0 && lc1 < params.max_seq_kv) out_row[lc1] = s1;
+                  if (lc2 >= 0 && lc2 < params.max_seq_kv) out_row[lc2] = s2;
+                  if (lc3 >= 0 && lc3 < params.max_seq_kv) out_row[lc3] = s3;
                 }
               }
             }

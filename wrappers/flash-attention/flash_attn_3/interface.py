@@ -27,12 +27,6 @@ def _resolve_block_table(
     return page_table if page_table is not None else block_table
 
 
-def _resolve_qv(
-    qv: Optional[torch.Tensor] = None, q_v: Optional[torch.Tensor] = None
-) -> Optional[torch.Tensor]:
-    return qv if qv is not None else q_v
-
-
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -111,7 +105,6 @@ def flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     qv: Optional[torch.Tensor] = None,
-    q_v: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
@@ -136,7 +129,10 @@ def flash_attn_varlen_func(
     resolved_page_table = _resolve_block_table(
         page_table=page_table, block_table=block_table
     )
-    resolved_qv = _resolve_qv(qv=qv, q_v=q_v)
+    resolved_softmax_lse = _resolve_return_softmax_lse(
+        return_attn_probs=return_attn_probs,
+        return_softmax_lse=return_softmax_lse,
+    )
 
     return mate_flash_attn_varlen_func(
         q=q,
@@ -151,7 +147,7 @@ def flash_attn_varlen_func(
         page_table=resolved_page_table,
         softmax_scale=softmax_scale,
         causal=causal,
-        qv=resolved_qv,
+        qv=qv,
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
@@ -164,7 +160,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         deterministic=deterministic,
         sm_margin=sm_margin,
-        return_softmax_lse=return_softmax_lse,
+        return_softmax_lse=resolved_softmax_lse,
         out=out,
         cp_world_size=cp_world_size,
         cp_rank=cp_rank,

@@ -114,9 +114,10 @@ inline void init_moe_gemm_asm_kern_registry() {
     moe_gemm_asm_src_type_to_id[float8_e4m3fn_code] = 2;
     moe_gemm_asm_src_type_to_id[float8_e5m2_code]   = 3;
 
-    moe_gemm_asm_dst_type_to_id[bfloat16_code] = 0;
-    moe_gemm_asm_dst_type_to_id[float16_code]  = 1;
-    moe_gemm_asm_dst_type_to_id[float32_code]  = 2;
+    moe_gemm_asm_dst_type_to_id[bfloat16_code]      = 0;
+    moe_gemm_asm_dst_type_to_id[float16_code]       = 1;
+    moe_gemm_asm_dst_type_to_id[float32_code]       = 2;
+    moe_gemm_asm_dst_type_to_id[float8_e4m3fn_code] = 3;
 
     moe_gemm_asm_tile_m_to_id[128] = 0;
     moe_gemm_asm_tile_m_to_id[256] = 1;
@@ -2690,6 +2691,1286 @@ inline void init_moe_gemm_asm_kern_registry() {
       0, 1,
       0, 0,
       bf16bf16bf16bf16ssgemm_gm1_nn_tce_256_256x128B128_epilogue_persis_stage4_btmenc
+    )
+
+        REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_512_256x256B128_epilogue_mldz_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      1, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_512_256x256B128_epilogue_group_block_128_fsla_persis_stage2_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e5m2e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      3, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e5m2e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 2, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e4m3e4m3e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 1,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      0, 0,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_nn_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 0,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tn_tce_256_128x256B128_epilogue_mldz_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      0, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_persis_stage4_btmenc_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 0,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_fp8quantout
+    )
+
+    REGISTER_MOE_GEMM_ASM_KERNEL(
+      2, 3, 3,
+      0,
+      0, 2, 0,
+      1, 1,
+      0, 1,
+      1, 0,
+      e4m3e5m2e4m3e4m3ssgemm_tt_tce_256_128x256B128_epilogue_group_block_128_fsla_persis_stage4_btmenc_fp8quantout
     )
 
     // clang-format on

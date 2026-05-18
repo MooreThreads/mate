@@ -17,7 +17,6 @@ _DEFAULT_QK_RECIPE: QuantRecipe = (128, 16, -1, 1)
 _VALUE_BLOCK_RECIPE: QuantRecipe = (128, 128, -1, 128)
 _SUPPORTED_RECIPES = {
     (-1, -1, -1, -1),
-    (1, 1, -1, 1),
     (128, 128, -1, 1),
     _DEFAULT_QK_RECIPE,
     _VALUE_BLOCK_RECIPE,
@@ -56,15 +55,6 @@ def _get_quant_bounds(quant_dtype: torch.dtype) -> tuple[float, float]:
         return float(info.max), float(info.min)
     info = torch.finfo(torch.float8_e4m3fn)
     return float(info.max), float(info.min)
-
-
-def _pack_v_scale_pairs(scale: torch.Tensor) -> torch.Tensor:
-    current = scale.squeeze(-1)
-    if current.shape[1] == 1:
-        nxt = current
-    else:
-        nxt = torch.cat([current[:, 1:], current[:, -1:]], dim=1)
-    return torch.stack([current, nxt], dim=-1)
 
 
 def _quantize_full_tensor(
@@ -198,24 +188,6 @@ def _quantize_sequence_channels(
     return q, scale_inv, q.to(torch.float32) * scale_inv
 
 
-def _quantize_elementwise(
-    x_bnhd: torch.Tensor,
-    *,
-    return_dequant: bool,
-) -> QuantizedResult:
-    quant_max, quant_min = _get_quant_bounds(torch.float8_e4m3fn)
-    scale = quant_max / x_bnhd.abs().to(torch.float32).clamp(min=1e-12)
-    q = (
-        (x_bnhd.to(torch.float32) * scale)
-        .clamp(min=quant_min, max=quant_max)
-        .to(torch.float8_e4m3fn)
-    )
-    scale_inv = scale.reciprocal()
-    if not return_dequant:
-        return q, scale_inv
-    return q, scale_inv, q.to(torch.float32) * scale_inv
-
-
 def _quantize_query_or_key(
     x_bnhd: torch.Tensor,
     *,
@@ -235,16 +207,6 @@ def _quantize_query_or_key(
                 QuantizedPair,
                 _quantize_full_tensor(
                     x_bhnd,
-                    quant_dtype=quant_dtype,
-                    return_dequant=False,
-                ),
-            )
-        elif quant_recipe == (1, 1, -1, 1):
-            q_bhnd, scale = cast(
-                QuantizedPair,
-                _quantize_sequence_groups(
-                    x_bhnd,
-                    group_size=1,
                     quant_dtype=quant_dtype,
                     return_dequant=False,
                 ),
@@ -276,16 +238,6 @@ def _quantize_query_or_key(
             QuantizedTriple,
             _quantize_full_tensor(
                 x_bhnd,
-                quant_dtype=quant_dtype,
-                return_dequant=True,
-            ),
-        )
-    elif quant_recipe == (1, 1, -1, 1):
-        q_bhnd, scale, dequant_bhnd = cast(
-            QuantizedTriple,
-            _quantize_sequence_groups(
-                x_bhnd,
-                group_size=1,
                 quant_dtype=quant_dtype,
                 return_dequant=True,
             ),
@@ -334,7 +286,7 @@ def _quantize_v(
                     return_dequant=False,
                 ),
             )
-            return q_bhnd.transpose(1, 2).contiguous(), _pack_v_scale_pairs(scale)
+            return q_bhnd.transpose(1, 2).contiguous(), scale
         q_bhnd, scale, dequant_bhnd = cast(
             QuantizedTriple,
             _quantize_sequence_groups(
@@ -346,7 +298,7 @@ def _quantize_v(
         )
         return (
             q_bhnd.transpose(1, 2).contiguous(),
-            _pack_v_scale_pairs(scale),
+            scale,
             dequant_bhnd.transpose(1, 2).contiguous(),
         )
 
@@ -374,9 +326,6 @@ def _quantize_v(
             scale,
             dequant_bhnd.transpose(1, 2).contiguous(),
         )
-
-    if quant_recipe == (1, 1, -1, 1):
-        return _quantize_elementwise(x_bnhd, return_dequant=return_dequant)
 
     return _quantize_sequence_channels(
         x_bnhd,

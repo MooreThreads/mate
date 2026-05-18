@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from typing import Optional, Tuple
-from .utils import ceil_div
+from ..execution_context import is_fake_mode
+from ..utils import ceil_div
 
 
 def _get_seqlen(batch_idx, seqused, cu_seqlens, seqlen):
@@ -92,6 +93,101 @@ def gen_padding_mask_from_seqlens(seqlen, batch_size, seqused=None, device="musa
         < lengths
     )
     return padding_mask
+
+
+def generate_random_padding_mask(
+    max_seqlen, batch_size, device, mode="random", zero_lengths=False
+):
+    assert mode in ["full", "random", "third"]
+    if mode == "full":
+        lengths = torch.full(
+            (batch_size, 1), max_seqlen, device=device, dtype=torch.int32
+        )
+    elif mode == "random":
+        lengths = torch.randint(
+            max(0 if zero_lengths else 1, max_seqlen - 20),
+            max_seqlen + 1,
+            (batch_size, 1),
+            device=device,
+        )
+    elif mode == "third":
+        lengths = torch.randint(
+            max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device
+        )
+
+    if zero_lengths:
+        # Generate zero-lengths every 5 batches and the last batch.
+        for i in range(batch_size):
+            if i % 5 == 0:
+                lengths[i] = 0
+        lengths[-1] = 0
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size)
+        < lengths
+    )
+    return padding_mask
+
+
+def _rotate_half_torch(x, interleaved=False):
+    if not interleaved:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    else:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return rearrange(
+            torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2
+        )
+
+
+def apply_rotary_emb(
+    x,
+    cos,
+    sin,
+    interleaved=False,
+    seqlen_offsets=0,
+):
+    """
+    x: (B, S, H, D)
+    cos, sin: (seqlen_ro, rotary_dim / 2)
+    seqlen_offsets: int or (B,)
+    return: (B, S, H, D)
+    """
+    assert x.dim() == 4
+    B, S, H, D = x.shape
+    seqlen_ro, rotary_half = cos.shape
+    rotary_dim = rotary_half * 2
+    assert sin.shape == cos.shape
+    assert rotary_dim <= D
+
+    if isinstance(seqlen_offsets, int):
+        pos = torch.arange(S, device=x.device) + seqlen_offsets
+        pos = pos.unsqueeze(0).expand(B, S)
+    else:
+        assert seqlen_offsets.shape == (B,)
+        pos = torch.arange(S, device=x.device).unsqueeze(0) + seqlen_offsets.unsqueeze(
+            1
+        )
+
+    assert pos.max().item() < seqlen_ro
+
+    cos_pos = cos[pos].float()  # (B, S, rotary_dim / 2)
+    sin_pos = sin[pos].float()  # (B, S, rotary_dim / 2)
+
+    if not interleaved:
+        cos_pos = repeat(cos_pos, "b s d -> b s 1 (2 d)")
+        sin_pos = repeat(sin_pos, "b s d -> b s 1 (2 d)")
+    else:
+        cos_pos = repeat(cos_pos, "b s d -> b s 1 (d 2)")
+        sin_pos = repeat(sin_pos, "b s d -> b s 1 (d 2)")
+
+    x_ro = x[..., :rotary_dim].float()
+    x_pass = x[..., rotary_dim:]
+
+    out_ro = (
+        x_ro * cos_pos + _rotate_half_torch(x_ro, interleaved=interleaved) * sin_pos
+    ).to(x.dtype)
+    return torch.cat([out_ro, x_pass], dim=-1)
 
 
 def gen_input_tensor(
@@ -359,8 +455,13 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     )
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    if not is_fake_mode():
+        indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+        max_seqlen_in_batch = seqlens_in_batch.max().item()
+    else:
+        batch_size, seqlen = attention_mask.shape
+        indices = torch.arange(batch_size * seqlen, device=hidden_states.device)
+        max_seqlen_in_batch = seqlen
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         IndexFirstAxis.apply(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
@@ -911,10 +1012,13 @@ def make_cp_rank_local_paged_kvcache(
 
     # Step 2: compute rank-local seqlen per batch item
     local_seqlens = []
-    for b in range(batch_size):
-        sk = cache_seqlens[b].item()
-        local_len = len(range(cp_rank, sk, cp_world_size))
-        local_seqlens.append(local_len)
+    if is_fake_mode():
+        local_seqlens = [0 for _ in range(batch_size)]
+    else:
+        for b in range(batch_size):
+            sk = cache_seqlens[b].item()
+            local_len = len(range(cp_rank, sk, cp_world_size))
+            local_seqlens.append(local_len)
 
     max_local_seqlen = max(local_seqlens) if local_seqlens else 0
     max_local_pages = (
@@ -948,6 +1052,8 @@ def make_cp_rank_local_paged_kvcache(
     page_cursor = 0
 
     for b in range(batch_size):
+        if is_fake_mode():
+            break
         sk = cache_seqlens[b].item()
         local_indices = torch.arange(cp_rank, sk, cp_world_size, device=device)
         local_len = local_indices.shape[0]

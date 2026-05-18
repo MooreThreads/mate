@@ -6,6 +6,9 @@ csrc/instantiations/*
 mate/_version.py
 mate/_build_meta.py
 mate/data
+wrappers/*/_mate_wrapper_version.txt
+wrappers/*/_mate_wrapper_requirements.txt
+wrappers/*/*/_build_meta.py
 
 # vscode
 .vscode/

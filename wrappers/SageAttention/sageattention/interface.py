@@ -8,7 +8,7 @@ and routes execution to MATE kernels on MUSA.
 from __future__ import annotations
 
 import math
-from typing import Any, Literal, Optional, Tuple, Union, overload
+from typing import Any, Literal, Optional, Tuple, Union, cast, overload
 
 import torch
 from mate.jit.utils import maybe_contiguous
@@ -21,13 +21,14 @@ _DEFAULT_THREAD_RECIPE: QuantRecipe = (128, 16, -1, 1)
 _DEFAULT_QK_QUANT_DTYPE = "int8"
 _SUPPORTED_DENSE_RECIPES = {
     (-1, -1, -1, -1),
-    (1, 1, -1, 1),
     (128, 128, -1, 1),
     (128, 16, -1, 1),
     (128, 128, -1, 128),
 }
 _SUPPORTED_QK_QUANT_DTYPES = {"int8", "fp8"}
 SageAttentionOutput = Tuple[torch.Tensor, torch.Tensor]
+SageAttentionFp8Output = Tuple[torch.Tensor, torch.Tensor]
+SageAttentionFp8LseOutput = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 def _validate_tensor_layout(tensor_layout: str) -> str:
@@ -132,17 +133,37 @@ def _compute_lse_correction(
 
 
 def _finalize_output(
-    result: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    result: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
     tensor_layout: str,
     output_dtype: torch.dtype,
     return_lse: bool,
     sm_scale: float,
     lse_correction: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
     if not return_lse:
+        if isinstance(result, tuple):
+            out, out_scale = cast(SageAttentionFp8Output, result)
+            return _from_bnhd(out, tensor_layout).to(output_dtype), _from_bnhd(
+                out_scale, tensor_layout
+            ).to(torch.float32)
         return _from_bnhd(result, tensor_layout).to(output_dtype)
 
-    out, lse = result
+    result_tuple = cast(Union[SageAttentionOutput, SageAttentionFp8LseOutput], result)
+    if len(result_tuple) == 3:
+        out, out_scale, lse = cast(SageAttentionFp8LseOutput, result_tuple)
+        out = _from_bnhd(out, tensor_layout).to(output_dtype)
+        out_scale = _from_bnhd(out_scale, tensor_layout).to(torch.float32)
+        if lse_correction is not None:
+            lse = lse + lse_correction * sm_scale
+        return out, out_scale, lse
+
+    out, lse = cast(SageAttentionOutput, result_tuple)
     out = _from_bnhd(out, tensor_layout).to(output_dtype)
     if lse_correction is not None:
         lse = lse + lse_correction * sm_scale
@@ -165,7 +186,10 @@ def _run_quantized_sage_attention(
     qk_quant_dtype: str,
     return_lse: bool,
     smooth_k: bool,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    fp8_output: bool = False,
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
     tensor_layout = _validate_tensor_layout(tensor_layout)
     _validate_inputs(q, k, v)
     resolved_quant_recipe = _validate_supported_quant_recipe(quant_recipe)
@@ -173,7 +197,7 @@ def _run_quantized_sage_attention(
     resolved_sm_scale = (
         sm_scale if sm_scale is not None else 1.0 / math.sqrt(q.shape[-1])
     )
-    output_dtype = q.dtype
+    output_dtype = torch.float8_e4m3fn if fp8_output else q.dtype
     qk_quant_torch_dtype = _resolve_qk_quant_dtype(resolved_qk_quant_dtype)
 
     q_bnhd = maybe_contiguous(_to_bnhd(q, tensor_layout).to(torch.bfloat16))
@@ -217,6 +241,7 @@ def _run_quantized_sage_attention(
         causal=is_causal,
         quant_recipe=resolved_quant_recipe,
         return_lse=return_lse,
+        fp8_output=fp8_output,
     )
     return _finalize_output(
         result,
@@ -241,6 +266,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     pv_accum_dtype: str = "fp32+fp32",
     smooth_k: bool = True,
     return_lse: Literal[False] = False,
+    fp8_output: Literal[False] = False,
     quant_recipe: Optional[QuantRecipe] = None,
     **kwargs: Any,
 ) -> torch.Tensor: ...
@@ -259,6 +285,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     pv_accum_dtype: str = "fp32+fp32",
     smooth_k: bool = True,
     return_lse: Literal[True] = True,
+    fp8_output: Literal[False] = False,
     quant_recipe: Optional[QuantRecipe] = None,
     **kwargs: Any,
 ) -> SageAttentionOutput: ...
@@ -277,9 +304,12 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     pv_accum_dtype: str = "fp32+fp32",
     smooth_k: bool = True,
     return_lse: bool = False,
+    fp8_output: bool = False,
     quant_recipe: Optional[QuantRecipe] = None,
     **kwargs: Any,
-) -> Union[torch.Tensor, SageAttentionOutput]: ...
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]: ...
 
 
 def sageattn_qk_int8_pv_fp8_cuda_sm90(
@@ -294,9 +324,12 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     pv_accum_dtype: str = "fp32+fp32",
     smooth_k: bool = True,
     return_lse: bool = False,
+    fp8_output: bool = False,
     quant_recipe: Optional[QuantRecipe] = None,
     **kwargs: Any,
-) -> Union[torch.Tensor, SageAttentionOutput]:
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
     r"""
     SageAttention wrapper with configurable QK quantization dtype on MUSA.
 
@@ -305,7 +338,10 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     ``qk_quant_dtype`` selects whether QK is quantized to ``int8`` or ``fp8``.
     ``quant_recipe`` describes the quantization granularity. Only
     ``qk_quant_gran='per_thread'`` is supported as the default granularity
-    shortcut.
+    shortcut. If ``fp8_output=True``, returns ``(out_fp8, out_scale)`` or
+    ``(out_fp8, out_scale, lse)`` when ``return_lse=True``. The ``out_scale``
+    tensor uses dtype ``torch.float32`` and follows the requested public tensor
+    layout.
     """
     del pv_accum_dtype, kwargs
     resolved_quant_recipe = _resolve_quant_recipe(
@@ -323,6 +359,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
         qk_quant_dtype=qk_quant_dtype,
         return_lse=return_lse,
         smooth_k=smooth_k,
+        fp8_output=fp8_output,
     )
 
 
@@ -339,6 +376,7 @@ def sageattn(
     qk_quant_dtype: str = _DEFAULT_QK_QUANT_DTYPE,
     quant_recipe: Optional[QuantRecipe] = None,
     smooth_k: bool = True,
+    fp8_output: Literal[False] = False,
     **kwargs: Any,
 ) -> torch.Tensor: ...
 
@@ -356,6 +394,7 @@ def sageattn(
     qk_quant_dtype: str = _DEFAULT_QK_QUANT_DTYPE,
     quant_recipe: Optional[QuantRecipe] = None,
     smooth_k: bool = True,
+    fp8_output: Literal[False] = False,
     **kwargs: Any,
 ) -> SageAttentionOutput: ...
 
@@ -373,8 +412,11 @@ def sageattn(
     qk_quant_dtype: str = _DEFAULT_QK_QUANT_DTYPE,
     quant_recipe: Optional[QuantRecipe] = None,
     smooth_k: bool = True,
+    fp8_output: bool = False,
     **kwargs: Any,
-) -> Union[torch.Tensor, SageAttentionOutput]: ...
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]: ...
 
 
 def sageattn(
@@ -389,15 +431,21 @@ def sageattn(
     qk_quant_dtype: str = _DEFAULT_QK_QUANT_DTYPE,
     quant_recipe: Optional[QuantRecipe] = None,
     smooth_k: bool = True,
+    fp8_output: bool = False,
     **kwargs: Any,
-) -> Union[torch.Tensor, SageAttentionOutput]:
+) -> Union[
+    torch.Tensor, SageAttentionOutput, SageAttentionFp8Output, SageAttentionFp8LseOutput
+]:
     r"""
     Automatically selects the supported SageAttention implementation on MUSA.
 
     By default this forwards to ``sageattn_qk_int8_pv_fp8_cuda_sm90`` with the
     thread recipe ``(128, 16, -1, 1)`` and ``qk_quant_dtype="int8"``.
     ``quant_recipe`` controls quantization granularity, while
-    ``qk_quant_dtype`` controls whether QK is quantized to INT8 or FP8.
+    ``qk_quant_dtype`` controls whether QK is quantized to INT8 or FP8. If
+    ``fp8_output=True``, returns ``(out_fp8, out_scale)`` or
+    ``(out_fp8, out_scale, lse)`` when ``return_lse=True``. Without FP8 output,
+    returns ``out`` or ``(out, lse)``.
     """
     return sageattn_qk_int8_pv_fp8_cuda_sm90(
         q=q,
@@ -410,6 +458,7 @@ def sageattn(
         sm_scale=sm_scale,
         smooth_k=smooth_k,
         return_lse=return_lse,
+        fp8_output=fp8_output,
         quant_recipe=quant_recipe,
         **kwargs,
     )

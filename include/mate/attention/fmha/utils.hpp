@@ -67,12 +67,20 @@ MUTE_HOST_DEVICE constexpr auto unstageSmemLayout(Layout const& layout, Stages s
   return composition(layout, make_tuple(_, _, make_layout(stages)));
 }
 
-template <int FragmentSize, class EngineSrc, typename Layout, class EngineDst>
+template <int FragmentSize_ = -1, class EngineSrc, typename Layout, class EngineDst>
 MUTE_DEVICE void convert_type(Tensor<EngineSrc, Layout> const& src, Tensor<EngineDst, Layout>& dst) {
   using SrcType = typename EngineSrc::value_type;
   using DstType = typename EngineDst::value_type;
 
-  static_assert(MUTE_STATIC_V(size(src)) % FragmentSize == 0);
+  static constexpr int FragmentSize = [&] {
+    if constexpr (FragmentSize_ > 0) {
+      return FragmentSize_;
+    } else {
+      return sizeof(SrcType) > sizeof(DstType) ? sizeof(SrcType) / sizeof(DstType) : sizeof(DstType) / sizeof(SrcType);
+    }
+  }();
+
+  static_assert(MUTE_STATIC_V(size(src)) % FragmentSize == 0, "Fragment size does not vectorize properly");
 
   Tensor src_frg = recast<mutlass::Array<SrcType, FragmentSize> const>(src);
   Tensor dst_frg = recast<mutlass::Array<DstType, FragmentSize>>(dst);

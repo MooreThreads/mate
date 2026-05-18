@@ -11,7 +11,11 @@ from mate.gemm import (
     gemm_fp8_nt_groupwise,
     ragged_k_moe_gemm_8bit,
 )
-from mate.jit.deep_gemm_attention import get_deep_gemm_attention_module
+from mate.jit.deep_gemm_attention import (
+    get_deep_gemm_attention_module,
+    get_metadata_module,
+)
+from mate.jit.gemm.deep_gemm.hyperconnection import get_hyperconnection_module
 from mate.jit.runtime import ffi_to_torch
 
 
@@ -209,7 +213,8 @@ def get_paged_mqa_logits_metadata(
     schedule_meta = torch.empty(
         (num_mps + 1, 2), device=context_lens.device, dtype=torch.int32
     )
-    _get_module().get_function("get_paged_mqa_logits_metadata")(
+    batch_size = context_lens.shape[0]
+    get_metadata_module(batch_size).get_function("get_paged_mqa_logits_metadata")(
         context_lens, block_kv, schedule_meta
     )
     return schedule_meta
@@ -330,7 +335,7 @@ def fp8_mqa_logits(
     """
     kv_fp8, kv_scale = kv
     if max_seqlen_k > 0 and clean_logits:
-        raise ValueError("max_seq_len_k is not supported with clean_logits")
+        raise ValueError("max_seqlen_k is not supported with clean_logits")
     return ffi_to_torch(
         _get_module().get_function("fp8_mqa_logits")(
             q,
@@ -342,4 +347,49 @@ def fp8_mqa_logits(
             clean_logits,
             int(max_seqlen_k),
         )
+    )
+
+
+@mate_api
+def tf32_hc_prenorm_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    sqr_sum: torch.Tensor,
+    num_splits: Optional[int] = None,
+) -> None:
+    r"""TF32 HyperConnection prenorm GEMM.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input tensor with shape ``(M, K)`` and dtype ``torch.bfloat16``.
+    b : torch.Tensor
+        Weight tensor with shape ``(N, K)`` and dtype ``torch.float32``.
+    d : torch.Tensor
+        Output GEMM tensor with dtype ``torch.float32``. Shape is ``(M, N)`` when
+        ``num_splits`` is ``None`` or ``<= 1``; otherwise ``(num_splits, M, N)``.
+    sqr_sum : torch.Tensor
+        Output row-wise squared-sum tensor with dtype ``torch.float32``. Shape is
+        ``(M,)`` when ``num_splits`` is ``None`` or ``<= 1``; otherwise
+        ``(num_splits, M)``.
+    num_splits : int, default=None
+        Optional split-K factor. When greater than 1, the kernel writes per-split
+        partial outputs and callers should reduce them along dim 0.
+
+    Returns
+    -------
+    None
+    """
+
+    m = a.shape[0]
+    n = b.shape[0]
+    num_splits = 1 if num_splits is None or num_splits <= 1 else int(num_splits)
+
+    get_hyperconnection_module(m, n).get_function("tf32_hc_prenorm_gemm")(
+        a,
+        b,
+        d,
+        sqr_sum,
+        num_splits,
     )

@@ -1,10 +1,11 @@
 [build-system]
 requires = ["setuptools>=77", "wheel"]
-build-backend = "setuptools.build_meta"
+build-backend = "_mate_wrapper_build_backend"
+backend-path = ["."]
 
 [project]
+dynamic = ["version", "dependencies"]
 name = "deep-gemm"
-version = "0.1.3"
 description = "A Python wrapper of MATE DeepGEMM"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,9 +22,10 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = [
-  "mate>=0.1.3",
-]
+
+[tool.setuptools.dynamic]
+version = { file = ["_mate_wrapper_version.txt"] }
+dependencies = { file = ["_mate_wrapper_requirements.txt"] }
 
 [project.urls]
 Homepage = "https://github.com/MooreThreads/mate"

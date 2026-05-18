@@ -11,9 +11,10 @@ MoE GEMM
 .. autofunction:: ragged_k_moe_gemm_8bit
 .. autofunction:: masked_moe_gemm_8bit
 
-FP8 GEMM
+Dense GEMM
 -------------------------
 
+.. autofunction:: bmm_fp16
 .. autofunction:: bmm_fp8
 .. autofunction:: gemm_fp8_nt_groupwise
 

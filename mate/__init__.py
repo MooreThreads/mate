@@ -21,7 +21,6 @@ _LAZY_SUBMODULES = {
     "aot",
     "api_logging",
     "deep_gemm",
-    "flashinfer",
     "flashmla",
     "gdn_decode",
     "gdn_prefill",
@@ -30,6 +29,7 @@ _LAZY_SUBMODULES = {
     "mha_interface",
     "sage_attention_interface",
     "testing",
+    "utils",
     "version",
 }
 
@@ -54,7 +54,6 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_attn_with_kvcache",
     "flash_mla_with_kvcache",
-    "flashinfer",
     "flashmla",
     "gated_delta_rule_decode",
     "gdn_decode",
@@ -70,6 +69,7 @@ __all__ = [
     "sage_attn_quantized_with_kvcache",
     "sage_attention_interface",
     "testing",
+    "utils",
     "version",
     "__version__",
 ]

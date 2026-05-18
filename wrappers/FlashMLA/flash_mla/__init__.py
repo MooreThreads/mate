@@ -1,5 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-import re
 
 from flash_mla.flash_mla_interface import (
     FlashMLASchedMeta,
@@ -9,31 +9,41 @@ from flash_mla.flash_mla_interface import (
 )
 
 
+try:
+    from ._build_meta import __git_version__ as __git_version__
+except Exception:
+    __git_version__ = "unknown"
+
+
 def _load_version() -> str:
     try:
-        from importlib.metadata import version
-
         return version("flash_mla")
+    except PackageNotFoundError:
+        pass
+
+    try:
+        from ._build_meta import __version__ as build_version
+
+        return build_version
     except Exception:
-        try:
-            pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-            pyproject_text = pyproject_path.read_text()
-            match = re.search(
-                r"^\[project\]\s.*?^version = [\"']([^\"']+)[\"']",
-                pyproject_text,
-                re.MULTILINE | re.DOTALL,
-            )
-            if match is not None:
-                return match.group(1)
-            return "unknown"
-        except Exception:
-            return "unknown"
+        pass
+
+    try:
+        return (
+            (Path(__file__).resolve().parents[3] / "version.txt")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except Exception:
+        return "unknown"
 
 
 __version__ = _load_version()
 
 __all__ = [
     "FlashMLASchedMeta",
+    "__git_version__",
+    "__version__",
     "get_mla_metadata",
     "flash_mla_with_kvcache",
     "flash_mla_sparse_fwd",

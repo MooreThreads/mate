@@ -85,10 +85,13 @@ When working with MATE's dependencies and tools, refer to these official documen
 - **Working on FFI bindings** → Check TVM-FFI docs for export patterns and type marshaling
 - **Working on kernel bindings** → Check the TVM-FFI kernel library guide for output-allocation patterns and `TensorView` usage
 
-
 ## Behavior Rules
 
 - Always read relevant files before modifying code
 - For non-trivial tasks, create a plan first
 - Validate changes by running tests
 - Prefer minimal, localized changes
+- When running as `root` in the container, restore edited tracked files to the
+  workspace owner/group and keep them user/group writable before handing off.
+  A typical fix is `chown <workspace_uid>:<workspace_gid> <files>` followed by
+  `chmod ug+rw <files>`, using the owner of `/workspace/mate` as the target.

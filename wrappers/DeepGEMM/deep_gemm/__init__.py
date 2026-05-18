@@ -1,5 +1,9 @@
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
 from .interface import (
     bf16_m_grouped_gemm_nt_masked,
+    bf16_gemm_nt,
     # legacy aliases
     fp8_m_grouped_gemm_nt_masked,
     fp8_gemm_nt,
@@ -23,6 +27,37 @@ from .utils import get_num_sms as get_num_sms
 from .utils import get_tc_util as get_tc_util
 from .utils import set_num_sms as set_num_sms
 from .utils import set_tc_util as set_tc_util
+
+try:
+    from ._build_meta import __git_version__ as __git_version__
+except Exception:
+    __git_version__ = "unknown"
+
+
+def _load_version() -> str:
+    try:
+        return version("deep-gemm")
+    except PackageNotFoundError:
+        pass
+
+    try:
+        from ._build_meta import __version__ as build_version
+
+        return build_version
+    except Exception:
+        pass
+
+    try:
+        return (
+            (Path(__file__).resolve().parents[3] / "version.txt")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+__version__ = _load_version()
 # utilities
 # "get_num_sms",
 # "set_num_sms",
@@ -33,7 +68,10 @@ from .utils import set_tc_util as set_tc_util
 # "get_mn_major_tma_aligned_tensor",
 
 __all__ = [
+    "__git_version__",
+    "__version__",
     # GEMM
+    "bf16_gemm_nt",
     "m_grouped_bf16_gemm_nt_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
     "m_grouped_fp8_gemm_nt_contiguous",

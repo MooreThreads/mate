@@ -6,12 +6,11 @@ import torch
 from mate.api_logging import mate_api
 from mate.jit.mla_ops import get_mla_ops_module
 from mate.jit.runtime import ffi_to_torch
-from .sparse_mla.tilelang.sparse_mla_decode_fwd_scheduled import (
-    tilelang_flashmla_interface,
+from .sparse_mla.flashmla_sparse import (
+    flashmla_sparse_decode,
+    flashmla_sparse_prefill,
 )
-from .sparse_mla.tilelang.sparse_mla_fwd_pipelined import (
-    tilelang_sparse_mla_prefill_fwd_interface,
-)
+from .execution_context import raise_complete_if_dry_run
 
 
 @functools.cache
@@ -55,8 +54,11 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    extra_topk: Optional[int] = None,
     q: Optional[torch.Tensor] = None,
     bs: Optional[int] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Get metadata for MLA decoding.
@@ -75,6 +77,12 @@ def get_mla_metadata(
         Whether the k_cache and v_cache are in fp8 format.
     topk: Optional[int]
         If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
+    extra_topk: Optional[int]
+        Optional sparse extra-KV topk. This mirrors FlashMLA sparse decode
+        metadata semantics without folding extra work into `topk`.
+    topk_length: Optional[Tensor]
+        Optional per-batch sparse workload lengths for MODEL1 scheduled decode metadata.
+        If extra_topk_length is provided, both lengths are summed in the C++ metadata kernel.
 
     Returns
     -------
@@ -84,8 +92,12 @@ def get_mla_metadata(
         * tile_scheduler_metadata, shape ``(num_sm_parts, TileSchedulerMetaDataSize)``
         * num_splits, shape ``(batch_size + 1)``
     """
+    func = _get_module().get_function("get_mla_decoding_metadata")
+
+    raise_complete_if_dry_run()
+
     return ffi_to_torch(
-        _get_module().get_function("get_mla_decoding_metadata")(
+        func(
             cache_seqlens,
             num_q_tokens_per_head_k,
             num_heads_k,
@@ -96,6 +108,9 @@ def get_mla_metadata(
             None,
             q,
             bs,
+            topk_length,
+            extra_topk_length,
+            extra_topk,
         )
     )
 
@@ -123,10 +138,8 @@ def flash_mla_sparse_fwd(
             If attn_sink is provided, when computing output, output will be additionally multiplied by exp(lse) / (exp(lse) + exp(attn_sink)).
             +-inf in attn_sink will be handled normally (i.e., -inf has no effect, +inf will make corresponding output all zeros).
             This argument has no effect on lse and max_logits.
-            * Not Supported Now *
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
-            * Not Supported Now *
     Returns:
         (output, max_logits, lse)
         Please refer to tests/ref.py for the precise definitions of these parameters.
@@ -134,24 +147,27 @@ def flash_mla_sparse_fwd(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, log-sum-exp of attention scores
     """
-    assert attn_sink is None, "attn_sink Not supported Now"
-    assert topk_length is None, "topk_length Not supported Now"
     assert d_v == 512, "sprase prefill only support d_v 512"
-    seq_len_q, num_heads_q, head_dim_q = q.shape
-    s_kv, h_k, _ = kv.shape
+    seq_len_q, _, head_dim_q = q.shape
+    _, h_k, _ = kv.shape
     _, _, topk = indices.shape
+    assert q.stride(-1) == 1, "q last dimension must be contiguous"
+    assert kv.stride(-1) == 1, "kv last dimension must be contiguous"
+    assert indices.stride(-1) == 1, "indices last dimension must be contiguous"
     assert head_dim_q == kv.shape[-1]
     assert seq_len_q == indices.shape[0]
     assert h_k == indices.shape[1]
     assert h_k == 1
 
-    tl_out, lse = tilelang_sparse_mla_prefill_fwd_interface(
-        q,
-        kv,
-        indices,
-        sm_scale,
+    return flashmla_sparse_prefill(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
     )
-    return tl_out, None, lse
 
 
 @mate_api
@@ -167,6 +183,11 @@ def flash_mla_with_kvcache(
     causal: bool = False,
     is_fp8_kvcache: bool = False,
     indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Mla forward with kv cache
@@ -216,33 +237,39 @@ def flash_mla_with_kvcache(
         softmax_scale = q.shape[-1] ** (-0.5)
     if indices is not None:
         assert not causal, "causal must be `false` if sparse attention is enabled."
+        assert is_fp8_kvcache, "sparse mla decode only support fp8 kvcache"
         dsa_backend = "tilelang"
         if dsa_backend == "tilelang":
-            if is_fp8_kvcache:
-                # decode fp8 kv cache
-                batch_size, seq_len_q, num_heads_q, head_dim_q = q.shape
-                num_blocks, block_size, h_k, dim_bytes = k_cache.shape
-                assert dim_bytes == 656
-                assert h_k == 1
-                assert batch_size == indices.shape[0]
-                assert seq_len_q == indices.shape[1]
-                assert h_k == indices.shape[2]
-                _, _, _, topk = indices.shape
-                k_cache = k_cache.view(-1, h_k, dim_bytes)
-                assert tile_scheduler_metadata is not None
-                assert num_splits is not None
-                return tilelang_flashmla_interface(
-                    q,
-                    k_cache,
-                    indices,
-                    tile_scheduler_metadata,
-                    num_splits,
-                    softmax_scale,
-                )
-            else:
-                assert False, "sparse mla decode only support fp8 kvcache"
+            # decode fp8 kv cache
+            return flashmla_sparse_decode(
+                q=q,
+                k_cache=k_cache,
+                indices=indices,
+                head_dim_v=head_dim_v,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices_in_kvcache,
+                topk_length=topk_length,
+                extra_topk_length=extra_topk_length,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                metadata_getter=get_mla_metadata,
+            )
         else:
             assert False, "Unsupported DSA backend"
+
+    assert attn_sink is None, "attn_sink is only supported for sparse MODEL1 decode"
+    assert extra_k_cache is None, (
+        "extra_k_cache is only supported for sparse MODEL1 decode"
+    )
+    assert extra_indices_in_kvcache is None, (
+        "extra_indices_in_kvcache is only supported for sparse MODEL1 decode"
+    )
+    assert topk_length is None, "topk_length is only supported for sparse MODEL1 decode"
+    assert extra_topk_length is None, (
+        "extra_topk_length is only supported for sparse MODEL1 decode"
+    )
 
     assert head_dim_v == 512
 
@@ -256,6 +283,7 @@ def flash_mla_with_kvcache(
     out, softmax_lse = _allocate_flashmla_outputs(q, head_dim_v)
 
     if should_run_with_asm:
+        raise_complete_if_dry_run()
         _get_module().get_function("flash_mla_asm")(
             q_nope,
             q_pe,
@@ -273,7 +301,9 @@ def flash_mla_with_kvcache(
             None,
         )
     else:
-        _get_module().get_function("mla_with_kvcache")(
+        func = _get_module().get_function("mla_with_kvcache")
+        raise_complete_if_dry_run()
+        func(
             q_nope,
             q_pe,
             k_cache[:, :, :, :head_dim_v],

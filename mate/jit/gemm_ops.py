@@ -35,7 +35,7 @@ INCLUDE_PATHS = [
 
 def gen_gemm_ops_spec() -> JitSpec:
     sources = [
-        jit_env.MATE_CSRC_DIR / "batch_gemm_fp8.mu",
+        jit_env.MATE_CSRC_DIR / "batch_gemm.mu",
         jit_env.MATE_CSRC_DIR / "gemm_fp8_groupwise.mu",
         jit_env.MATE_CSRC_DIR / "moe_gemm_asm.mu",
         *sorted((jit_env.MATE_CSRC_DIR / "mubin" / "mp31" / "gemm").glob("*.cpp")),

@@ -14,7 +14,9 @@ from .fmha_utils import (
     _get_fwd_kernel_config as _get_metadata_kernel_config,
     fmha_extra_include_paths,
     get_fmha_template,
+    _resolve_mask,
 )
+from ....execution_context import raise_complete_if_dry_run
 
 
 def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
@@ -36,14 +38,20 @@ def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
     elif config["has_cu_seqlens_k"]:
         mode_k = "ragged_k"
         name_list.append(mode_k)
-    
+
     if config["has_cu_seqlens_k_new"]:
         mode_k_new = "ragged_knew"
         name_list.append(mode_k_new)
 
+    if config["has_leftpad_k"]:
+        name_list.append("leftpad_k")
+
     if config["is_causal"]:
         mode_causal = "causal"
         name_list.append(mode_causal)
+    elif config["is_local"]:
+        mode_local = "local"
+        name_list.append(mode_local)
     if config["is_packgqa"]:
         mode_packgqa = "packgqa"
         name_list.append(mode_packgqa)
@@ -141,14 +149,14 @@ mode_k = [
     ),
     ParamSpec(
         name="has_leftpad_k",
-        domain=[False],
+        domain=[False, True],
         default=False,
     ),
 ]
 mode_mask = [
     ParamSpec(
         name="mode_mask",
-        domain=["none", "causal"],
+        domain=["none", "causal", "local"],
         default="none",
         export=False,
     ),
@@ -156,6 +164,13 @@ mode_mask = [
         name="is_causal",
         default=False,
         compute=lambda cfg: cfg["mode_mask"] == "causal",
+        depends_on=("mode_mask",),
+        sweep=False,
+    ),
+    ParamSpec(
+        name="is_local",
+        default=False,
+        compute=lambda cfg: cfg["mode_mask"] == "local",
         depends_on=("mode_mask",),
         sweep=False,
     ),
@@ -246,7 +261,11 @@ def _fmha_get_metadata(
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
-    causal: bool = False,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    leftpad_k: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     packgqa: Optional[bool] = None,
     mp_margin: int = 0,
@@ -269,14 +288,23 @@ def _fmha_get_metadata(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
+    assert leftpad_k is None or leftpad_k.shape == (batch_size,), (
+        "leftpad_k must have shape (batch_size,)"
+    )
 
-    for tensor in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+    for tensor in [
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        leftpad_k,
+    ]:
         if tensor is not None:
             assert tensor.dtype == torch.int32, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
+                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, leftpad_k must be int32"
             )
             assert tensor.stride(0) == 1, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
+                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, leftpad_k must be contiguous"
             )
 
     assert all(
@@ -286,13 +314,21 @@ def _fmha_get_metadata(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
+            leftpad_k,
         )
     ), "inputs must be on MUSA device"
 
     assert num_heads_q % num_heads_kv == 0, (
         "num_heads_q must be divisible by num_heads_kv"
     )
-
+    is_causal, is_local, window_size_left, window_size_right = _resolve_mask(
+        seqlen_q=max_seqlen_q,
+        seqlen_k=max_seqlen_k,
+        is_causal=is_causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        attention_chunk=attention_chunk,
+    )
     qhead_per_kvhead = num_heads_q // num_heads_kv
 
     metadata = torch.empty((batch_size * 4), dtype=torch.int32, device="musa")
@@ -330,8 +366,9 @@ def _fmha_get_metadata(
         "has_seqused_q": seqused_q is not None,
         "has_seqused_k": seqused_k is not None,
         "has_cu_seqlens_k_new": cu_seqlens_k_new is not None,
-        "has_leftpad_k": False,
-        "is_causal": causal,
+        "has_leftpad_k": leftpad_k is not None,
+        "is_causal": is_causal,
+        "is_local": is_local,
         "is_packgqa": packgqa,
         "head_ratio": qhead_per_kvhead,
         "sort": True,
@@ -340,6 +377,10 @@ def _fmha_get_metadata(
 
     dispatch_name, mod = _fmha_metadata_module(constexpr_dict)
     fmha_metadata_impl = mod.get_function(dispatch_name)
+
+    # Exit in dry run
+    raise_complete_if_dry_run()
+
     fmha_metadata_impl(
         batch_size,
         num_heads_q,
@@ -354,6 +395,9 @@ def _fmha_get_metadata(
         seqused_q,
         seqused_k,
         cu_seqlens_k_new,
+        window_size_left,
+        window_size_right,
+        leftpad_k,
         num_splits_dynamic,
         batch_table,
         num_m_blocks,

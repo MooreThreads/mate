@@ -14,6 +14,19 @@ mate --help
 python -m mate --help
 ```
 
+For source builds or local wheels in an environment that already has the
+correct MUSA-enabled `torch` / `torch_musa` stack installed, prefer
+`--no-deps`. This is especially important with `--force-reinstall`, which can
+otherwise replace the MUSA PyTorch stack with the official PyPI `torch`
+package.
+
+From a local wheel:
+
+```bash
+python -m pip install --no-deps /abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl
+python -m pip install --force-reinstall --no-deps /abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl
+```
+
 If you plan to load or replay dumps written in `safetensors` format, install the CLI extra or install `safetensors` directly.
 
 From a package index:
@@ -28,9 +41,19 @@ If you only have a local wheel, use the standard direct-reference syntax instead
 python -m pip install "mate[cli] @ file:///abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl"
 ```
 
+If preserving an existing MUSA PyTorch stack matters more than resolving extras
+through pip metadata, install the wheel with `--no-deps` first and then install
+`safetensors` explicitly:
+
+```bash
+python -m pip install --force-reinstall --no-deps /abs/path/mate-0.1.3+mu436-cp310-cp310-linux_x86_64.whl
+python -m pip install safetensors
+```
+
 Notes:
 
 - The `name[extra] @ file:///...` form is the recommended pip syntax for extras with a local wheel
+- `--force-reinstall` without `--no-deps` can cause pip to reinstall `torch` from package metadata, which is usually wrong in a MUSA environment
 - If your environment cannot access a package index, the extra dependency must also be available locally. For `mate[cli]`, that means `safetensors`
 - Installing only the MATE wheel without resolving `safetensors` is still valid, but replaying `*.safetensors` dumps will fail until `safetensors` is installed
 - MATE also requires a MUSA-enabled `apache-tvm-ffi` build. Install or build it from the MooreThreads MUSA fork at `https://github.com/MooreThreads/tvm-ffi` using a release tag that contains `musa` (for example `v0.1.9.post2+musa.1`); a plain upstream TVM-FFI package is treated as an invalid runtime dependency by `mate check`
@@ -39,7 +62,11 @@ Notes:
 
 | Command | Purpose |
 | --- | --- |
-| `mate show-config` | Show MATE, Python, PyTorch, MUSA, and AOT information |
+| `mate show-config` | Show MATE, Python, PyTorch, MUSA, JIT, and AOT information |
+| `mate module-status [--detailed]` | Show registered JIT/AOT module status without compiling |
+| `mate list-modules [MODULE]` | List registered JIT/AOT modules or inspect one module |
+| `mate export-compile-commands [PATH]` | Export compile commands for registered JIT modules |
+| `mate clear-cache` | Remove the runtime JIT cache directory only |
 | `mate env` | Show relevant environment variables and their current values |
 | `mate check` | Validate a usable MATE runtime environment |
 | `mate replay --dir PATH` | Replay one Level 10 dump or a directory of dumps |
@@ -68,6 +95,7 @@ The command reports:
 - PyTorch version
 - `torch_musa` version and whether MUSA is available
 - Resolved JIT MUSA architecture list, cache key, and whether the value came from `MATE_MUSA_ARCH_LIST` or auto-detection
+- JIT workspace/cache/generated-source directories, AOT directory, JIT toggles, and registered module counts
 - `apache-tvm-ffi` version and whether it is a MUSA-enabled build
 - MUSA device count and device names
 - AOT library directory and a short sample of detected `.so` files
@@ -87,10 +115,31 @@ mate env
 ```
 
 This command is a read-only view of the current process environment. It is useful for checking whether shell exports are in place before launching a workload.
+For variable meanings, defaults, and timing details, see [Environment Variables](environment_variables.md).
 
-Runtime JIT cache files are isolated by MATE base version and normalized MUSA target architecture list. They are not split by Torch version.
-When a matching AOT library exists, runtime loading prefers AOT. `MATE_DISABLE_JIT=1` switches to AOT-only behavior and causes a hard error if no matching AOT module exists.
-If `MATE_MUSA_ARCH_LIST` is unset, `mate show-config` reports either the auto-detected visible-device architectures or why auto-detection was unavailable.
+### JIT/AOT diagnostics
+
+These commands register the default JIT/AOT module specs for diagnostics, but they do not compile kernels or run ninja:
+
+```bash
+MATE_MUSA_ARCH_LIST=3.1 mate module-status
+MATE_MUSA_ARCH_LIST=3.1 mate module-status --detailed
+MATE_MUSA_ARCH_LIST=3.1 mate list-modules
+MATE_MUSA_ARCH_LIST=3.1 mate list-modules gemm_ops
+MATE_MUSA_ARCH_LIST=3.1 mate export-compile-commands
+```
+
+`module-status` reports whether each module is backed by an AOT library, an existing runtime JIT `.so`, or no compiled library. `list-modules MODULE` prints JSON for a single module, including source files and expected AOT/JIT paths. `export-compile-commands` writes `compile_commands.json` by default for clangd/IDE tooling.
+
+Use `MATE_MUSA_ARCH_LIST=3.1` for offline diagnostics when no MUSA device is visible. See [Environment Variables](environment_variables.md) for details.
+
+### `clear-cache`
+
+Remove runtime JIT cache files without touching AOT libraries:
+
+```bash
+mate clear-cache
+```
 
 ### `check`
 
@@ -169,7 +218,7 @@ Practical notes:
 
 - `--device cpu` is useful for validating dump loading and argument reconstruction, but execution only succeeds if the target API supports CPU tensors
 - Replaying `safetensors` dumps requires `safetensors` to be installed
-- Dumps produced with `MATE_DUMP_SAFETENSORS=1` lose original stride and non-contiguous layout information because tensors are saved as contiguous tensors
+- Dumps produced with `MATE_DUMP_SAFETENSORS=1` lose original stride and non-contiguous layout information; see [Environment Variables](environment_variables.md) for dump format details
 
 ### `list-dumps`
 
@@ -198,7 +247,7 @@ With `--details`, the output includes:
 
 ## Level 10 Dump Layout
 
-When `MATE_LOGLEVEL=10`, MATE writes one subdirectory per dumped API call under `MATE_DUMP_DIR`:
+When Level 10 API logging is enabled, MATE writes one subdirectory per dumped API call under the configured dump root:
 
 ```text
 mate_dumps/
@@ -223,33 +272,8 @@ Notes:
 
 ## Environment Variables
 
-The logging and dumping configuration is read when `mate.api_logging` is imported. Set these variables before launching the Python process you want to observe.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `MATE_LOGLEVEL` | `0` | Logging level: `0`, `1`, `3`, `5`, `10` |
-| `MATE_LOGDEST` | `stdout` | Log destination: `stdout`, `stderr`, or a file path |
-| `MATE_DUMP_DIR` | `mate_dumps` | Root directory for Level 10 dumps |
-| `MATE_DUMP_MAX_SIZE_GB` | `20` | Maximum total dump size in GB per process |
-| `MATE_DUMP_MAX_COUNT` | `1000` | Maximum number of dumped calls per process |
-| `MATE_DUMP_SAFETENSORS` | `0` | Save dumps as `safetensors` instead of `torch.save` |
-| `MATE_DUMP_INCLUDE` | empty | Comma-separated `fnmatch` patterns to include |
-| `MATE_DUMP_EXCLUDE` | empty | Comma-separated `fnmatch` patterns to exclude |
-| `MATE_MUSA_ARCH_LIST` | auto-detect visible devices | MUSA architecture list used by JIT/AOT workflows; accepts space-separated `major.minor` values such as `3.1` or `3.1 4.0` |
-| `MATE_WORKSPACE_BASE` | home directory | Base directory for the MATE cache workspace |
-| `MATE_DISABLE_JIT` | `0` | Disable runtime JIT and require matching AOT modules |
-| `MATE_JIT_VERBOSE` | `0` | Show verbose ninja output for runtime JIT builds |
-
-Log-level meaning:
-
-- `0`: disabled
-- `1`: function names only
-- `3`: function names plus structured inputs and outputs
-- `5`: level 3 plus tensor statistics
-- `10`: level 5 plus on-disk tensor dumping for replay
-
-`MATE_LOGDEST` also supports `%i` in file paths, which is replaced with the current process id.
-MATE does not provide an environment variable to bypass AOT and force runtime JIT when matching AOT modules are present.
+Use `mate env` to inspect current values. For the complete list of variables,
+defaults, and detailed behavior, see [Environment Variables](environment_variables.md).
 
 ## Usage Examples
 

@@ -6,6 +6,7 @@ import torch
 import torch_musa  # noqa: F401
 from mate import flash_attn_varlen_func
 from typing import Optional  # noqa: F401
+from mate.testing import supported_musa_compute_capability
 
 
 def ref_attn(
@@ -76,6 +77,7 @@ def ref_attn(
         return torch.stack(outputs, dim=0), torch.stack(lse_outputs, dim=0)
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize(
     "seq_lens",
     [

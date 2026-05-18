@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+import random
+
 import pytest
 import torch
 import torch_musa  # noqa: F401
@@ -22,16 +25,32 @@ from mate.testing.flash_attn import (
     mask_unused,
     generate_block_kvcache,
     gen_padding_mask_from_seqlens,
+    generate_random_padding_mask,
+    apply_rotary_emb,
     lse_ref_from_score,
     unpad_input,
     pad_input,
     _combine_cp_partials,
     make_cp_rank_local_paged_kvcache,
 )
+from mate.execution_context import (
+    maybe_fake_tensor_mode,
+    empty_if_dry_run,
+    is_fake_mode,
+    is_dry_run_enabled,
+    MateDryRunComplete,
+)
+from mate.testing import supported_musa_compute_capability
+from torch.testing import assert_close as cmp  # noqa: F401
 
 # from mate.jit.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
+torch.set_printoptions(sci_mode=False, precision=4)
+
+USE_FAKE_MODE = is_dry_run_enabled()
 
 
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_splits", [0, 5])  # neg value disable split
 @pytest.mark.parametrize("pack_gqa", [True, False])
@@ -131,35 +150,16 @@ def test_metadata(
         torch.arange(max_seqlen_kv, device=device), "s -> 1 s"
     )
     key_padding_mask = max_seqlen_kv_arange < rearrange(cache_seqlens, "b -> b 1")
-    out_ref, _, score_ref = attention_ref(
-        q=query_pad,
-        k=k_cache_rep,
-        v=v_cache_rep,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-        key_leftpad=None,
-        attn_bias=None,
-        dropout_p=0.0,
-        dropout_mask=None,
-        causal=is_causal,
-        qv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        window_size=window_size,
-        attention_chunk=0,
-        sink_token_length=0,
-        learnable_sink=learnable_sink,
-        softcap=0.0,
-        upcast=True,
-        reorder_ops=False,
-        intermediate_dtype=None,
-    )
 
     atol, rtol = 1.5e-2, 1e-2
 
     if num_splits >= 0:
-        metadata = get_scheduler_metadata(
+        metadata = empty_if_dry_run(
+            get_scheduler_metadata,
+            empty_values=torch.empty(
+                (4 * batch_size,), dtype=torch.int32, device=device
+            ),
+        )(
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_qo,
             max_seqlen_k=max_seqlen_kv,
@@ -184,9 +184,6 @@ def test_metadata(
             pack_gqa=pack_gqa,
             mp_margin=0,
         )
-        # batch size of 1000 should never splits
-        splits = metadata[:batch_size]
-        torch.testing.assert_close(splits, torch.ones_like(splits), atol=0, rtol=0)
     else:
         # not split
         metadata = None  # noqa: F841
@@ -235,6 +232,30 @@ def test_metadata(
             seqused_q=None,
             cu_seqlens_q=cu_seqlens_qo,
         )
+    out_ref, _, score_ref = attention_ref(
+        q=query_pad,
+        k=k_cache_rep,
+        v=v_cache_rep,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
 
     out_pad = pad_input(out, indices_query, batch_size, max_seqlen_query)
     lse_ref, _ = lse_ref_from_score(
@@ -247,6 +268,9 @@ def test_metadata(
         learnable_sink=learnable_sink,
     )
 
+    # batch size of 1000 should never splits
+    splits = metadata[:batch_size]
+    torch.testing.assert_close(splits, torch.ones_like(splits), atol=0, rtol=0)
     atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(lse_ref, lse, atol=atol, rtol=rtol)
     torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
@@ -257,7 +281,8 @@ def test_metadata(
 # ==============================================================================
 
 
-@pytest.mark.skip(reason="Skip for CI. Avoid Long JIT")
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_splits", [-1, 0, 5])
 @pytest.mark.parametrize("pack_gqa", [False])
@@ -340,7 +365,12 @@ def test_varlen_func_bshd(
 
     metadata = None
     if num_splits >= 0:
-        metadata = get_scheduler_metadata(
+        metadata = empty_if_dry_run(
+            get_scheduler_metadata,
+            empty_values=torch.empty(
+                (4 * batch_size,), dtype=torch.int32, device=device
+            ),
+        )(
             batch_size=batch_size,
             max_seqlen_q=seqlen_qo,
             max_seqlen_k=seqlen_kv,
@@ -365,31 +395,6 @@ def test_varlen_func_bshd(
             pack_gqa=pack_gqa,
             mp_margin=0,
         )
-
-    out_ref, _, score_ref = attention_ref(
-        q=query,
-        k=key,
-        v=value,
-        query_padding_mask=None,
-        key_padding_mask=None,
-        key_leftpad=None,
-        attn_bias=None,
-        dropout_p=0.0,
-        dropout_mask=None,
-        causal=is_causal,
-        qv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        window_size=window_size,
-        attention_chunk=0,
-        sink_token_length=0,
-        learnable_sink=None,
-        softcap=0.0,
-        upcast=True,
-        reorder_ops=False,
-        intermediate_dtype=None,
-    )
 
     out, lse = flash_attn_varlen_func(
         q=query,
@@ -420,6 +425,31 @@ def test_varlen_func_bshd(
         backend=backend,
     )
 
+    out_ref, _, score_ref = attention_ref(
+        q=query,
+        k=key,
+        v=value,
+        query_padding_mask=None,
+        key_padding_mask=None,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=None,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
+
     _, lse_ref_pad = lse_ref_from_score(
         score_ref,
         is_causal=is_causal,
@@ -435,6 +465,8 @@ def test_varlen_func_bshd(
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
 
 
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("cp_world_size", [1, 2, 4])
 @pytest.mark.parametrize("num_splits", [-1, 0, 5])
@@ -520,41 +552,18 @@ def test_varlen_func_ragged_qkv(
         window_size = mask  # type: ignore
 
     learnable_sink = None
-
-    out_ref, _, score_ref = attention_ref(
-        q=q_pad,
-        k=k_pad,
-        v=v_pad,
-        query_padding_mask=q_padding_mask,
-        key_padding_mask=kv_padding_mask,
-        key_leftpad=None,
-        attn_bias=None,
-        dropout_p=0.0,
-        dropout_mask=None,
-        causal=is_causal,
-        qv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        window_size=window_size,
-        attention_chunk=0,
-        sink_token_length=0,
-        learnable_sink=learnable_sink,
-        softcap=0.0,
-        upcast=True,
-        reorder_ops=False,
-        intermediate_dtype=None,
-    )
-
     atol, rtol = 1.5e-2, 1e-2
 
     if cp_world_size > 1:
         # CP path: split KV interleaved across ranks, combine partial outputs.
         # Use effective seqlens (seqused if present) as the split boundary.
-        eff_seqlens_kv = [
-            seqused_kv[b].item() if seqused_kv is not None else seqlens_kv[b]
-            for b in range(batch_size)
-        ]
+        if is_fake_mode():
+            eff_seqlens_kv = [0 for _ in range(batch_size)]
+        else:
+            eff_seqlens_kv = [
+                seqused_kv[b].item() if seqused_kv is not None else seqlens_kv[b]
+                for b in range(batch_size)
+            ]
         cp_tot_seqused_k = torch.tensor(
             eff_seqlens_kv, dtype=torch.int32, device=device
         )
@@ -570,16 +579,22 @@ def test_varlen_func_ragged_qkv(
                     (sk - cp_rank + cp_world_size - 1) // cp_world_size
                 )
 
-            cu_seqlens_k_local = torch.tensor(
-                [0] + torch.cumsum(torch.tensor(local_seqlens_k), dim=0).tolist(),
+            cu_seqlens_k_local = torch.cumsum(
+                torch.tensor([0] + local_seqlens_k, dtype=torch.int32, device=device),
+                dim=0,
                 dtype=torch.int32,
-                device=device,
             )
             k_local = torch.cat(k_segs, dim=0)
             v_local = torch.cat(v_segs, dim=0)
 
+            metadata = None
             if num_splits >= 0:
-                metadata = get_scheduler_metadata(
+                metadata = empty_if_dry_run(
+                    get_scheduler_metadata,
+                    empty_values=torch.empty(
+                        (4 * batch_size,), dtype=torch.int32, device=device
+                    ),
+                )(
                     batch_size=batch_size,
                     max_seqlen_q=max_seqlen_qo,
                     max_seqlen_k=max(local_seqlens_k),
@@ -604,10 +619,6 @@ def test_varlen_func_ragged_qkv(
                     pack_gqa=pack_gqa,
                     mp_margin=0,
                 )
-            else:
-                # not split
-                metadata = None  # noqa: F841
-                num_splits = -1
 
             out_rank, lse_rank = flash_attn_varlen_func(
                 q=q_unpad,
@@ -663,68 +674,95 @@ def test_varlen_func_ragged_qkv(
             pad_input(combined_unpad.to(dtype), indices_q, batch_size, max_seqlen_qo),
             seqused_qo,
         )
-        out_ref = mask_unused(out_ref, seqused_qo)
-        torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
-        return
+    else:
+        metadata = None
+        if num_splits >= 0:
+            metadata = empty_if_dry_run(
+                get_scheduler_metadata,
+                empty_values=torch.empty(
+                    (4 * batch_size,), dtype=torch.int32, device=device
+                ),
+            )(
+                batch_size=batch_size,
+                max_seqlen_q=max_seqlen_qo,
+                max_seqlen_k=max_seqlen_kv,
+                num_heads_q=head_qo,
+                num_heads_kv=head_kv,
+                headdim=headdim_qk,
+                seqused_q=seqused_qo,
+                seqused_k=seqused_kv,
+                headdim_v=headdim_vo,
+                qkv_dtype=dtype,
+                cu_seqlens_q=cu_seqlens_qo,
+                cu_seqlens_k=cu_seqlens_kv,
+                cu_seqlens_k_new=None,
+                cache_leftpad=None,
+                page_size=None,
+                max_seqlen_k_new=0,
+                causal=is_causal,
+                window_size=window_size,
+                attention_chunk=0,
+                has_softcap=False,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
+                mp_margin=0,
+            )
 
-    if num_splits >= 0:
-        metadata = get_scheduler_metadata(
-            batch_size=batch_size,
-            max_seqlen_q=max_seqlen_qo,
-            max_seqlen_k=max_seqlen_kv,
-            num_heads_q=head_qo,
-            num_heads_kv=head_kv,
-            headdim=headdim_qk,
-            seqused_q=seqused_qo,
-            seqused_k=seqused_kv,
-            headdim_v=headdim_vo,
-            qkv_dtype=dtype,
+        out, lse = flash_attn_varlen_func(
+            q=q_unpad,
+            k=k_unpad,
+            v=v_unpad,
             cu_seqlens_q=cu_seqlens_qo,
             cu_seqlens_k=cu_seqlens_kv,
-            cu_seqlens_k_new=None,
-            cache_leftpad=None,
-            page_size=None,
-            max_seqlen_k_new=0,
+            max_seqlen_q=max_seqlen_qo,
+            max_seqlen_k=max_seqlen_kv,
+            seqused_q=seqused_qo,
+            seqused_k=seqused_kv,
+            softmax_scale=softmax_scale,
             causal=is_causal,
+            qv=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             attention_chunk=0,
-            has_softcap=False,
+            softcap=0.0,
+            scheduler_metadata=metadata,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
-            mp_margin=0,
+            deterministic=False,
+            sm_margin=0,
+            return_softmax_lse=True,
+            backend=backend,
         )
-    else:
-        # not split
-        metadata = None  # noqa: F841
-        num_splits = -1
+        out_pad = mask_unused(
+            pad_input(out, indices_q, batch_size, max_seqlen_qo), seqused_qo
+        )
 
-    out, lse = flash_attn_varlen_func(
-        q=q_unpad,
-        k=k_unpad,
-        v=v_unpad,
-        cu_seqlens_q=cu_seqlens_qo,
-        cu_seqlens_k=cu_seqlens_kv,
-        max_seqlen_q=max_seqlen_qo,
-        max_seqlen_k=max_seqlen_kv,
-        seqused_q=seqused_qo,
-        seqused_k=seqused_kv,
-        softmax_scale=softmax_scale,
+    out_ref, _, score_ref = attention_ref(
+        q=q_pad,
+        k=k_pad,
+        v=v_pad,
+        query_padding_mask=q_padding_mask,
+        key_padding_mask=kv_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
         causal=is_causal,
         qv=None,
         q_descale=None,
         k_descale=None,
         v_descale=None,
         window_size=window_size,
-        learnable_sink=learnable_sink,
         attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
         softcap=0.0,
-        scheduler_metadata=metadata,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        deterministic=False,
-        sm_margin=0,
-        return_softmax_lse=True,
-        backend=backend,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
     )
 
     # lse_ref_unpad, _ = lse_ref_from_score(
@@ -737,21 +775,18 @@ def test_varlen_func_ragged_qkv(
     #     learnable_sink=learnable_sink,
     # )
 
-    out_pad = mask_unused(
-        pad_input(out, indices_q, batch_size, max_seqlen_qo), seqused_qo
-    )
     out_ref = mask_unused(out_ref, seqused_qo)
 
     atol, rtol = 1.5e-2, 1e-2
 
-    # import pdb
     # pdb.set_trace()
 
     # torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.skip(reason="Skip for CI. Avoid Long JIT")
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("softcap", [0.0, 50.0])
 @pytest.mark.parametrize("num_splits", [-1, 0, 5])
@@ -843,7 +878,12 @@ def test_varlen_func_ragged_qkv_advance(
         learnable_sink = None
 
     if num_splits >= 0:
-        metadata = get_scheduler_metadata(
+        metadata = empty_if_dry_run(
+            get_scheduler_metadata,
+            empty_values=torch.empty(
+                (4 * batch_size,), dtype=torch.int32, device=device
+            ),
+        )(
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_qo,
             max_seqlen_k=max_seqlen_kv,
@@ -956,6 +996,8 @@ def test_varlen_func_ragged_qkv_advance(
 # ==============================================================================
 
 
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("cp_world_size", [1, 2, 4])
 @pytest.mark.parametrize("num_splits", [0, 5])  # neg value disable split
@@ -1060,30 +1102,6 @@ def test_paged_attn(
         torch.arange(max_seqlen_kv, device=device), "s -> 1 s"
     )
     key_padding_mask = max_seqlen_kv_arange < rearrange(cache_seqlens, "b -> b 1")
-    out_ref, _, score_ref = attention_ref(
-        q=query_pad,
-        k=k_cache_rep,
-        v=v_cache_rep,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-        key_leftpad=None,
-        attn_bias=None,
-        dropout_p=0.0,
-        dropout_mask=None,
-        causal=is_causal,
-        qv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        window_size=window_size,
-        attention_chunk=0,
-        sink_token_length=0,
-        learnable_sink=learnable_sink,
-        softcap=0.0,
-        upcast=True,
-        reorder_ops=False,
-        intermediate_dtype=None,
-    )
 
     atol, rtol = 1.5e-2, 1e-2
 
@@ -1106,11 +1124,17 @@ def test_paged_attn(
                 )
             )
 
+            metadata = None
             if num_splits >= 0:
-                metadata = get_scheduler_metadata(
+                metadata = empty_if_dry_run(
+                    get_scheduler_metadata,
+                    empty_values=torch.empty(
+                        (4 * batch_size,), dtype=torch.int32, device=device
+                    ),
+                )(
                     batch_size=batch_size,
                     max_seqlen_q=max_seqlen_qo,
-                    max_seqlen_k=max(local_seqlens).item(),
+                    max_seqlen_k=1 if is_fake_mode() else max(local_seqlens).item(),
                     num_heads_q=head_qo,
                     num_heads_kv=head_kv,
                     headdim=headdim_qk,
@@ -1132,10 +1156,6 @@ def test_paged_attn(
                     pack_gqa=pack_gqa,
                     mp_margin=0,
                 )
-            else:
-                # not split
-                metadata = None  # noqa: F841
-                num_splits = -1
 
             out_rank, lse_rank, *_ = flash_attn_with_kvcache(
                 q=query_unpad,
@@ -1179,100 +1199,124 @@ def test_paged_attn(
         out_pad = pad_input(
             combined_unpad.to(dtype), indices_query, batch_size, max_seqlen_query
         )
-        torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
-        return
+    else:
+        metadata = None
+        if num_splits >= 0:
+            metadata = empty_if_dry_run(
+                get_scheduler_metadata,
+                empty_values=torch.empty(
+                    (4 * batch_size,), dtype=torch.int32, device=device
+                ),
+            )(
+                batch_size=batch_size,
+                max_seqlen_q=max_seqlen_qo,
+                max_seqlen_k=max_seqlen_kv,
+                num_heads_q=head_qo,
+                num_heads_kv=head_kv,
+                headdim=headdim_qk,
+                seqused_q=None,
+                seqused_k=cache_seqlens,
+                headdim_v=headdim_vo,
+                qkv_dtype=dtype,
+                cu_seqlens_q=cu_seqlens_qo,
+                cu_seqlens_k=None,
+                cu_seqlens_k_new=None,
+                cache_leftpad=None,
+                page_size=page_size,
+                max_seqlen_k_new=0,
+                causal=is_causal,
+                window_size=window_size,
+                attention_chunk=0,
+                has_softcap=False,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
+                mp_margin=0,
+            )
+            # print(metadata[:4*batch_size].view(4, -1))
 
-    if num_splits >= 0:
-        metadata = get_scheduler_metadata(
-            batch_size=batch_size,
-            max_seqlen_q=max_seqlen_qo,
-            max_seqlen_k=max_seqlen_kv,
-            num_heads_q=head_qo,
-            num_heads_kv=head_kv,
-            headdim=headdim_qk,
-            seqused_q=None,
-            seqused_k=cache_seqlens,
-            headdim_v=headdim_vo,
-            qkv_dtype=dtype,
-            cu_seqlens_q=cu_seqlens_qo,
-            cu_seqlens_k=None,
-            cu_seqlens_k_new=None,
+            # TODO: too many feat unsupported
+            # out_accum_ref, lse_accum_ref = attention_accum_ref(
+            #     query=query_pad,
+            #     key=k_cache_rep,
+            #     value=v_cache_rep,
+            #     metadata=metadata,
+            #     num_splits=num_splits,
+            #     softmax_scale=softmax_scale,
+            #     seqused_q=None,
+            #     seqused_kv=cache_seqlens,
+            #     cu_seqlens_q=cu_seqlens_qo,
+            #     cu_seqlens_kv=None,
+            # )
+
+        out, lse, out_accum, lse_accum, *rest = flash_attn_with_kvcache(
+            q=query_unpad,
+            k_cache=k_cache if page_size is None else k_cache_paged,
+            v_cache=v_cache if page_size is None else v_cache_paged,
+            k=None,
+            v=None,
+            qv=None,
+            rotary_cos=None,
+            rotary_sin=None,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=None,
             cache_leftpad=None,
-            page_size=page_size,
-            max_seqlen_k_new=0,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_qo,
+            cu_seqlens_k_new=None,
+            max_seqlen_q=max_seqlen_qo,
+            rotary_seqlens=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            softmax_scale=softmax_scale,
             causal=is_causal,
             window_size=window_size,
+            learnable_sink=learnable_sink,
             attention_chunk=0,
-            has_softcap=False,
+            softcap=0.0,
+            rotary_interleaved=False,
+            scheduler_metadata=metadata,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
-            mp_margin=0,
+            sm_margin=0,
+            return_softmax_lse=True,
         )
-        # print(metadata[:4*batch_size].view(4, -1))
 
-        # TODO: too many feat unsupported
-        # out_accum_ref, lse_accum_ref = attention_accum_ref(
-        #     query=query_pad,
-        #     key=k_cache_rep,
-        #     value=v_cache_rep,
-        #     metadata=metadata,
-        #     num_splits=num_splits,
-        #     softmax_scale=softmax_scale,
-        #     seqused_q=None,
-        #     seqused_kv=cache_seqlens,
-        #     cu_seqlens_q=cu_seqlens_qo,
-        #     cu_seqlens_kv=None,
-        # )
-    else:
-        # not split
-        metadata = None  # noqa: F841
-        num_splits = -1
+        if num_splits >= 0:
+            out_accum = torch.utils.dlpack.from_dlpack(out_accum)
+            lse_accum = torch.utils.dlpack.from_dlpack(lse_accum)
+            out_accum_pad, lse_accum_pad = pad_accum(
+                out_accum=out_accum,
+                lse_accum=lse_accum,
+                seqused_q=None,
+                cu_seqlens_q=cu_seqlens_qo,
+            )
+        out_pad = pad_input(out, indices_query, batch_size, max_seqlen_query)
 
-    out, lse, out_accum, lse_accum, *rest = flash_attn_with_kvcache(
-        q=query_unpad,
-        k_cache=k_cache if page_size is None else k_cache_paged,
-        v_cache=v_cache if page_size is None else v_cache_paged,
-        k=None,
-        v=None,
+    out_ref, _, score_ref = attention_ref(
+        q=query_pad,
+        k=k_cache_rep,
+        v=v_cache_rep,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
         qv=None,
-        rotary_cos=None,
-        rotary_sin=None,
-        cache_seqlens=cache_seqlens,
-        cache_batch_idx=None,
-        cache_leftpad=None,
-        page_table=page_table,
-        cu_seqlens_q=cu_seqlens_qo,
-        cu_seqlens_k_new=None,
-        max_seqlen_q=max_seqlen_qo,
-        rotary_seqlens=None,
         q_descale=None,
         k_descale=None,
         v_descale=None,
-        softmax_scale=softmax_scale,
-        causal=is_causal,
         window_size=window_size,
-        learnable_sink=learnable_sink,
         attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
         softcap=0.0,
-        rotary_interleaved=False,
-        scheduler_metadata=metadata,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=0,
-        return_softmax_lse=True,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
     )
-
-    if num_splits >= 0:
-        out_accum = torch.utils.dlpack.from_dlpack(out_accum)
-        lse_accum = torch.utils.dlpack.from_dlpack(lse_accum)
-        out_accum_pad, lse_accum_pad = pad_accum(
-            out_accum=out_accum,
-            lse_accum=lse_accum,
-            seqused_q=None,
-            cu_seqlens_q=cu_seqlens_qo,
-        )
-
-    out_pad = pad_input(out, indices_query, batch_size, max_seqlen_query)
     lse_ref, _ = lse_ref_from_score(
         score_ref,
         is_causal=is_causal,
@@ -1284,11 +1328,13 @@ def test_paged_attn(
     )
 
     atol, rtol = 1.5e-2, 1e-2
-    torch.testing.assert_close(lse_ref, lse, atol=atol, rtol=rtol)
+    if cp_world_size == 1:
+        torch.testing.assert_close(lse_ref, lse, atol=atol, rtol=rtol)
     torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.skip(reason="Skip for CI. Avoid Long JIT")
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_splits", [0, 5])  # neg value disable split
 @pytest.mark.parametrize("pack_gqa", [True, False])
@@ -1399,33 +1445,15 @@ def test_paged_attn_advance(
         torch.arange(max_seqlen_kv, device=device), "s -> 1 s"
     )
     key_padding_mask = max_seqlen_kv_arange < rearrange(cache_seqlens, "b -> b 1")
-    out_ref, _, score_ref = attention_ref(
-        q=query_pad,
-        k=k_cache_rep,
-        v=v_cache_rep,
-        query_padding_mask=query_padding_mask if is_varlen_q else None,
-        key_padding_mask=key_padding_mask,
-        key_leftpad=None,
-        attn_bias=None,
-        dropout_p=0.0,
-        dropout_mask=None,
-        causal=is_causal,
-        qv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        window_size=window_size,
-        attention_chunk=0,
-        sink_token_length=0,
-        learnable_sink=learnable_sink,
-        softcap=0.0,
-        upcast=True,
-        reorder_ops=False,
-        intermediate_dtype=None,
-    )
 
+    metadata = None
     if num_splits >= 0:
-        metadata = get_scheduler_metadata(
+        metadata = empty_if_dry_run(
+            get_scheduler_metadata,
+            empty_values=torch.empty(
+                (4 * batch_size,), dtype=torch.int32, device=device
+            ),
+        )(
             batch_size=batch_size,
             max_seqlen_q=max_seqlen_qo,
             max_seqlen_k=max_seqlen_kv,
@@ -1465,10 +1493,6 @@ def test_paged_attn_advance(
         #     cu_seqlens_q=cu_seqlens_qo,
         #     cu_seqlens_kv=None,
         # )
-    else:
-        # not split
-        metadata = None  # noqa: F841
-        num_splits = -1
 
     out, lse, out_accum, lse_accum, *rest = flash_attn_with_kvcache(
         q=query_unpad if is_varlen_q else query_pad,
@@ -1518,6 +1542,30 @@ def test_paged_attn_advance(
     #         out_accum_pad = out_accum
     #         lse_accum_pad = lse_accum
 
+    out_ref, _, score_ref = attention_ref(
+        q=query_pad,
+        k=k_cache_rep,
+        v=v_cache_rep,
+        query_padding_mask=query_padding_mask if is_varlen_q else None,
+        key_padding_mask=key_padding_mask,
+        key_leftpad=None,
+        attn_bias=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=is_causal,
+        qv=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        window_size=window_size,
+        attention_chunk=0,
+        sink_token_length=0,
+        learnable_sink=learnable_sink,
+        softcap=0.0,
+        upcast=True,
+        reorder_ops=False,
+        intermediate_dtype=None,
+    )
     if is_varlen_q:
         out_pad = pad_input(out, indices_query, batch_size, max_seqlen_query)
     else:
@@ -1539,7 +1587,8 @@ def test_paged_attn_advance(
     torch.testing.assert_close(out_pad, out_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.skip(reason="Will be verified in fwd PR.")
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
 @pytest.mark.parametrize("seqlen_q", [1, 3])
 @pytest.mark.parametrize("headdim_v", [128, 256])
 @pytest.mark.parametrize("num_head", [1, 4, 5, 8])
@@ -1558,7 +1607,7 @@ def test_combine(
     headdim_v: int,
     seqlen_q: int,
 ) -> None:
-    device = torch.device("musa")
+    device = "musa"
 
     # torch.manual_seed(666)
     # torch.musa.manual_seed(666)
@@ -1598,7 +1647,9 @@ def test_combine(
                 seqlens_q.cumsum(dim=0),
             ]
         ).to(torch.int32)
-        total_q = cu_seqlens_q[-1].item()
+        total_q = (
+            cu_seqlens_q[-1].item() if not is_fake_mode() else batch_size * seqlen_q
+        )
         max_seqlen_q = seqlen_q
         shape_oaccum = (1, num_head, max_splits, total_q, headdim_v)  # type: ignore[assignment]
         shape_lseaccum = (1, num_head, max_splits, total_q)  # type: ignore[assignment]
@@ -1676,170 +1727,461 @@ def test_combine(
     torch.set_printoptions(sci_mode=False)
     atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(lse, ref_lse, atol=atol, rtol=rtol)
-    torch.testing.assert_close(out, ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(out, ref_out.to(out.dtype), atol=atol, rtol=rtol)
 
 
+@supported_musa_compute_capability([31])
+@maybe_fake_tensor_mode(fake=USE_FAKE_MODE)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("num_splits", [-1, 0, 5])
+@pytest.mark.parametrize("num_splits", [0, 5])
+@pytest.mark.parametrize("new_kv", [True])
+@pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize(
-    "cache_seqlen_list",
+    "causal", [False, True], ids=lambda x: "causal" if x else "noncausal"
+)
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
+@pytest.mark.parametrize(
+    "has_rotary_seqlens",
     [
-        [1],
-        [1, 63],
-        [63, 64, 65],
-        [1, 63, 64, 127],
+        False,
+        True,
+    ],
+    ids=lambda x: "rotary_seqlens" if x else "no_rotary_seqlens",
+)
+@pytest.mark.parametrize(
+    "rotary_interleaved",
+    [
+        False,
+        True,
+    ],
+    ids=lambda x: "rotary_interleaved" if x else "rotary_contiguous",
+)
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("page_size", [None, 1, 64])
+@pytest.mark.parametrize(
+    "has_leftpad", [True], ids=lambda x: "leftpad" if x else "no_leftpad"
+)
+@pytest.mark.parametrize(
+    "has_batch_idx", [True], ids=lambda x: "batch_idx" if x else "no_batch_idx"
+)
+@pytest.mark.parametrize("pack_gqa", [True])
+@pytest.mark.parametrize(
+    "varlen_q", [True], ids=lambda x: "varlen" if x else "nonvarlen"
+)
+@pytest.mark.parametrize("headdim", [(128, 128)])
+@pytest.mark.parametrize(
+    "heads",
+    [
+        (96, 8),
+        # (40, 8),
+        # (32, 8),
     ],
 )
-@pytest.mark.parametrize("append_seqlen", [1, 3, 7])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 128),
+        (1, 339),
+        (3, 1024),
+        (64, 800),
+        # (64, 256),
+        (3, 799),
+        # (64, 2048),
+        (16, 20000),
+        # (1, 128 * 64),
+        # (16, 128 * 64),
+        # (128, 128),
+    ],
+)
+@pytest.mark.parametrize(
+    "batch_size",
+    [1, 10, 77],
+)
 @torch.inference_mode()
-def test_paged_attn_appendkv(cache_seqlen_list: list[int], append_seqlen: int):
-    torch.manual_seed(666)
-    torch.musa.manual_seed(666)
+def test_advance_features(
+    batch_size,
+    seqlen_q,
+    seqlen_k,
+    heads,
+    headdim,
+    varlen_q,
+    pack_gqa,
+    has_batch_idx,
+    has_leftpad,
+    page_size,
+    rotary_fraction,
+    rotary_interleaved,
+    has_rotary_seqlens,
+    seqlen_new_eq_seqlen_q,
+    causal,
+    local,
+    new_kv,
+    num_splits,
+    dtype,
+) -> None:
+    # Skip
+    # if page_size is not None and seqlen_k % page_size != 0:
+    #     pytest.skip()
+    if seqlen_q > seqlen_k and new_kv:
+        pytest.skip()
+    if not new_kv:
+        if rotary_fraction > 0.0 or seqlen_new_eq_seqlen_q or has_rotary_seqlens:
+            pytest.skip()
+    if rotary_fraction == 0.0:
+        if has_rotary_seqlens or not rotary_interleaved:
+            pytest.skip()
 
     device = "musa"
-    dtype = torch.bfloat16
-    batch_size = len(cache_seqlen_list)
-    seqlen_q = 1
-    total_seqlens_kv = [
-        cache_seqlen + append_seqlen for cache_seqlen in cache_seqlen_list
-    ]
-    max_total_seqlen_kv = max(total_seqlens_kv)
-    head_qo = 8
-    head_kv = 1
-    headdim_qk = 128
-    headdim_vo = 128
-    page_size = 64
+    torch.manual_seed(666)
+    torch.musa.manual_seed(666)
+    random.seed(666)
 
+    head_qo, head_kv = heads
+    headdim_qk, headdim_vo = headdim
+
+    rotary_dim = math.floor(int(rotary_fraction * headdim_qk) / 16) * 16
+
+    # init_tensors()
+    batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
     q = torch.randn(
         batch_size, seqlen_q, head_qo, headdim_qk, device=device, dtype=dtype
     )
-    k_new = torch.randn(
-        batch_size, append_seqlen, head_kv, headdim_qk, device=device, dtype=dtype
-    )
-    v_new = torch.randn(
-        batch_size, append_seqlen, head_kv, headdim_vo, device=device, dtype=dtype
-    )
-    cache_seqlens = torch.tensor(cache_seqlen_list, dtype=torch.int32, device=device)
-    total_seqlens = torch.tensor(total_seqlens_kv, dtype=torch.int32, device=device)
+    if varlen_q:
+        query_padding_mask = generate_random_padding_mask(
+            seqlen_q, batch_size, device, mode="random"
+        )
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(
+            q, query_padding_mask
+        )
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
+    else:
+        query_padding_mask = None
+        q_unpad = q
+        cu_seqlens_q, max_seqlen_q = None, seqlen_q
 
-    k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, _ = (
-        generate_block_kvcache(
-            max_total_seqlen_kv,
+    window_size = (None, None) if not local else torch.randint(0, seqlen_k, (2,))
+
+    seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else random.randint(1, seqlen_q)
+    cu_seqlens_k_new = None
+    key_new_padding_mask = None
+    if new_kv:
+        k = torch.randn(
+            batch_size, seqlen_new, head_kv, headdim_qk, device=device, dtype=dtype
+        )
+        v = torch.randn(
+            batch_size, seqlen_new, head_kv, headdim_vo, device=device, dtype=dtype
+        )
+        # k = (
+        #     torch.arange(headdim_qk, dtype=dtype, device=device)
+        #     .view(1, 1, 1, -1)
+        #     .expand(batch_size, seqlen_new, head_kv, headdim_qk)
+        #     .contiguous()
+        # )
+        # v = k.clone()
+        if varlen_q:  # k & v are also varlen
+            key_new_padding_mask = generate_random_padding_mask(
+                seqlen_new, batch_size, device, mode="random"
+            )
+            k_unpad, indices_k, cu_seqlens_k_new, *rest = unpad_input(
+                k, key_new_padding_mask
+            )
+            v_unpad, *rest = unpad_input(v, key_new_padding_mask)
+        else:
+            k_unpad, v_unpad = k, v
+    else:
+        k, v, k_unpad, v_unpad = None, None, None, None
+    if page_size is None:
+        k_cache = torch.randn(
+            batch_size_cache, seqlen_k, head_kv, headdim_qk, device=device, dtype=dtype
+        )
+        v_cache = torch.randn(
+            batch_size_cache, seqlen_k, head_kv, headdim_vo, device=device, dtype=dtype
+        )
+        page_table = None
+    else:
+        (
+            k_cache,
+            v_cache,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_pages,
+        ) = generate_block_kvcache(
+            seqlen_k,
             page_size,
-            batch_size,
+            batch_size_cache,
             head_kv,
             headdim_qk,
             headdim_vo,
             device,
             dtype,
+            torch.randn,
         )
+    cache_seqlens = torch.randint(
+        0 if new_kv else 1,
+        # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+        (
+            (
+                seqlen_k
+                - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new)
+                + 1
+            )
+            if new_kv
+            else (seqlen_k + 1)
+        ),
+        (batch_size,),
+        dtype=torch.int32,
+        device=device,
     )
-    k_cache = k_cache.clone().fill_(0)
-    v_cache = v_cache.clone().fill_(0)
-    k_cache_paged = k_cache_paged.clone().fill_(0)
-    v_cache_paged = v_cache_paged.clone().fill_(0)
+    if has_leftpad:
+        if is_fake_mode():
+            cache_leftpad = torch.empty(batch_size, dtype=torch.int32, device=device)
+        else:
+            cache_leftpad = torch.cat(
+                [
+                    torch.randint(
+                        0,
+                        cache_seqlens[i].item(),
+                        (1,),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    if cache_seqlens[i].item() > 0
+                    else torch.zeros(1, dtype=torch.int32, device=device)
+                    for i in range(batch_size)
+                ]
+            )
+    else:
+        cache_leftpad = None
+    if has_batch_idx:
+        cache_batch_idx = torch.randperm(
+            batch_size_cache, dtype=torch.int32, device=device
+        )[:batch_size]
+    else:
+        cache_batch_idx = None
 
-    softmax_scale = headdim_qk**-0.5
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
+    if not new_kv:
+        key_padding_mask = arange < cache_seqlens_expanded
+    else:
+        k_new_seqlens = (
+            key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+        )
+        key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
+    if has_leftpad:
+        key_padding_mask = torch.logical_and(
+            key_padding_mask, arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k)
+        )
 
-    k_full = k_cache.clone()
-    v_full = v_cache.clone()
-    for batch_idx, cache_seqlen in enumerate(cache_seqlen_list):
-        logical_slice = slice(cache_seqlen, cache_seqlen + append_seqlen)
-        k_full[batch_idx, logical_slice] = k_new[batch_idx]
-        v_full[batch_idx, logical_slice] = v_new[batch_idx]
-    key_padding_mask = rearrange(
-        torch.arange(max_total_seqlen_kv, device=device), "s -> 1 s"
-    ) < rearrange(total_seqlens, "b -> b 1")
-    out_ref, _, score_ref = attention_ref(
-        q=q,
-        k=k_full,
-        v=v_full,
-        query_padding_mask=None,
-        key_padding_mask=key_padding_mask,
-        key_leftpad=None,
-        attn_bias=None,
-        dropout_p=0.0,
-        dropout_mask=None,
-        causal=True,
-        qv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        window_size=(None, None),
-        attention_chunk=0,
-        sink_token_length=0,
-        learnable_sink=None,
-        softcap=0.0,
-        upcast=True,
-        reorder_ops=False,
-        intermediate_dtype=None,
-    )
-    _, lse_ref = lse_ref_from_score(
-        score_ref,
-        is_causal=True,
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        seqused_q=None,
-        seqused_k=total_seqlens,
-        learnable_sink=None,
-    )
+    rotary_seqlens = cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2
+    if rotary_dim > 0:
+        angle = (
+            torch.rand(
+                seqlen_k if page_size is None else num_pages * page_size,
+                rotary_dim // 2,
+                device=device,
+            )
+            * 2
+            * math.pi
+        )
+        cos = torch.cos(angle).to(dtype=dtype)
+        sin = torch.sin(angle).to(dtype=dtype)
+        if not is_fake_mode():
+            if causal or local:
+                q_ro = apply_rotary_emb(
+                    q,
+                    cos,
+                    sin,
+                    seqlen_offsets=rotary_seqlens,
+                    interleaved=rotary_interleaved,
+                )
+            else:
+                q_ro = rearrange(
+                    apply_rotary_emb(
+                        rearrange(q, "b s h d -> b 1 (s h) d"),
+                        cos,
+                        sin,
+                        seqlen_offsets=rotary_seqlens,
+                        interleaved=rotary_interleaved,
+                    ),
+                    "b 1 (s h) d -> b s h d",
+                    s=seqlen_q,
+                )
+            # q_ro = q
+            # k_ro = k
+            k_ro = apply_rotary_emb(
+                k,
+                cos,
+                sin,
+                seqlen_offsets=rotary_seqlens,
+                interleaved=rotary_interleaved,
+            )
+        else:
+            q_ro, k_ro = q, k
+    else:
+        cos, sin = None, None
+        q_ro, k_ro = q, k
 
-    out, lse, *_ = flash_attn_with_kvcache(
-        q=q,
-        k_cache=k_cache_paged,
-        v_cache=v_cache_paged,
-        k=k_new,
-        v=v_new,
-        qv=None,
-        rotary_cos=None,
-        rotary_sin=None,
+    if has_batch_idx:
+        k_cache_ref = k_cache[cache_batch_idx.to(dtype=torch.long)].clone()
+        v_cache_ref = v_cache[cache_batch_idx.to(dtype=torch.long)].clone()
+    else:
+        k_cache_ref = k_cache.clone()
+        v_cache_ref = v_cache.clone()
+    if new_kv:
+        update_mask = torch.logical_and(
+            cache_seqlens_expanded <= arange,
+            arange < cache_seqlens_expanded + k_new_seqlens,
+        )
+        k_to_update = rearrange(k_ro, "b s ... -> (b s) ...")
+        v_to_update = rearrange(v, "b s ... -> (b s) ...")
+        if varlen_q:
+            k_to_update = k_to_update[indices_k]
+            v_to_update = v_to_update[indices_k]
+        k_cache_ref[update_mask] = k_to_update
+        v_cache_ref[update_mask] = v_to_update
+    k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+    v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=head_qo // head_kv)
+
+    # call_kernel()
+    scheduler_metadata = None
+    if num_splits >= 0:
+        try:
+            scheduler_metadata = get_scheduler_metadata(
+                batch_size=batch_size,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=seqlen_k,
+                num_heads_q=head_qo,
+                num_heads_kv=head_kv,
+                headdim=headdim_qk,
+                seqused_q=None,
+                seqused_k=cache_seqlens,
+                headdim_v=headdim_vo,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=None,
+                cu_seqlens_k_new=cu_seqlens_k_new,
+                cache_leftpad=cache_leftpad,
+                page_size=page_size,
+                max_seqlen_k_new=seqlen_new if new_kv else 0,
+                causal=causal,
+                window_size=window_size,
+                attention_chunk=0,
+                has_softcap=False,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
+                mp_margin=0,
+            )
+            # print(scheduler_metadata[: 4 * batch_size].view(4, -1))
+        except MateDryRunComplete:
+            scheduler_metadata = torch.empty(
+                4 * batch_size, device=device, dtype=torch.int32
+            )
+
+    out, lse, *rest = flash_attn_with_kvcache(
+        q if not varlen_q else q_unpad,
+        k_cache if page_size is None else k_cache_paged,
+        v_cache if page_size is None else v_cache_paged,
+        k if not new_kv or not varlen_q else k_unpad,
+        v if not new_kv or not varlen_q else v_unpad,
+        rotary_cos=cos,
+        rotary_sin=sin,
         cache_seqlens=cache_seqlens,
-        cache_batch_idx=None,
-        cache_leftpad=None,
+        cache_batch_idx=cache_batch_idx,
+        cache_leftpad=cache_leftpad,
         page_table=page_table,
-        cu_seqlens_q=None,
-        cu_seqlens_k_new=None,
-        max_seqlen_q=None,
-        rotary_seqlens=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        softmax_scale=softmax_scale,
-        causal=True,
-        window_size=(None, None),
-        learnable_sink=None,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k_new=cu_seqlens_k_new,
+        max_seqlen_q=max_seqlen_q,
+        rotary_seqlens=rotary_seqlens,
+        causal=causal,
+        window_size=window_size,
         attention_chunk=0,
-        softcap=0.0,
-        rotary_interleaved=False,
-        scheduler_metadata=None,
-        num_splits=-1,
-        pack_gqa=True,
-        sm_margin=0,
+        rotary_interleaved=rotary_interleaved,
+        scheduler_metadata=scheduler_metadata,
+        num_splits=num_splits,
         return_softmax_lse=True,
+        pack_gqa=pack_gqa,
     )
-    torch.musa.synchronize()
+    if varlen_q:
+        out = output_pad_fn(out)
 
-    atol, rtol = 1.5e-2, 1e-2
+    # generate_ref()
+    out_ref, _, score_ref = attention_ref(
+        q_ro,
+        k_cache_rep,
+        v_cache_rep,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        qv=None,
+        window_size=window_size,
+        attention_chunk=0,
+        key_leftpad=cache_leftpad,
+    )
+
+    # compare()
+    # print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    # print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    if new_kv:
+        if page_size is None:
+            k_cache_select = k_cache if not has_batch_idx else k_cache[cache_batch_idx]
+            v_cache_select = v_cache if not has_batch_idx else v_cache[cache_batch_idx]
+        else:
+            k_cache_select = rearrange(
+                k_cache_paged[
+                    (
+                        page_table if not has_batch_idx else page_table[cache_batch_idx]
+                    ).flatten()
+                ],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k]
+            v_cache_select = rearrange(
+                v_cache_paged[
+                    (
+                        page_table if not has_batch_idx else page_table[cache_batch_idx]
+                    ).flatten()
+                ],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k]
+
+        # Check Appended V Cache
+        try:
+            cmp(
+                v_cache_select,
+                v_cache_ref,
+                rtol=0,
+                atol=0,
+            )
+        except:
+            # pdb.set_trace()
+            raise
+        # Check Appended K Cache
+        if rotary_dim == 0:
+            at, rt = 0.0, 0.0
+        else:
+            at, rt = 1e-2, 1.5e-2
+
+        try:
+            cmp(
+                k_cache_select,
+                k_cache_ref,
+                rtol=rt,
+                atol=at,
+            )
+        except:
+            # pdb.set_trace()
+            raise
+    # mult = 2
+    # pdb.set_trace()
+    # Check Attention Output
     try:
-        for batch_idx, cache_seqlen in enumerate(cache_seqlen_list):
-            for append_idx in range(append_seqlen):
-                logical_pos = cache_seqlen + append_idx
-                page_idx = logical_pos // page_size
-                page_offset = logical_pos % page_size
-                physical_page = page_table[batch_idx, page_idx]
-                torch.testing.assert_close(
-                    k_cache_paged[physical_page, page_offset],
-                    k_new[batch_idx, append_idx],
-                    atol=atol,
-                    rtol=rtol,
-                )
-                torch.testing.assert_close(
-                    v_cache_paged[physical_page, page_offset],
-                    v_new[batch_idx, append_idx],
-                    atol=atol,
-                    rtol=rtol,
-                )
-
-        torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
-        torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
-        assert lse.shape == (batch_size, head_qo, seqlen_q)
-    except AssertionError:
+        cmp(out, out_ref, rtol=1e-2, atol=1.5e-2)
+    except:
+        # pdb.set_trace()
         raise

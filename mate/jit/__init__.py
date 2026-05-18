@@ -30,6 +30,15 @@ from .flash_attention_ops import (
 from .flash_attention_ops import (
     get_flash_attention_ops_module as get_flash_attention_ops_module,
 )
+from .gemm.deep_gemm.hyperconnection import (
+    gen_hyperconnection_aot as gen_hyperconnection_aot,
+)
+from .gemm.deep_gemm.hyperconnection import (
+    gen_hyperconnection_spec as gen_hyperconnection_spec,
+)
+from .gemm.deep_gemm.hyperconnection import (
+    get_hyperconnection_module as get_hyperconnection_module,
+)
 from .gemm_ops import gen_gemm_ops_aot as gen_gemm_ops_aot
 from .gemm_ops import gen_gemm_ops_spec as gen_gemm_ops_spec
 from .gemm_ops import get_gemm_ops_module as get_gemm_ops_module
@@ -63,6 +72,9 @@ __all__ = [
     "gen_gemm_ops_aot",
     "gen_gemm_ops_spec",
     "get_gemm_ops_module",
+    "gen_hyperconnection_aot",
+    "gen_hyperconnection_spec",
+    "get_hyperconnection_module",
     "gen_mla_ops_aot",
     "gen_mla_ops_spec",
     "get_mla_ops_module",
@@ -93,6 +105,7 @@ def prewarm_modules(
     include_flash_attention: bool = False,
     include_gemm: bool = False,
     include_deep_gemm_attention: bool = False,
+    include_hyperconnection: bool = False,
     include_mla: bool = False,
     include_moe_fused_gate: bool = False,
     include_sage_attention: bool = False,
@@ -125,6 +138,10 @@ def prewarm_modules(
         from .deep_gemm_attention import gen_deep_gemm_attention_spec
 
         specs.append(gen_deep_gemm_attention_spec())
+    if include_hyperconnection:
+        from .gemm.deep_gemm.hyperconnection import gen_hyperconnection_aot
+
+        specs.extend(gen_hyperconnection_aot())
     if include_mla:
         from .mla_ops import gen_mla_ops_spec
 

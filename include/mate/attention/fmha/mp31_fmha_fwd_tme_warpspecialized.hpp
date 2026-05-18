@@ -13,6 +13,7 @@
 #include "pack_gqa.hpp"
 #include "paged_kv.hpp"
 #include "pipeline_ws.hpp"
+#include "rotary.hpp"
 #include "seqlen.hpp"
 #include "softmax.hpp"
 #include "utils.hpp"
@@ -39,6 +40,7 @@ template <class Element_,
           bool HasKvBatchIdx_,
           bool HasSequsedQ_,
           bool HasSequsedK_,
+          bool HasLeftpadK_,
           bool IsPagedKV_,
           bool ForceLSULoadKV_,
           bool IsCausal_,
@@ -49,6 +51,9 @@ template <class Element_,
           int  HeadRatio_,
           bool IsPackGQA_,
           bool Split_,
+          bool IsRotary_,
+          bool IsRotaryInterleaved_,
+          bool HasSeqlensRotary_,
           bool EnableCP_,
           int  NumPVConsumers_ = NumQKConsumers_>
 struct Mp31FmhaFwdTmeWarpSpecialized {
@@ -71,6 +76,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   // For Pinghu, the consumer granularity is WarpSquad
   static constexpr int NumMmaWarpSquads = std::max(NumQKConsumers_, NumPVConsumers_);
   static constexpr int NumMmaThreads    = NumMmaWarpSquads * mutlass::NumThreadsPerWarpSquad;
+  static constexpr int NumQKMmaThreads  = NumQKConsumers * mutlass::NumThreadsPerWarpSquad;
+  static constexpr int NumPVMmaThreads  = NumPVConsumers * mutlass::NumThreadsPerWarpSquad;
 
   static_assert(TileM % NumQKConsumers == 0);
   static_assert(TileM % NumPVConsumers == 0);
@@ -81,6 +88,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool HasKvBatchIdx    = HasKvBatchIdx_;
   static constexpr bool HasSequsedQ      = HasSequsedQ_;
   static constexpr bool HasSequsedK      = HasSequsedK_;
+  static constexpr bool HasLeftpadK      = HasLeftpadK_;
 
   static constexpr bool IsPackGQA = IsPackGQA_;
   static constexpr bool IsPagedKV = IsPagedKV_;
@@ -91,8 +99,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool HasLearnableSink = HasLearnableSink_;
   static constexpr bool HasSoftcap       = HasSoftcap_;
 
-  static constexpr bool EnableCP   = EnableCP_;
-  static constexpr bool IsAppendKV = IsAppendKV_;
+  static constexpr bool EnableCP = EnableCP_;
+
+  static constexpr bool IsAppendKV          = IsAppendKV_;
+  static constexpr bool IsRotary            = IsRotary_;
+  static constexpr bool IsRotaryInterleaved = IsRotaryInterleaved_;
+  static constexpr bool HasSeqlensRotary    = HasSeqlensRotary_;
 
   static constexpr bool SameHeadDim = HeadDimQK == HeadDimVO;
 
@@ -102,14 +114,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool UseLSULoadQ = !UseTMELoadQ;
 
   static constexpr bool ForceLSULoadKV = ForceLSULoadKV_ && IsPagedKV;
-  static constexpr bool UseLSULoadK    = ForceLSULoadKV || (!IsPagedKV && HasCuseqlensK);
+  static constexpr bool UseLSULoadK    = ForceLSULoadKV || (!IsPagedKV && (HasCuseqlensK || HasLeftpadK));
   static constexpr bool UseLSULoadV    = ForceLSULoadKV;
 
   static_assert(IsPagedKV || (!IsPagedKV && !ForceLSULoadKV), "ForceLSULoadKV is only supported for paged KV");
   static_assert(!IsPagedKV || (UseLSULoadK && UseLSULoadV) || (!UseLSULoadK && !UseLSULoadV),
                 "KV Load methods must be same if paged KV is enabled!");
-  static_assert(IsPagedKV || (HasCuseqlensK && UseLSULoadK) || !HasCuseqlensK,
-                "Load K support LSU Only if ragged KV is enabled!");
+  static_assert(IsPagedKV || ((HasCuseqlensK || HasLeftpadK) && UseLSULoadK) || !HasCuseqlensK,
+                "Load K support LSU Only if ragged KV or leftpad_k is enabled!");
   static_assert(IsPagedKV || !UseLSULoadV, "Load V support TME Only if paged kv is disabled!");
 
   static constexpr int NumProducerThreads =
@@ -144,13 +156,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
   using StrideDescale = Stride<int64_t, int64_t>;
 
+  using NamedBarrier = mutlass::arch::AsyncBarrier;
+
   using SeqlenInfo = SeqlenInfoQK<HasCuseqlensQ,
                                   HasSequsedQ,
                                   HasCuseqlensK,
                                   HasSequsedK,
-                                  false /* HasLeftpadK */,
+                                  HasLeftpadK,
                                   IsAppendKV,
                                   HasCuseqlensKNew,
+                                  HasSeqlensRotary,
                                   EnableCP>;
   using BlockInfo  = BlockInfo<SeqlenInfo, TileM, TileN, HeadRatio, IsCausal, IsLocal, IsPackGQA, Split, EnableCP>;
 
@@ -232,8 +247,6 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr TME::CacheHint TmeVNewOuterHint = TME::CacheHint::CACHE_NORMAL;
 
   using TmeLoadKeyBuilder = Mp31FmhaTmeLoadKeyBuilder<Element, SmemLayoutK, StrideQKV, TmeKInnerHint, TmeKOuterHint>;
-  using TmeLoadKeyNewBuilder =
-      Mp31FmhaTmeLoadKeyBuilderNoPermute<Element, SmemLayoutK, StrideQKV, TmeKNewInnerHint, TmeKNewOuterHint>;
 
   static constexpr int FragmentSize = TmeLoadKeyBuilder::Fragment;
 
@@ -256,7 +269,11 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       SmemLayoutTMELoadQ{},
       TileShapeQ{}));
   using TME_K      = typename TmeLoadKeyBuilder::TME_K;
-  using TME_KNew   = typename TmeLoadKeyNewBuilder::TME_K;
+  using TME_KNew   = decltype(make_tme_copy<TmeKNewInnerHint, TmeKNewOuterHint>(
+      MP31_TME_LOAD{},
+      make_tensor(
+          make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideQKV{}, int32_t(0)), StrideQKV{}),
+      take<0, 2>(SmemLayoutK{})));
   using TME_V      = decltype(make_tme_copy<TmeVInnerHint, TmeVOuterHint>(
       MP31_TME_LOAD{},
       make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
@@ -292,7 +309,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   using MainloopPipelineV     = std::conditional_t<UseLSULoadV,
                                                    mutlass::Mp31PipelineAsyncWarpsepcialized<StagesV>,
                                                    mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesV>>;
-  using MainloopPipelineKVNew = mutlass::Mp31PipelineTmeAsync<StagesK>;  // Always use TME for new KV
+  using MainloopPipelineKVNew = mutlass::Mp31PipelineTmeAsyncWarpsepcialized<StagesK>;  // Always use TME for new KV
 
   using PipelineQState     = typename MainloopPipelineQ::PipelineState;
   using PipelineKState     = typename MainloopPipelineK::PipelineState;
@@ -340,7 +357,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     StrideRotary const   stride_rotary_cos;
     Element const* const ptr_rotary_sin;
     StrideRotary const   stride_rotary_sin;
-    // bool const is_rotary_interleaved;
+    // bool const is_rotary_interleaved;  // Use IsRotaryInterleaved instead
 
     // PageTable
     int const* const      ptr_pagetable;
@@ -378,8 +395,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     uint32_t const* const cu_seqlens_k_new = nullptr;
     uint32_t const* const seqused_q        = nullptr;
     uint32_t const* const seqused_k        = nullptr;
-    // uint32_t const* const leftpad_k        = nullptr;
-    uint32_t const* const seqlens_rotary = nullptr;
+    uint32_t const* const leftpad_k        = nullptr;
+    uint32_t const* const seqlens_rotary   = nullptr;
 
     // CP
     int             cp_world_size    = 1;
@@ -421,7 +438,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     StrideRotary const   stride_rotary_cos;
     Element const* const ptr_rotary_sin;
     StrideRotary const   stride_rotary_sin;
-    // bool const is_rotary_interleaved;
+    // bool const is_rotary_interleaved;  // Use IsRotaryInterleaved instead
 
     // PageTable
     int const* const      ptr_pagetable;
@@ -447,6 +464,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     RobustDescriptor const desc_page_table;
     RobustDescriptor const desc_K_new;
     RobustDescriptor const desc_V_new;
+    RobustDescriptor const desc_Cos;
+    RobustDescriptor const desc_Sin;
 
     // Scale
     float const         softmax_scale;
@@ -481,8 +500,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     uint32_t const* const cu_seqlens_k_new = nullptr;
     uint32_t const* const seqused_q        = nullptr;
     uint32_t const* const seqused_k        = nullptr;
-    // uint32_t const* const leftpad_k        = nullptr;
-    uint32_t const* const seqlens_rotary = nullptr;
+    uint32_t const* const leftpad_k        = nullptr;
+    uint32_t const* const seqlens_rotary   = nullptr;
 
     // CP
     int             cp_world_size    = 1;
@@ -540,7 +559,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     // AppendKV
     Tensor   mKnew          = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
-    TME_KNew tme_load_K_new = TmeLoadKeyNewBuilder::make_tme_copy(conditional_return<IsAppendKV>(mKnew, mK));
+    TME_KNew tme_load_K_new = make_tme_copy<TmeKNewInnerHint, TmeKNewOuterHint>(
+        MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mKnew, mK), take<0, 2>(SmemLayoutK{}));
     int cosize_k_new = get<0>(args.shape_K_new) == 0 ? 0 : cosize(make_layout(args.shape_K_new, args.stride_K_new));
 
     RobustDescriptor desc_K_new = make_robust_desc(args.ptr_K_new, cosize_k_new);
@@ -553,6 +573,11 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         MP31_TME_LOAD{}, conditional_return<IsAppendKV>(mVnew, mV), take<0, 2>(SmemLayoutV{}));
 
     RobustDescriptor desc_V_new = make_robust_desc(args.ptr_V_new, cosize_k_new);
+
+    RobustDescriptor desc_Cos =
+        make_robust_desc(args.ptr_rotary_cos, cosize(make_layout(args.shape_rotary, args.stride_rotary_cos)));
+    RobustDescriptor desc_Sin =
+        make_robust_desc(args.ptr_rotary_sin, cosize(make_layout(args.shape_rotary, args.stride_rotary_sin)));
 
     // Qv
 
@@ -604,9 +629,19 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .ptr_V_new    = args.ptr_V_new,
         .stride_V_new = args.stride_V_new,
 
-        // QV
+        // Qv
+        // .ptr_Qv           = ,
+        // .stride_Qv        = ,
+        // .shape_Qv_packed  = ,
+        // .stride_Qv_packed = ,
 
         // Rotary
+        .ptr_rotary_cos    = args.ptr_rotary_cos,
+        .shape_rotary      = args.shape_rotary,
+        .stride_rotary_cos = args.stride_rotary_cos,
+        .ptr_rotary_sin    = args.ptr_rotary_sin,
+        .stride_rotary_sin = args.stride_rotary_sin,
+        // .is_rotary_interleaved;  // Use IsRotaryInterleaved instead
 
         // PageTable
         .ptr_pagetable    = args.ptr_pagetable,
@@ -628,6 +663,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .desc_page_table = desc_page_table,
         .desc_K_new      = desc_K_new,
         .desc_V_new      = desc_V_new,
+        .desc_Cos        = desc_Cos,
+        .desc_Sin        = desc_Sin,
 
         .softmax_scale      = args.softmax_scale,
         .softmax_scale_log2 = args.softmax_scale * log2e,
@@ -648,8 +685,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .cu_seqlens_k_new = args.cu_seqlens_k_new,
         .seqused_q        = args.seqused_q,
         .seqused_k        = args.seqused_k,
-        //.leftpad_k    = args.leftpad_k,
-        //.seqlens_rotary = args.seqlens_rotary,
+        .leftpad_k        = args.leftpad_k,
+        .seqlens_rotary   = args.seqlens_rotary,
 
         // CP
         .cp_world_size    = args.cp_world_size,
@@ -757,7 +794,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                params.desc_V,
                                params.page_size_divmod,
                                seqlen_k,
-                               0,  // seqlen_info.leftpad_k,
+                               static_cast<int>(seqlen_info.leftpad_k),
                                thread_idx,
                                bidb_kv,
                                bidh_kv,
@@ -993,8 +1030,46 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       }
     };
 
+    int const seqlen_q = seqlen_info.seqlen_q;
+    int const seqlen_k = seqlen_info.seqlen_k;
+
     // Q is ready
-    pipeline_q.consumer_wait(smem_pipe_read_q);
+    if constexpr (!IsAppendKV || !IsRotary) {
+      pipeline_q.consumer_wait(smem_pipe_read_q);
+    } else {  // Rotary
+      using Rotary_t = Rotary<TileM,
+                              HeadDimQK,
+                              NumQKMmaThreads,
+                              Element,
+                              FragmentSize,
+                              !(IsCausal || IsLocal) /*FixedPosition*/,
+                              HeadRatio>;
+      Rotary_t rotary{params.ptr_rotary_cos,
+                      params.shape_rotary,
+                      params.stride_rotary_cos,
+                      params.ptr_rotary_sin,
+                      params.stride_rotary_sin,
+                      thread_idx,
+                      seqlen_q,
+                      seqlen_info.seqlen_rotary};
+
+      Tensor sQ_pi = mute::as_position_independent_swizzle_tensor(sQ);
+
+      auto [tRrCos, tRrSin] =
+          conditional_return<!IsPackGQA>(rotary.template load_cos_sin<IsRotaryInterleaved /*IsInterleaved*/>(
+                                             m_block, params.desc_Cos, params.desc_Sin),
+                                         rotary.template load_cos_sin_packgqa<IsRotaryInterleaved /*IsInterleaved*/>(
+                                             m_block, params.desc_Cos, params.desc_Sin));
+      pipeline_q.consumer_wait(smem_pipe_read_q);
+      if constexpr (IsRotaryInterleaved) {
+        rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block);
+      } else {
+        rotary.apply_Q_contiguous(sQ_pi, tRrCos, tRrSin, m_block);
+      }
+      __syncwarp();
+      named_barrier_sync(
+          static_cast<uint32_t>(FwdNamedBarriers::RotaryQ));  // Ensure rotated Q is visible to all consumers
+    }
 
     // Tensor acc_pv = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePDV{}));
 
@@ -1009,9 +1084,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     Mask<PermuteTiledMmaQK, SeqlenInfo, TileM, TileN, HeadRatio, IsPackGQA, IsCausal, IsLocal, EnableCP> mask(
         thread_idx, seqlen_info, params.window_size_left, params.window_size_right, params.sink_token_length);
 
-    int const seqlen_q = seqlen_info.seqlen_q;
-    int const seqlen_k = seqlen_info.seqlen_k;
-    int       n_block  = n_block_max - 1;
+    int n_block = n_block_max - 1;
 
     if constexpr (IntraWarpSquadOverlap) {
       Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQKD{}));
@@ -1397,10 +1470,10 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int const bidb_kv = !HasKvBatchIdx ? bidb : params.kv_batch_idx[bidb];
 
     Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(
-        _, _, bidh_kv, !HasCuseqlensKNew ? bidb_kv : 0);
+        _, _, bidh_kv, !HasCuseqlensK ? bidb_kv : 0);
     auto shape_V = make_shape(params.headdim_V, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
-    Tensor mV    = make_tensor(make_gmem_ptr(params.ptr_V), shape_V, params.stride_V)(
-        _, _, bidh_kv, !HasCuseqlensKNew ? bidb_kv : 0);
+    Tensor mV =
+        make_tensor(make_gmem_ptr(params.ptr_V), shape_V, params.stride_V)(_, _, bidh_kv, !HasCuseqlensK ? bidb_kv : 0);
 
     int const offset_k = seqlen_info.offset_k + seqlen_info.seqlen_k_og;
 
@@ -1412,11 +1485,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     int const seqlen_k_new = seqlen_info.seqlen_k_new;
 
-    // Rope not implemented yet.
-    // Rotary rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
-    //               params.ptr_rotary_sin, params.stride_rotary_sin,
-    //               params.is_rotary_interleaved, thread_idx, seqlen_k_new,
-    //               seqlen_info.seqlen_rotary);
+    using Rotary_t = Rotary<TileN, HeadDimQK, NumMmaThreads, Element, FragmentSize>;
+
+    Rotary_t rotary{params.ptr_rotary_cos,
+                    params.shape_rotary,
+                    params.stride_rotary_cos,
+                    params.ptr_rotary_sin,
+                    params.stride_rotary_sin,
+                    thread_idx,
+                    seqlen_k_new,
+                    seqlen_info.seqlen_rotary};
 
     // This is used to index into the batch dimension of mK and mV
     int const bidb_kv_idx = !HasCuseqlensKNew && !IsPagedKV ? bidb_kv : 0;
@@ -1474,20 +1552,49 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     auto store_K = [&](int const n_block, auto const& smem_pipe_read) {
       int const n_limit = std::min(seqlen_k_new - n_block * TileN, TileN);
 
-      pipeline_k_new.consumer_wait(smem_pipe_read);
-      Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_read.index());
-      Tensor tKrK     = make_fragment_like(tKsK_cur);  // ((_8,_1),_4,_2):((_1,_0),_8,_32)
-      Tensor tKrK_src = gmem_thr_copy_kv.retile_S(tKrK);
-      copy(tKsK_cur, tKrK);
-      if constexpr (!IsPagedKV) {
-        Tensor tKgK_cur = tKgK(_, _, _, n_block);
-        MUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < size<2>(tKgK_cur); ++k) {
-          copy(gmem_tiled_copy_kv.with(params.desc_K_new).with(tKpK(k)), tKrK_src(_, _, k), tKgK_cur(_, _, k));
+      if constexpr (!IsRotary) {  // No rotary, smem -> rmem -> gmem directly
+        pipeline_k_new.consumer_wait(smem_pipe_read);
+        Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_read.index());
+        Tensor tKrK     = make_fragment_like(tKsK_cur);  // ((_8,_1),_4,_2):((_1,_0),_8,_32)
+        Tensor tKrK_src = gmem_thr_copy_kv.retile_S(tKrK);
+        copy(tKsK_cur, tKrK);
+        if constexpr (!IsPagedKV) {
+          Tensor tKgK_cur = tKgK(_, _, _, n_block);
+          MUTLASS_PRAGMA_UNROLL
+          for (int m = 0; m < size<1>(tKgK_cur); ++m) {
+            bool row_valid = get<0>(tKcK(_0{}, m, _0{})) < n_limit;
+            MUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < size<2>(tKgK_cur); ++k) {
+              bool pred = row_valid && tVpV(k);
+              copy(gmem_tiled_copy_kv.with(params.desc_K).with(pred), tKrK_src(_, m, k), tKgK_cur(_, m, k));
+            }
+          }
+        } else {
+          paged_kv_manager.store_K(n_block, tKrK_src);
         }
       } else {
-        paged_kv_manager.store_K(n_block, tKrK_src);
+        Tensor gK_cur  = gK(_, _, n_block);
+        auto   tPrKPtr = conditional_return<IsPagedKV>(paged_kv_manager.compute_K_ptr(), nullptr);
+
+        auto [tRrCos, tRrSin] = rotary.template load_cos_sin<IsRotaryInterleaved /*kInterleaved*/>(
+            n_block, params.desc_Cos, params.desc_Sin);
+        pipeline_k_new.consumer_wait(smem_pipe_read);
+        if constexpr (IsRotaryInterleaved) {
+          rotary.template apply_K_interleaved<IsPagedKV>(
+              sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCos, tRrSin, tPrKPtr, n_block, params.desc_K);
+        } else {
+          rotary.template apply_K_contiguous<IsPagedKV>(sK(_, _, smem_pipe_read.index()),
+                                                        gK_cur,
+                                                        tKpK,
+                                                        tRrCos,
+                                                        tRrSin,
+                                                        tPrKPtr,
+                                                        n_block,
+                                                        get<1>(params.shape_K),
+                                                        params.desc_K);
+        }
       }
+
       pipeline_k_new.consumer_release(smem_pipe_read);
     };
 
@@ -1502,8 +1609,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       if constexpr (!IsPagedKV) {
         Tensor tVgV_cur = tVgV(_, _, _, n_block);
         MUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < size<2>(tVgV_cur); ++k) {
-          copy(gmem_tiled_copy_kv.with(params.desc_V_new).with(tVpV(k)), tVrV_src(_, _, k), tVgV_cur(_, _, k));
+        for (int m = 0; m < size<1>(tVgV_cur); ++m) {
+          bool row_valid = get<0>(tVcV(_0{}, m, _0{})) < n_limit;
+          MUTLASS_PRAGMA_UNROLL
+          for (int k = 0; k < size<2>(tVgV_cur); ++k) {
+            bool pred = row_valid && tVpV(k);
+            copy(gmem_tiled_copy_kv.with(params.desc_V).with(pred), tVrV_src(_, m, k), tVgV_cur(_, m, k));
+          }
         }
       } else {
         paged_kv_manager.store_V(n_block, tVrV_src);

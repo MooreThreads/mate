@@ -328,7 +328,6 @@ __device__ void moe_fused_gate_impl_static(void*    input,
   __shared__ float smem_grp_max_sum[NR_ROWS_PER_CTA * NR_EXPERT_GRPS];
   __shared__ T     smem_score[NR_ROWS_PER_CTA * NR_EXPERTS];
   __shared__ int   smem_idx[NR_ROWS_PER_CTA * NR_EXPERTS];
-  __shared__ T     smem_bias[NR_EXPERTS];
 
   static_assert(Vlen <= NR_EXPERT_PER_GRP);
 
@@ -354,12 +353,10 @@ __device__ void moe_fused_gate_impl_static(void*    input,
 #pragma unroll
   for (int v = 0; v < Vlen; v++) {
     ////////////////////// Sigmoid //////////////////////
-    row_chunk[v] = static_cast<T>(fast_rcpf(1.0f + fast_expf(-float(row_chunk[v]))));
-    if (tidy == 0) {
-      smem_bias[tidx + v] = bias_chunk[v];
-    }
-    bias_chunk[v] = row_chunk[v] + bias_chunk[v];
-    idx_chunk[v]  = tidx + v;
+    row_chunk[v]                             = static_cast<T>(fast_rcpf(1.0f + fast_expf(-float(row_chunk[v]))));
+    smem_score[tidy * NR_EXPERTS + tidx + v] = row_chunk[v];
+    bias_chunk[v]                            = row_chunk[v] + bias_chunk[v];
+    idx_chunk[v]                             = tidx + v;
   }
 
   int   max_idx = exp_idx_in_grp;
@@ -462,11 +459,10 @@ __device__ void moe_fused_gate_impl_static(void*    input,
     }
     int warp_max_idx = __shfl_sync(0xFFFFFFFF, thread_max_idx, 0, WARP_SIZE);
 
-    if (tidx == 0) {
-      // restore row_chunk
-      float restored_val = (float)thread_max_val - (float)smem_bias[thread_max_idx];
-      output_sum += restored_val;
-      smem_score[tidy * NR_EXPERTS + i] = (T)restored_val;
+    if (tidx == 0 && thread_row < num_rows) {
+      float output_val = static_cast<float>(smem_score[tidy * NR_EXPERTS + thread_max_idx]);
+      output_sum += output_val;
+      output_ptr[thread_row * topk + i] = output_val;
       smem_idx[tidy * NR_EXPERTS + i]   = thread_max_idx;
     }
 
@@ -487,7 +483,7 @@ __device__ void moe_fused_gate_impl_static(void*    input,
   if (thread_row < num_rows) {
     for (int i = tid_st_x; i < topk_excluding_share_expert_fusion; i += WARP_SIZE) {
       float scale      = renorm ? fast_rcpf(output_sum) : 1.0f;
-      float output_val = smem_score[tidy * NR_EXPERTS + i] * scale;
+      float output_val = output_ptr[out_idx + i] * scale;
       if (apply_routed_scaling_factor_on_output) {
         output_val *= routed_scaling_factor;
       }

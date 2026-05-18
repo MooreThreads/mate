@@ -25,6 +25,7 @@ struct SageAttenQuantizedASMArgs {
   bool    is_causal{};
   bool    is_kv_cache{};
   bool    is_qk_int8{};
+  bool    fp8_output{};
   int32_t quant_mode;  // 0/7: extra ASM modes, 1: unit-block recipe, 2: per-block 128, 6: per-block 128 + per-thread 16
 
   DLDataType q_data_type{};
@@ -111,6 +112,7 @@ struct SageAttenQuantizedASMArgs {
 
   // output pointers
   void* p_output{};
+  void* p_output_scale{};
   void* p_lse_output{};
 
 };  // struct SageAttenQuantizedASMArgs
@@ -167,6 +169,7 @@ struct SageAttenQuantizedASMDispatcher {
     id.dtype       = getDataTypeEnum(args.v_data_type);
     id.quant_mode  = args.quant_mode;
     id.is_qk_int8  = static_cast<int>(args.is_qk_int8);
+    id.fp8_output  = static_cast<int>(args.fp8_output);
 
     auto res = kernel_map.find(id);
     if (res != kernel_map.end()) {
@@ -201,20 +204,20 @@ class SageAttentionQuantizedAsmKernel {
 
   struct Params {
     void* output_ptr;
+    void* output_scale_ptr;
     void* out_lse_ptr;
 
-    mute::RobustReg robust_mask;  // Not used by the dense SageAttention path.
-    mute::RobustReg robust_key;
-    mute::RobustReg robust_q_scale;
-    mute::RobustReg robust_k_scale;
-    mute::RobustReg robust_v_scale;
-    bool            is_qk_int8;
-
+    mute::RobustReg    robust_mask;  // Not used by the dense SageAttention path.
     MUtensorDescriptor q_desc;
+    mute::RobustReg    robust_key;
     MUtensorDescriptor k_desc;
     MUtensorDescriptor k_desc_1;
     MUtensorDescriptor v_desc;
     MUtensorDescriptor out_desc;
+    mute::RobustReg    robust_q_scale;
+    mute::RobustReg    robust_k_scale;
+    mute::RobustReg    robust_v_scale;
+    bool               is_qk_int8;
 
     // Scale strides
     int32_t q_scale_batch_stride;
@@ -295,6 +298,8 @@ class SageAttentionQuantizedAsmKernel {
     int32_t tile_out_dim2;
     int32_t tile_out_dim3;
 
+    bool fp8_output;
+
   };  // struct Params
 
   SageAttentionQuantizedAsmKernel(const Params&       in_params,
@@ -330,8 +335,9 @@ class SageAttentionQuantizedAsmKernel {
                             args.p_output,
                             dl_dtype_to_tme_type(args.out_data_type));
 
-    params.output_ptr  = args.p_output;
-    params.out_lse_ptr = args.p_lse_output;
+    params.output_ptr       = args.p_output;
+    params.output_scale_ptr = args.p_output_scale;
+    params.out_lse_ptr      = args.p_lse_output;
 
     params.q_desc     = tensor_desc_q.desc;
     params.k_desc     = tensor_desc_k.desc;
@@ -441,6 +447,7 @@ class SageAttentionQuantizedAsmKernel {
     params.tile_out_dim1 = 4;
     params.tile_out_dim2 = 1;
     params.tile_out_dim3 = 1;
+    params.fp8_output    = args.fp8_output;
 
     // Match the dense flash-attention wrapper launch convention from ComputeAsmKern.
     launch_config.blockDimX = config.nr_thr;
@@ -466,16 +473,18 @@ class SageAttentionQuantizedAsmKernel {
 
   void run() {
     void* kernel_params[] = {&params.output_ptr,
+                             &params.output_scale_ptr,
                              &params.out_lse_ptr,
                              &params.robust_mask,
+                             &params.q_desc,
                              &params.robust_key,
+                             &params.k_desc,
+                             &params.k_desc_1,
+                             &params.v_desc,
+                             &params.out_desc,
                              &params.robust_q_scale,
                              &params.robust_k_scale,
                              &params.robust_v_scale,
-                             &params.q_desc,
-                             &params.k_desc,
-                             &params.v_desc,
-                             &params.out_desc,
                              &params.q_scale_batch_stride,
                              &params.q_scale_seq_stride,
                              &params.q_scale_head_stride,
@@ -538,8 +547,8 @@ class SageAttentionQuantizedAsmKernel {
                              &params.tile_out_dim1,
                              &params.tile_out_dim2,
                              &params.tile_out_dim3};
-
     MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, *config.asm_func, kernel_params, nullptr));
+    return;
   }
 
  protected:
@@ -562,6 +571,7 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
 
   struct Params {
     void* output_ptr;
+    void* output_scale_ptr;
     void* out_lse_ptr;
 
     MUtensorDescriptor q_desc;
@@ -660,6 +670,8 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
     int32_t tile_out_dim2;
     int32_t tile_out_dim3;
 
+    bool fp8_output;
+
   };  // struct Params
 
   SageAttentionQuantizedWithKVCacheAsmKernel(const Params&       in_params,
@@ -693,8 +705,9 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
                             args.p_output,
                             dl_dtype_to_tme_type(args.out_data_type));
 
-    params.output_ptr  = args.p_output;
-    params.out_lse_ptr = args.p_lse_output;
+    params.output_ptr       = args.p_output;
+    params.output_scale_ptr = args.p_output_scale;
+    params.out_lse_ptr      = args.p_lse_output;
 
     params.q_desc   = tensor_desc_q.desc;
     params.v_desc   = tensor_desc_v.desc;
@@ -801,6 +814,7 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
     params.tile_out_dim1 = 1;
     params.tile_out_dim2 = 4;
     params.tile_out_dim3 = 1;
+    params.fp8_output    = args.fp8_output;
 
     // Launch configuration
     launch_config.blockDimX = config.nr_thr;
@@ -843,17 +857,18 @@ class SageAttentionQuantizedWithKVCacheAsmKernel {
 // Dispatch Functions for Quantized Sage Attention
 // ============================================================================
 
-void sage_attn_quantized_asm(ffi::TensorView out,
-                             ffi::TensorView out_lse,
-                             ffi::TensorView q,
-                             ffi::TensorView k,
-                             ffi::TensorView v,
-                             double          softmax_scale,
-                             ffi::TensorView q_scale,
-                             ffi::TensorView k_scale,
-                             ffi::TensorView v_scale,
-                             bool            is_causal,
-                             int64_t         quant_mode) {
+void sage_attn_quantized_asm(ffi::TensorView                out,
+                             ffi::Optional<ffi::TensorView> out_scale,
+                             ffi::TensorView                out_lse,
+                             ffi::TensorView                q,
+                             ffi::TensorView                k,
+                             ffi::TensorView                v,
+                             double                         softmax_scale,
+                             ffi::TensorView                q_scale,
+                             ffi::TensorView                k_scale,
+                             ffi::TensorView                v_scale,
+                             bool                           is_causal,
+                             int64_t                        quant_mode) {
   check_mp31(q.device(), "sage_attn_quantized_asm");
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
@@ -863,6 +878,9 @@ void sage_attn_quantized_asm(ffi::TensorView out,
   CHECK_INPUT(v_scale);
   CHECK_INPUT(out);
   CHECK_INPUT(out_lse);
+  if (out_scale.has_value()) {
+    CHECK_INPUT(out_scale.value());
+  }
 
   CHECK_DEVICE(q, k);
   CHECK_DEVICE(q, v);
@@ -871,11 +889,15 @@ void sage_attn_quantized_asm(ffi::TensorView out,
   CHECK_DEVICE(q, v_scale);
   CHECK_DEVICE(q, out);
   CHECK_DEVICE(q, out_lse);
+  if (out_scale.has_value()) {
+    CHECK_DEVICE(q, out_scale.value());
+  }
 
   const DLDataType q_dtype = q.dtype();
   const DLDataType k_dtype = k.dtype();
   const DLDataType v_dtype = v.dtype();
   const bool qk_int8_path  = dtype_equal(q_dtype, dl_int8) && dtype_equal(k_dtype, dl_int8) && is_fp8_dtype(v_dtype);
+  const bool fp8_output    = out_scale.has_value();
 
   if (qk_int8_path) {
     TVM_FFI_ICHECK(dtype_equal(q_dtype, k_dtype)) << "q and k must have same dtype";
@@ -884,13 +906,20 @@ void sage_attn_quantized_asm(ffi::TensorView out,
     TVM_FFI_ICHECK(dtype_equal(q_dtype, v_dtype)) << "q and v must have same dtype";
     TVM_FFI_ICHECK(is_fp8_dtype(q_dtype)) << "qkv must be e4m3 or e5m2";
   }
-  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(out.dtype())) << "out must be bf16 or fp16";
+  if (fp8_output) {
+    TVM_FFI_ICHECK(is_fp8_dtype(out.dtype())) << "out must be e4m3 or e5m2 when fp8_output is enabled";
+    TVM_FFI_ICHECK(dtype_equal(out.dtype(), v_dtype)) << "out must have the same dtype as v when fp8_output is enabled";
+    TVM_FFI_ICHECK(dtype_equal(out_scale.value().dtype(), dl_float32)) << "out_scale must be float32";
+  } else {
+    TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(out.dtype())) << "out must be bf16 or fp16";
+  }
 
   using Args = mate::sage_attention::SageAttenQuantizedASMArgs;
   Args args;
   args.is_causal     = is_causal;
   args.is_kv_cache   = false;
   args.is_qk_int8    = qk_int8_path;
+  args.fp8_output    = fp8_output;
   args.quant_mode    = quant_mode;
   args.q_data_type   = q_dtype;
   args.k_data_type   = k_dtype;
@@ -945,7 +974,7 @@ void sage_attn_quantized_asm(ffi::TensorView out,
     expect_shape(q_scale, {args.batch, q_seq_scale_num, args.nr_heads, 1}, "q_scale");
     expect_shape(k_scale, {args.batch, k_seq_scale_num, args.nr_heads_kv, 1}, "k_scale");
     if (quant_mode == 7) {
-      expect_shape(v_scale, {args.batch, v_seq_scale_num, args.nr_heads_kv, 2}, "v_scale");
+      expect_shape(v_scale, {args.batch, v_seq_scale_num, args.nr_heads_kv, 1}, "v_scale");
     } else if (quant_mode == 1) {
       expect_shape(v_scale, {args.batch, v_seq_scale_num, args.nr_heads_kv, args.headdim_v}, "v_scale");
     } else {
@@ -953,6 +982,9 @@ void sage_attn_quantized_asm(ffi::TensorView out,
     }
   }
   expect_shape(out, {args.batch, args.seqlen_q, args.nr_heads, args.headdim_v}, "out");
+  if (fp8_output) {
+    expect_shape(out_scale.value(), {args.batch, args.seqlen_q, args.nr_heads, 1}, "out_scale");
+  }
   expect_shape(out_lse, {args.batch, args.nr_heads, args.seqlen_q}, "out_lse");
 
   args.batch_stride_q       = q.stride(0);
@@ -983,14 +1015,15 @@ void sage_attn_quantized_asm(ffi::TensorView out,
   args.nr_v_scale    = static_cast<int32_t>(v_scale.numel());
   args.softmax_scale = softmax_scale;
 
-  args.p_q          = q.data_ptr();
-  args.p_k          = k.data_ptr();
-  args.p_v          = v.data_ptr();
-  args.p_q_scale    = q_scale.data_ptr();
-  args.p_k_scale    = k_scale.data_ptr();
-  args.p_v_scale    = v_scale.data_ptr();
-  args.p_output     = out.data_ptr();
-  args.p_lse_output = out_lse.data_ptr();
+  args.p_q            = q.data_ptr();
+  args.p_k            = k.data_ptr();
+  args.p_v            = v.data_ptr();
+  args.p_q_scale      = q_scale.data_ptr();
+  args.p_k_scale      = k_scale.data_ptr();
+  args.p_v_scale      = v_scale.data_ptr();
+  args.p_output       = out.data_ptr();
+  args.p_output_scale = fp8_output ? out_scale.value().data_ptr() : nullptr;
+  args.p_lse_output   = out_lse.data_ptr();
 
   musaStream_t stream                 = get_stream(q.device());
   using Kernel                        = mate::sage_attention::mubin::SageAttentionQuantizedAsmKernel<Args>;
@@ -999,19 +1032,20 @@ void sage_attn_quantized_asm(ffi::TensorView out,
   kernel.run();
 }
 
-void sage_attn_quantized_with_kvcache_asm(ffi::TensorView out,
-                                          ffi::TensorView out_lse,
-                                          ffi::TensorView q,
-                                          ffi::TensorView k_cache,
-                                          ffi::TensorView v_cache,
-                                          ffi::TensorView page_table,
-                                          ffi::TensorView cache_seqlens,
-                                          ffi::TensorView q_scale,
-                                          ffi::TensorView k_scale,
-                                          ffi::TensorView v_scale,
-                                          double          softmax_scale,
-                                          bool            is_causal,
-                                          int64_t         quant_mode) {
+void sage_attn_quantized_with_kvcache_asm(ffi::TensorView                out,
+                                          ffi::Optional<ffi::TensorView> out_scale,
+                                          ffi::TensorView                out_lse,
+                                          ffi::TensorView                q,
+                                          ffi::TensorView                k_cache,
+                                          ffi::TensorView                v_cache,
+                                          ffi::TensorView                page_table,
+                                          ffi::TensorView                cache_seqlens,
+                                          ffi::TensorView                q_scale,
+                                          ffi::TensorView                k_scale,
+                                          ffi::TensorView                v_scale,
+                                          double                         softmax_scale,
+                                          bool                           is_causal,
+                                          int64_t                        quant_mode) {
   check_mp31(q.device(), "sage_attn_quantized_with_kvcache_asm");
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_cache);
@@ -1021,6 +1055,9 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView out,
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_scale);
   CHECK_INPUT(out);
   CHECK_INPUT(out_lse);
+  if (out_scale.has_value()) {
+    CHECK_INPUT(out_scale.value());
+  }
   CHECK_INPUT(page_table);
   CHECK_INPUT(cache_seqlens);
 
@@ -1033,15 +1070,20 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView out,
   CHECK_DEVICE(q, v_scale);
   CHECK_DEVICE(q, out);
   CHECK_DEVICE(q, out_lse);
+  if (out_scale.has_value()) {
+    CHECK_DEVICE(q, out_scale.value());
+  }
 
   TVM_FFI_ICHECK(dtype_equal(page_table.dtype(), dl_int32)) << "page_table must be int32";
   TVM_FFI_ICHECK(dtype_equal(cache_seqlens.dtype(), dl_int32)) << "cache_seqlens must be int32";
+  const bool fp8_output = out_scale.has_value();
 
   using Args = mate::sage_attention::SageAttenQuantizedASMArgs;
   Args args;
   args.is_causal     = is_causal;
   args.is_kv_cache   = true;
   args.is_qk_int8    = false;
+  args.fp8_output    = fp8_output;
   args.quant_mode    = quant_mode;
   args.q_data_type   = q.dtype();
   args.k_data_type   = k_cache.dtype();
@@ -1051,7 +1093,14 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView out,
   TVM_FFI_ICHECK(is_fp8_dtype(args.q_data_type)) << "q must be e4m3 or e5m2";
   TVM_FFI_ICHECK(is_fp8_dtype(args.k_data_type)) << "k_cache must be e4m3 or e5m2";
   TVM_FFI_ICHECK(is_fp8_dtype(args.v_data_type)) << "v_cache must be e4m3 or e5m2";
-  TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(args.out_data_type)) << "out must be bf16 or fp16";
+  if (fp8_output) {
+    TVM_FFI_ICHECK(is_fp8_dtype(args.out_data_type)) << "out must be e4m3 or e5m2 when fp8_output is enabled";
+    TVM_FFI_ICHECK(dtype_equal(args.out_data_type, args.v_data_type))
+        << "out must have the same dtype as v_cache when fp8_output is enabled";
+    TVM_FFI_ICHECK(dtype_equal(out_scale.value().dtype(), dl_float32)) << "out_scale must be float32";
+  } else {
+    TVM_FFI_ICHECK(is_bf16_or_fp16_dtype(args.out_data_type)) << "out must be bf16 or fp16";
+  }
 
   musaDeviceProp prop{};
   MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&prop, q.device().device_id));
@@ -1107,6 +1156,9 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView out,
     }
   }
   expect_shape(out, {args.batch, args.seqlen_q, args.nr_heads, args.headdim_v}, "out");
+  if (fp8_output) {
+    expect_shape(out_scale.value(), {args.batch, args.seqlen_q, args.nr_heads, 1}, "out_scale");
+  }
   expect_shape(out_lse, {args.batch, args.nr_heads, args.seqlen_q}, "out_lse");
   expect_shape(page_table, {args.batch, page_table.size(1)}, "page_table");
   expect_shape(cache_seqlens, {args.batch}, "cache_seqlens");
@@ -1148,6 +1200,7 @@ void sage_attn_quantized_with_kvcache_asm(ffi::TensorView out,
   args.p_k_scale        = k_scale.data_ptr();
   args.p_v_scale        = v_scale.data_ptr();
   args.p_output         = out.data_ptr();
+  args.p_output_scale   = fp8_output ? out_scale.value().data_ptr() : nullptr;
   args.p_lse_output     = out_lse.data_ptr();
 
   musaStream_t stream                 = get_stream(q.device());

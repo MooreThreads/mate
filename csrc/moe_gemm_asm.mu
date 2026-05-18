@@ -22,7 +22,7 @@
 namespace mate::moe_gemm {
 
 enum class MoeGemmMode {
-  Reserve0 = 0,
+  NoGroup = 0,
   RaggedPSumLayout,
   Reserve1,
   Ragged,
@@ -42,6 +42,7 @@ struct MoeGemmArgs {
   int n;
   int k;
   int num_expert;
+  int batch{1};
 
   int quant_tile;
   int alignment_m;
@@ -81,6 +82,7 @@ struct MoeGemmArgs {
 
   void* p_scale_a;
   void* p_scale_b;
+  void* p_scale_out{nullptr};
 
   void* p_m_indices;
   void* p_signal;
@@ -234,6 +236,11 @@ struct MoeGemmMubinDispatcher {
       config.block.tile_k     = 128;
     } else if constexpr (mode == MoeGemmMode::RaggedPSumLayout) {
       get_block_tile(group_mode_to_block_map[MoeGemmMode::RaggedPSumLayout], config, args);
+    } else if constexpr (mode == MoeGemmMode::NoGroup) {
+      config.block.tile_m     = 256;
+      config.block.tile_n     = 256;
+      config.block.num_thread = 512;
+      config.block.tile_k     = 128;
     } else {
       throw std::runtime_error("MoeGemmMubinDispatcher mode not supported!");
     }
@@ -455,8 +462,8 @@ class MoeGemmAsmKernel {
 
     Params params;
 
-    constexpr int batch   = 1;
-    int           batch_b = mode == MoeGemmMode::KContig ? 1 : args.num_expert;
+    int batch   = args.batch;
+    int batch_b = mode == MoeGemmMode::KContig ? 1 : (mode == MoeGemmMode::NoGroup ? args.batch : args.num_expert);
 
     size_t tme_a_dim0, tme_a_dim1, tme_a_dim2, tme_a_stride0, tme_a_stride1;
     size_t tme_b_dim0, tme_b_dim1, tme_b_dim2, tme_b_stride0, tme_b_stride1;
@@ -519,6 +526,10 @@ class MoeGemmAsmKernel {
       grid_y         = mutlass::ceil_div(args.m, config.block.tile_m) + args.num_expert - 1;
       grid_z         = 1;
       gridy_in_group = grid_y;
+    } else if constexpr (mode == MoeGemmMode::NoGroup) {
+      grid_x = mutlass::ceil_div(args.n, config.block.tile_n);
+      grid_y = mutlass::ceil_div(args.m, config.block.tile_m);
+      grid_z = batch;
     } else {
       throw std::runtime_error("Get Unsupported MoeGemmMode!");
     }
@@ -544,6 +555,7 @@ class MoeGemmAsmKernel {
     auto fast_nr_block_group  = mutlass::FastDivmod(gridy_in_group * grid_x);
 
     params.output_ptr = args.p_d;
+    if constexpr (mode == MoeGemmMode::NoGroup) params.amax_ptr = args.p_scale_out;
 
     params.a_desc = tensor_desc_a.desc;
     params.b_desc = tensor_desc_b.desc;
@@ -564,6 +576,7 @@ class MoeGemmAsmKernel {
           mute::make_robust_desc(static_cast<int*>(args.p_d), args.m * args.n * args.num_expert).reg;
     } else if constexpr (mode == MoeGemmMode::RaggedPSumLayout) {
       params.robust_group_idx = mute::make_robust_desc(static_cast<int*>(args.p_m_indices), args.num_expert).reg;
+    } else if constexpr (mode == MoeGemmMode::NoGroup) {
     } else {
       throw std::runtime_error("Get Unsupported MoeGemmMode!");
     }
@@ -1616,6 +1629,96 @@ void k_grouped_contig_gemm_16bit(ffi::TensorView        a,
   run_moe_gemm_kernel<Kernel>(args, a.device());
 }
 
+void groupwise_gemm_8bit_fp8output(const std::tuple<ffi::TensorView, ffi::TensorView>& input_a,
+                                   const std::tuple<ffi::TensorView, ffi::TensorView>& input_b,
+                                   const std::tuple<int64_t, int64_t, int64_t>&        scale_granularity_mnk,
+                                   ffi::TensorView                                     out,
+                                   ffi::TensorView                                     output_scale,
+                                   const std::string&                                  major_mode_a,
+                                   const std::string&                                  major_mode_b,
+                                   std::optional<int64_t>                              num_mp) {
+  const auto& [a, scale_a] = input_a;
+  const auto& [b, scale_b] = input_b;
+
+  check_mp31(a.device(), "m_grouped_contig_gemm_8bit");
+  CHECK_MUSA(a);
+  CHECK_MUSA(b);
+  CHECK_MUSA(scale_a);
+  CHECK_MUSA(scale_b);
+  CHECK_MUSA(out);
+  CHECK_MUSA(output_scale)
+  CHECK_DEVICE(a, b);
+  CHECK_DEVICE(a, scale_a);
+  CHECK_DEVICE(a, scale_b);
+  CHECK_DEVICE(a, out);
+  CHECK_DEVICE(a, output_scale);
+  CHECK_DIM(2, a);
+  TVM_FFI_ICHECK(scale_a.stride(-1) == 1 || scale_a.stride(-2) == 1) << "scale_a must be contiguous";
+  TVM_FFI_ICHECK(dtype_equal(scale_a.dtype(), dl_float32)) << "scale_a must be float32";
+  TVM_FFI_ICHECK(dtype_equal(scale_b.dtype(), dl_float32)) << "scale_b must be float32";
+  TVM_FFI_ICHECK(is_fp8_dtype(a.dtype())) << "a must be fp8";
+  TVM_FFI_ICHECK(is_fp8_dtype(b.dtype())) << "b must be fp8";
+  TVM_FFI_ICHECK(dtype_equal(output_scale.dtype(), dl_float32)) << "output_scale must be float32";
+  TVM_FFI_ICHECK(dtype_equal(out.dtype(), dl_float8_e4m3fn)) << "output must be fp8_e4m3";
+
+  mate::moe_gemm::MoeGemmArgs args{};
+  args.type_a = a.dtype();
+  args.type_b = b.dtype();
+  args.type_d = out.dtype();
+
+  args.batch      = 1;
+  args.num_expert = 1;
+  args.m          = major_mode_a[0] == 'K' ? static_cast<int>(a.size(-2)) : static_cast<int>(a.size(-1));
+  args.n          = major_mode_b[0] == 'K' ? static_cast<int>(b.size(-2)) : static_cast<int>(b.size(-1));
+  args.k          = major_mode_a[0] == 'K' ? static_cast<int>(a.size(-1)) : static_cast<int>(a.size(-2));
+
+  if (gemm_common::gemm_early_return(args.m, args.n, args.k, out)) {
+    return;
+  }
+
+  args.quant_tile = static_cast<int>(std::get<2>(scale_granularity_mnk));
+  TVM_FFI_ICHECK_EQ(args.quant_tile, 128) << "quant_tile must be 128";
+  args.alignment_m     = 0;
+  args.expected_m      = 0;
+  args.total_mp_count  = current_num_mps(a.device());
+  args.target_mp_count = static_cast<int>(num_mp.value_or(args.total_mp_count));
+
+  args.stride_m_a       = args.k;
+  args.stride_k_a       = args.m;
+  args.stride_batch_a   = args.m * args.k;
+  args.stride_n_b       = args.k;
+  args.stride_k_b       = args.n;
+  args.stride_batch_b   = args.n * args.k;
+  args.stride_m_out     = args.n;
+  args.stride_batch_out = args.m * args.n;
+
+  args.major_a       = major_mode_a[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
+  args.major_b       = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
+  args.quant_mode_a  = TensorQuantMode::GROUP;
+  args.quant_mode_b  = TensorQuantMode::BLOCK;
+  args.major_scale_a = major_mode_a[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
+  args.major_scale_b = major_mode_b[0] == 'K' ? TensorMajor::K : TensorMajor::MN;
+
+  args.scale_a_m = major_mode_a[0] == 'K' ? static_cast<int>(scale_a.size(-2)) : static_cast<int>(scale_a.size(-1));
+  args.scale_a_k = major_mode_a[0] == 'K' ? static_cast<int>(scale_a.size(-1)) : static_cast<int>(scale_a.size(-2));
+  args.scale_a_nr_elem = args.scale_a_m * args.scale_a_k * args.batch;
+  args.scale_b_n = major_mode_b[0] == 'K' ? static_cast<int>(scale_b.size(-2)) : static_cast<int>(scale_b.size(-1));
+  args.scale_b_k = major_mode_b[0] == 'K' ? static_cast<int>(scale_b.size(-1)) : static_cast<int>(scale_b.size(-2));
+  args.scale_b_nr_elem = args.scale_b_n * args.scale_b_k * args.batch;
+
+  args.p_a         = a.data_ptr();
+  args.p_b         = b.data_ptr();
+  args.p_d         = out.data_ptr();
+  args.p_scale_a   = scale_a.data_ptr();
+  args.p_scale_b   = scale_b.data_ptr();
+  args.p_scale_out = output_scale.data_ptr();
+  args.p_m_indices = nullptr;
+  args.p_signal    = nullptr;
+
+  using Kernel = mate::moe_gemm::mubin::MoeGemmAsmKernel<mate::moe_gemm::MoeGemmMode::NoGroup>;
+  run_moe_gemm_kernel<Kernel>(args, a.device());
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_moe_gemm_16bit, ragged_moe_gemm_16bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(masked_moe_gemm_16bit, masked_moe_gemm_16bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_contig_gemm_16bit, k_grouped_contig_gemm_16bit);
@@ -1624,3 +1727,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_moe_gemm_8bit, ragged_moe_gemm_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(masked_moe_gemm_8bit, masked_moe_gemm_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_contig_gemm_8bit, k_grouped_contig_gemm_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_contig_gemm_8bit, m_grouped_contig_gemm_8bit);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(groupwise_gemm_8bit_fp8output, groupwise_gemm_8bit_fp8output);

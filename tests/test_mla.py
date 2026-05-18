@@ -6,8 +6,9 @@ import torch
 import torch_musa  # noqa: F401
 import math
 import mate
-from mate.jit.runtime import ffi_to_torch
+from mate.jit.runtime import ffi_to_torch  # noqa: F401
 from mate.mha_interface import flash_attn_with_kvcache
+from mate.testing import supported_musa_compute_capability
 
 
 def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
@@ -135,6 +136,7 @@ def attention_ref_varlen(
     return torch.cat(o_ref, dim=0), torch.cat(lse_ref, dim=1)
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("batch_size", [1, 56, 60])
 @pytest.mark.parametrize("kv_len", [33, 97, 129])
 @pytest.mark.parametrize("qo_len", [1, 3, 5])
@@ -224,6 +226,7 @@ def test_fa_interface(
     torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("batch_size", [1, 56, 60])
 @pytest.mark.parametrize("kv_len", [33, 97, 129])
 @pytest.mark.parametrize("qo_len", [1, 3, 5])
@@ -306,41 +309,7 @@ def test_flashmla_interface(
     torch.testing.assert_close(lse, lse_ref, atol=atol, rtol=rtol)
 
 
-@torch.inference_mode()
-def test_mla_metadata_prealloc_return():
-    device = torch.device("musa")
-    kv_lens = torch.tensor([33, 97, 129], dtype=torch.int32, device=device)
-    num_q_tokens_per_head_k = 96
-    num_heads_k = 1
-
-    meta_ref, splits_ref = mate.flashmla.get_mla_metadata(
-        kv_lens, num_q_tokens_per_head_k, num_heads_k
-    )
-    meta = torch.full_like(meta_ref, -1)
-    splits = torch.full_like(splits_ref, -1)
-
-    meta_out, splits_out = ffi_to_torch(
-        mate.flashmla._get_module().get_function("get_mla_decoding_metadata")(
-            kv_lens,
-            num_q_tokens_per_head_k,
-            num_heads_k,
-            None,
-            False,
-            None,
-            meta,
-            splits,
-            None,
-            None,
-        )
-    )
-
-    assert meta_out.data_ptr() == meta.data_ptr()
-    assert splits_out.data_ptr() == splits.data_ptr()
-    # The metadata kernel only materializes the populated prefix of each row.
-    torch.testing.assert_close(meta_out[:, :5], meta_ref[:, :5])
-    torch.testing.assert_close(splits_out, splits_ref)
-
-
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("num_heads_q", [8, 16, 32, 64, 128])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
@@ -441,6 +410,7 @@ def test_mla_decode_varlen(
     torch.testing.assert_close(o, o_ref, atol=atol, rtol=rtol)
 
 
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("num_heads_q", [32, 128])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])

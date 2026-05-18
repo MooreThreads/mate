@@ -2,6 +2,7 @@ from functools import lru_cache
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from ... import env as jit_env
+from ....utils import ceil_div
 
 
 @lru_cache
@@ -39,8 +40,37 @@ def fmha_extra_include_paths():
     ]
 
 
-def ceil_div(x, y):
-    return (x + y - 1) // y
+def _resolve_mask(
+    seqlen_q,
+    seqlen_k,
+    is_causal,
+    window_size_left,
+    window_size_right,
+    attention_chunk=0,
+):
+    if window_size_left is None or window_size_left >= seqlen_k - 1:
+        window_size_left = -1
+    if window_size_right is None or window_size_right >= seqlen_q - 1:
+        window_size_right = -1
+
+    if is_causal:
+        window_size_right = 0
+
+    is_causal = window_size_left < 0 and window_size_right == 0 and attention_chunk == 0
+    is_local = (
+        window_size_left >= 0 or window_size_right >= 0 or attention_chunk >= 1
+    ) and not is_causal
+
+    # chunk
+    if window_size_left < 0:
+        window_size_left = seqlen_k - 1
+    if window_size_right < 0:
+        window_size_right = seqlen_q - 1
+    if attention_chunk > 0:
+        window_size_left = min(window_size_left, attention_chunk - 1)
+        window_size_right = min(window_size_right, attention_chunk - 1)
+
+    return is_causal, is_local, window_size_left, window_size_right
 
 
 @lru_cache

@@ -36,8 +36,12 @@ class FlashMLASchedMeta:
 
 
 def get_mla_metadata(*args, **kwargs) -> Tuple[FlashMLASchedMeta, None]:
-    del args, kwargs
-    return FlashMLASchedMeta(), None
+    sched_meta = FlashMLASchedMeta()
+    if args or kwargs:
+        tile_scheduler_metadata, num_splits = mate_get_mla_metadata(*args, **kwargs)
+        sched_meta.tile_scheduler_metadata = tile_scheduler_metadata
+        sched_meta.num_splits = num_splits
+    return sched_meta, None
 
 
 def _check_sched_meta(
@@ -142,19 +146,13 @@ def flash_mla_with_kvcache(
         raise AssertionError("num_splits must be None")
 
     topk = indices.shape[-1] if indices is not None else None
+    extra_topk = (
+        extra_indices_in_kvcache.shape[-1]
+        if extra_indices_in_kvcache is not None
+        else None
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-
-    if (
-        attn_sink is not None
-        or extra_k_cache is not None
-        or extra_indices_in_kvcache is not None
-        or topk_length is not None
-        or extra_topk_length is not None
-    ):
-        raise NotImplementedError(
-            "Unsupported attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length, extra_topk_length"
-        )
 
     _check_sched_meta(
         sched_meta,
@@ -176,7 +174,12 @@ def flash_mla_with_kvcache(
             num_heads_q=q.shape[2],
             is_fp8_kvcache=is_fp8_kvcache,
             topk=topk,
+            extra_topk=extra_topk,
             q=q,
+            topk_length=topk_length.contiguous() if topk_length is not None else None,
+            extra_topk_length=extra_topk_length.contiguous()
+            if extra_topk_length is not None
+            else None,
         )
         sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
         sched_meta.num_splits = new_num_splits
@@ -193,6 +196,11 @@ def flash_mla_with_kvcache(
         causal=causal,
         is_fp8_kvcache=is_fp8_kvcache,
         indices=indices,
+        attn_sink=attn_sink,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices_in_kvcache,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
     )
 
 

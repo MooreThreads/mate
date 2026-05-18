@@ -25,17 +25,17 @@ CXX_FLAGS = [
 
 _SAGE_ATTENTION_KERNEL_PATTERN = re.compile(
     r"(?:"
-    r"e4m3tce_flash_atten_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?"
+    r"e4m3tce_flash_atten_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?(?:_fp8out)?"
     r"|"
-    r"e4m3tce_flash_atten_qk_int8_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?"
+    r"e4m3tce_flash_atten_qk_int8_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?(?:_fp8out)?"
     r")\.cpp"
 )
 
 _SAGE_ATTENTION_KERNEL_OBJECT_PATTERN = re.compile(
     r"(?:"
-    r"e4m3tce_flash_atten_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?"
+    r"e4m3tce_flash_atten_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?(?:_fp8out)?"
     r"|"
-    r"e4m3tce_flash_atten_qk_int8_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?"
+    r"e4m3tce_flash_atten_qk_int8_quant_mode_\d+_512_256x128x128(?:_kvcache)?(?:_causal_persistence)?(?:_fp8out)?"
     r")\.o"
 )
 
