@@ -18,18 +18,14 @@ struct NumericArrayConverter<float, bfloat16_t, 4, FloatRoundStyle::round_to_nea
 
   MUTLASS_DEVICE
   static result_type convert(source_type const& src) {
-    auto const*    packed = reinterpret_cast<uint32_t const*>(&src);
-    __mt_bfloat162 b01    = reinterpret_cast<__mt_bfloat162 const&>(packed[0]);
-    __mt_bfloat162 b23    = reinterpret_cast<__mt_bfloat162 const&>(packed[1]);
-
-    float2 f01 = __bfloat1622float2(b01);
-    float2 f23 = __bfloat1622float2(b23);
+    __mt_bfloat164 b0123 = reinterpret_cast<__mt_bfloat164 const&>(src);
+    float4         f0123 = __bfloat1642float4(b0123);
 
     result_type dst;
-    dst[0] = f01.x;
-    dst[1] = f01.y;
-    dst[2] = f23.x;
-    dst[3] = f23.y;
+    dst[0] = f0123.x;
+    dst[1] = f0123.y;
+    dst[2] = f0123.z;
+    dst[3] = f0123.w;
     return dst;
   }
 
@@ -155,35 +151,36 @@ struct Mp31Tf32HcPrenormGemm {
 
   static constexpr uint32_t NumLoadWarpSquads = 1;
   static constexpr uint32_t NumSqrsumSquads   = 1;
-  static constexpr uint32_t NumCastSquads     = 1;
-  static constexpr uint32_t NumGemmSquads     = kNumMmaWarpSquads - NumSqrsumSquads - NumCastSquads;
-  static_assert(NumGemmSquads >= 1, "kNumMmaWarpSquads must be >= 3");
+  static constexpr uint32_t NumGemmSquads     = kNumMmaWarpSquads - NumSqrsumSquads;
+  static_assert(NumGemmSquads >= 1, "kNumMmaWarpSquads must be >= 2");
 
   static constexpr uint32_t NumThreadsPerWarp      = mutlass::NumThreadsPerWarp;
   static constexpr uint32_t NumThreadsPerWarpSquad = mutlass::NumThreadsPerWarpSquad;
   static constexpr uint32_t WarpsPerWarpSquad      = NumThreadsPerWarpSquad / NumThreadsPerWarp;
 
-  static constexpr uint32_t NumConsumerWarpsA = (NumSqrsumSquads + NumCastSquads) * WarpsPerWarpSquad;
-  static constexpr uint32_t NumConsumerWarpsB = NumGemmSquads * WarpsPerWarpSquad;
-
+  static constexpr uint32_t NumCastWarps         = NumSqrsumSquads * WarpsPerWarpSquad;
+  static constexpr uint32_t NumConsumerWarpsA    = NumSqrsumSquads * WarpsPerWarpSquad;
+  static constexpr uint32_t NumConsumerWarpsB    = NumGemmSquads * WarpsPerWarpSquad;
+  static constexpr uint32_t NumConsumerWarpsMain = NumConsumerWarpsA + NumConsumerWarpsB;
   static constexpr uint32_t MaxThreadsPerBlock =
-      (NumLoadWarpSquads + NumSqrsumSquads + NumCastSquads + NumGemmSquads) * NumThreadsPerWarpSquad;
+      (NumLoadWarpSquads + NumSqrsumSquads + NumGemmSquads) * NumThreadsPerWarpSquad;
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
   static constexpr int      SmemAlignmentBytes         = 256;
 
-  using PipelineA         = mutlass::Mp31PipelineTmeAsyncWarpsepcialized<kStages>;
-  using PipelineB         = mutlass::Mp31PipelineTmeAsyncWarpsepcialized<kStages>;
-  using PipelineState     = typename PipelineA::PipelineState;
-  using PipelineSeq       = mutlass::OrderedSequenceBarrier<kStages, 2>;
-  using PipelineSeqParams = typename PipelineSeq::Params;
+  using PipelineMain      = mutlass::Mp31PipelineTmeAsyncWarpsepcialized<kStages>;
+  using PipelineCast      = mutlass::Mp31PipelineAsyncWarpsepcialized<kStages>;
+  using PipelineState     = typename PipelineMain::PipelineState;
+  using PipelineCastState = typename PipelineCast::PipelineState;
 
   static constexpr int kCastFragmentSize  = 4;
   static constexpr int kCastThreadsPerRow = BlockK / kCastFragmentSize;
+  static constexpr int kS2RFragmentBits   = sizeof_bits_v<ElementA> * kCastFragmentSize;
   using CastThreadLayout = Layout<Shape<Int<NumThreadsPerWarpSquad / kCastThreadsPerRow>, Int<kCastThreadsPerRow>>,
                                   Stride<Int<kCastThreadsPerRow>, _1>>;
   using R2SFragmentType  = mute::uint_bit_t<sizeof_bits_v<float> * kCastFragmentSize>;
-  using S2RFragmentType  = mute::uint_bit_t<sizeof_bits_v<ElementA> * kCastFragmentSize>;
-  using R2SCopyAtom      = Copy_Atom<UniversalCopy<R2SFragmentType>, float>;
+  // Keep S2R lowered as 64-bit LMA loads; mute::uint_bit_t<64> is scalar uint64_t here.
+  using S2RFragmentType = mute::uint32_t __attribute__((vector_size(kS2RFragmentBits / 8)));
+  using R2SCopyAtom     = Copy_Atom<UniversalCopy<R2SFragmentType>, float>;
   using R2STiledCopy =
       decltype(make_tiled_copy(R2SCopyAtom{}, CastThreadLayout{}, Layout<Shape<_1, Int<kCastFragmentSize>>>{}));
   using S2RCopyAtom = Copy_Atom<UniversalCopy<S2RFragmentType>, ElementA>;
@@ -191,9 +188,8 @@ struct Mp31Tf32HcPrenormGemm {
       decltype(make_tiled_copy(S2RCopyAtom{}, CastThreadLayout{}, Layout<Shape<_1, Int<kCastFragmentSize>>>{}));
 
   struct MUTE_ALIGNAS(1) BarrierStorage {
-    uint8_t PipelineA[PipelineA::NumBarriers];
-    uint8_t PipelineB[PipelineB::NumBarriers];
-    uint8_t PipelineSeq[PipelineSeq::NumBarriers];
+    uint8_t PipelineMain[PipelineMain::NumBarriers];
+    uint8_t PipelineCast[PipelineCast::NumBarriers];
   };
 
   struct SharedStorage {
@@ -275,19 +271,16 @@ struct Mp31Tf32HcPrenormGemm {
     mutlass::arch::allocate_async_barriers(sizeof(BarrierStorage));
     BarrierStorage* bs = reinterpret_cast<BarrierStorage*>(0);
 
-    typename PipelineA::Params pa_params;
-    pa_params.transaction_bytes = TmeTransactionBytesA;
-    pa_params.num_consumers     = NumConsumerWarpsA;
-    pa_params.num_producers     = 1;
-    PipelineA pipeline_a(pa_params, reinterpret_cast<uint64_t>(&bs->PipelineA));
+    typename PipelineMain::Params main_params;
+    main_params.transaction_bytes = TmeTransactionBytesA + TmeTransactionBytesB;
+    main_params.num_consumers     = NumConsumerWarpsMain;
+    main_params.num_producers     = 1;
+    PipelineMain pipeline_main(main_params, reinterpret_cast<uint64_t>(&bs->PipelineMain));
 
-    typename PipelineB::Params pb_params;
-    pb_params.transaction_bytes = TmeTransactionBytesB;
-    pb_params.num_consumers     = NumConsumerWarpsB;
-    pb_params.num_producers     = 1;
-    PipelineB pipeline_b(pb_params, reinterpret_cast<uint64_t>(&bs->PipelineB));
-
-    constexpr uint32_t kSeqBase = PipelineA::NumBarriers + PipelineB::NumBarriers;
+    typename PipelineCast::Params pipeline_cast_params;
+    pipeline_cast_params.producer_arv_count = NumCastWarps;
+    pipeline_cast_params.consumer_arv_count = NumConsumerWarpsB;
+    PipelineCast pipeline_cast(pipeline_cast_params, reinterpret_cast<uint64_t>(&bs->PipelineCast));
 
     const int squad         = mutlass::canonical_warp_squad_idx();
     const int warp_idx      = mutlass::canonical_warp_idx_sync();
@@ -295,8 +288,7 @@ struct Mp31Tf32HcPrenormGemm {
 
     const bool is_producer_squad = (squad == 0);
     const bool is_sqrsum_squad   = (squad == int(NumLoadWarpSquads));
-    const bool is_cast_squad     = (squad == int(NumLoadWarpSquads + NumSqrsumSquads));
-    const bool is_gemm_squad     = (squad > int(NumLoadWarpSquads + NumSqrsumSquads));
+    const bool is_gemm_squad     = (squad > int(NumLoadWarpSquads));
     const bool is_tme_warp       = is_producer_squad && (warp_in_squad == 0);
 
     const int k_split_idx = int(blockIdx.x);
@@ -304,10 +296,6 @@ struct Mp31Tf32HcPrenormGemm {
     const int m_block_idx = int(blockIdx.z);
     const int m_offset    = m_block_idx * BlockM;
     const int n_offset    = n_block_idx * BlockN;
-
-    if (m_offset >= params.m || n_offset >= params.n) {
-      return;
-    }
 
     const int k_blocks_this_split = params.num_k_blocks_per_split + (k_split_idx < params.remain_k_blocks ? 1 : 0);
     const int k_block_start = k_split_idx * params.num_k_blocks_per_split + min(k_split_idx, params.remain_k_blocks);
@@ -325,34 +313,28 @@ struct Mp31Tf32HcPrenormGemm {
     Tensor mB        = params.tme_b.get_tme_tensor(make_shape(params.n, params.k));
     Tensor gB_full   = local_tile(mB, make_shape(Int<BlockN>{}, Int<BlockK>{}), make_coord(_, _));
 
-    PipelineState pipe_write_a;
-    PipelineState pipe_write_b;
-    PipelineState pipe_read_a;
-    PipelineState pipe_read_b;
-
-    const int         seq_group_id = is_gemm_squad ? 1 : 0;
-    PipelineSeqParams seq_params_global{};
-    seq_params_global.group_size = int(WarpsPerWarpSquad);
-    seq_params_global.group_id   = seq_group_id;
-    PipelineSeq pipeline_seq(seq_params_global, kSeqBase);
+    PipelineState     pipe_write;
+    PipelineState     pipe_read;
+    PipelineCastState pipe_cast_write;
+    PipelineCastState pipe_cast_read;
 
     __syncthreads();
 
-    // consumers prime empty barriers before the first producer acquire.
-    if (is_sqrsum_squad || is_cast_squad) {
-      PipelineState pipe_empty_a;
+    // Consumers prime empty barriers before the first producer acquire.
+    if (is_sqrsum_squad || is_gemm_squad) {
+      PipelineState pipe_empty;
       MUTE_UNROLL
       for (int i = 0; i < int(kStages); ++i) {
-        pipeline_a.consumer_release(pipe_empty_a);
-        ++pipe_empty_a;
+        pipeline_main.consumer_release(pipe_empty);
+        ++pipe_empty;
       }
     }
     if (is_gemm_squad) {
-      PipelineState pipe_empty_b;
+      PipelineCastState pipe_empty_cast;
       MUTE_UNROLL
       for (int i = 0; i < int(kStages); ++i) {
-        pipeline_b.consumer_release(pipe_empty_b);
-        ++pipe_empty_b;
+        pipeline_cast.consumer_release(pipe_empty_cast);
+        ++pipe_empty_cast;
       }
     }
 
@@ -361,24 +343,20 @@ struct Mp31Tf32HcPrenormGemm {
         for (int kb = 0; kb < k_blocks_this_split; ++kb) {
           const int gkb = k_block_start + kb;
 
-          pipeline_a.producer_acquire(pipe_write_a);
-          pipeline_b.producer_acquire(pipe_write_b);
+          pipeline_main.producer_acquire(pipe_write);
 
-          const uint32_t bar_id_a = pipeline_a.producer_get_barrier_id(pipe_write_a);
-          const uint32_t bar_id_b = pipeline_b.producer_get_barrier_id(pipe_write_b);
-          const int      stage_a  = int(pipe_write_a.index());
-          const int      stage_b  = int(pipe_write_b.index());
+          const uint32_t bar_id = pipeline_main.producer_get_barrier_id(pipe_write);
+          const int      stage  = int(pipe_write.index());
 
           auto tAgA = cta_tme_a.partition_S(gA_full(_, _, m_block_idx, gkb));
-          auto tAsA = cta_tme_a.partition_D(sA_bf16_A(_, _, stage_a));
-          copy(params.tme_a.with(bar_id_a), tAgA, tAsA);
+          auto tAsA = cta_tme_a.partition_D(sA_bf16_A(_, _, stage));
+          copy(params.tme_a.with(bar_id), tAgA, tAsA);
 
           auto tBgB = cta_tme_b.partition_S(gB_full(_, _, n_block_idx, gkb));
-          auto tBsB = cta_tme_b.partition_D(sB(_, _, stage_b));
-          copy(params.tme_b.with(bar_id_b), tBgB, tBsB);
+          auto tBsB = cta_tme_b.partition_D(sB(_, _, stage));
+          copy(params.tme_b.with(bar_id), tBgB, tBsB);
 
-          ++pipe_write_a;
-          ++pipe_write_b;
+          ++pipe_write;
         }
       }
       return;
@@ -394,24 +372,49 @@ struct Mp31Tf32HcPrenormGemm {
       Tensor     tCrAA_A    = thr_mma_aa.make_fragment_A(tCsAA_A);
       Tensor     tCrAA_B    = thr_mma_aa.make_fragment_B(tCsAA_B);
 
+      S2RTiledCopy tiled_copy_s2r;
+      R2STiledCopy tiled_copy_r2s;
+      auto         thr_copy_s2r = tiled_copy_s2r.get_thread_slice(tid_sq);
+      auto         thr_copy_r2s = tiled_copy_r2s.get_thread_slice(tid_sq);
+
+      auto rA_bf16      = make_fragment_like(thr_copy_s2r.partition_S(sA_bf16_A(_, _, _0{})));
+      auto rA_bf16_view = thr_copy_s2r.retile_D(rA_bf16);
+      auto rA_fp32      = make_fragment_like<float>(rA_bf16);
+      auto rA_fp32_view = thr_copy_r2s.retile_S(rA_fp32);
+
       auto rAcc_AA = partition_fragment_C(tiled_mma_aa, make_shape(Int<BlockM>{}, Int<BlockM>{}));
       clear(rAcc_AA);
 
       const int valid_m = min(BlockM, params.m - m_offset);
 
       for (int kb = 0; kb < k_blocks_this_split; ++kb) {
-        pipeline_a.consumer_wait(pipe_read_a);
-        const int stage = int(pipe_read_a.index());
+        pipeline_main.consumer_wait(pipe_read);
+        const int stage_main = int(pipe_read.index());
 
         MUTE_UNROLL
         for (int mma_k = 0; mma_k < size<2>(tCrAA_A); ++mma_k) {
-          mute::gemm(tiled_mma_aa, tCrAA_A(_, _, mma_k, stage), tCrAA_B(_, _, mma_k, stage), rAcc_AA);
+          mute::gemm(tiled_mma_aa, tCrAA_A(_, _, mma_k, stage_main), tCrAA_B(_, _, mma_k, stage_main), rAcc_AA);
         }
         mate::warpsquad_commit_batch();
-        mate::warpsquad_wait();
 
-        pipeline_a.consumer_release(pipe_read_a);
-        ++pipe_read_a;
+        pipeline_cast.producer_acquire(pipe_cast_write);
+        const int stage_cast = int(pipe_cast_write.index());
+
+        auto sA_bf16       = sA_bf16_A(_, _, stage_main);
+        auto sA_fp32_stage = sA_fp32(_, _, stage_cast);
+        auto tCsA_bf16     = thr_copy_s2r.partition_S(sA_bf16);
+        auto tCsA_fp32     = thr_copy_r2s.partition_D(sA_fp32_stage);
+        copy(tiled_copy_s2r, tCsA_bf16, rA_bf16_view);
+
+        detail::convert_op<kCastFragmentSize>(rA_bf16, rA_fp32);
+        mate::warpsquad_wait();
+        copy(tiled_copy_r2s, rA_fp32_view, tCsA_fp32);
+
+        __syncwarp();
+        pipeline_cast.producer_commit(pipe_cast_write);
+        pipeline_main.consumer_release(pipe_read);
+        ++pipe_cast_write;
+        ++pipe_read;
       }
 
       if (n_block_idx == 0) {
@@ -435,45 +438,8 @@ struct Mp31Tf32HcPrenormGemm {
       return;
     }
 
-    if (is_cast_squad) {
-      const int tid_cast = int(threadIdx.x) - int((NumLoadWarpSquads + NumSqrsumSquads) * NumThreadsPerWarpSquad);
-
-      constexpr int FragmentSize = kCastFragmentSize;
-      S2RTiledCopy  tiled_copy_s2r;
-      R2STiledCopy  tiled_copy_r2s;
-      auto          thr_copy_s2r = tiled_copy_s2r.get_thread_slice(tid_cast);
-      auto          thr_copy_r2s = tiled_copy_r2s.get_thread_slice(tid_cast);
-
-      auto sA_bf16_0      = sA_bf16_A(_, _, _0{});
-      auto src_smem_view0 = thr_copy_s2r.partition_S(sA_bf16_0);
-      auto src_reg        = make_fragment_like(src_smem_view0);
-      auto src_reg_view   = thr_copy_s2r.retile_D(src_reg);
-      auto dst_reg        = make_fragment_like<float>(src_reg);
-      auto dst_reg_view   = thr_copy_r2s.retile_S(dst_reg);
-
-      for (int kb = 0; kb < k_blocks_this_split; ++kb) {
-        pipeline_a.consumer_wait(pipe_read_a);
-        const int stage = int(pipe_read_a.index());
-
-        auto sA_bf16_s     = sA_bf16_A(_, _, stage);
-        auto sA_fp32_s     = sA_fp32(_, _, stage);
-        auto src_smem_view = thr_copy_s2r.partition_S(sA_bf16_s);
-        auto dst_smem_view = thr_copy_r2s.partition_D(sA_fp32_s);
-        copy(tiled_copy_s2r, src_smem_view, src_reg_view);
-
-        detail::convert_op<FragmentSize>(src_reg, dst_reg);
-        copy(tiled_copy_r2s, dst_reg_view, dst_smem_view);
-
-        __syncwarp();
-        pipeline_seq.arrive();
-        pipeline_a.consumer_release(pipe_read_a);
-        ++pipe_read_a;
-      }
-      return;
-    }
-
     if (is_gemm_squad) {
-      const int mma_thread_offset = int((NumLoadWarpSquads + NumSqrsumSquads + NumCastSquads) * NumThreadsPerWarpSquad);
+      const int  mma_thread_offset = int((NumLoadWarpSquads + NumSqrsumSquads) * NumThreadsPerWarpSquad);
       TiledMmaAB tiled_mma;
       auto       thr_mma = tiled_mma.get_thread_slice(int(threadIdx.x) - mma_thread_offset);
 
@@ -486,21 +452,23 @@ struct Mp31Tf32HcPrenormGemm {
       Tensor tCrB = thr_mma.make_fragment_B(tCsB);
 
       for (int kb = 0; kb < k_blocks_this_split; ++kb) {
-        pipeline_b.consumer_wait(pipe_read_b);
-        pipeline_seq.wait();
+        pipeline_main.consumer_wait(pipe_read);
+        pipeline_cast.consumer_wait(pipe_cast_read);
 
-        const int stage = int(pipe_read_b.index());
+        const int stage_a = int(pipe_cast_read.index());
+        const int stage_b = int(pipe_read.index());
 
         MUTE_UNROLL
         for (int mma_k = 0; mma_k < size<2>(tCrA); ++mma_k) {
-          mute::gemm(tiled_mma, tCrA(_, _, mma_k, stage), tCrB(_, _, mma_k, stage), rAcc);
+          mute::gemm(tiled_mma, tCrA(_, _, mma_k, stage_a), tCrB(_, _, mma_k, stage_b), rAcc);
         }
         mate::warpsquad_commit_batch();
         mate::warpsquad_wait();
 
-        pipeline_seq.arrive();
-        pipeline_b.consumer_release(pipe_read_b);
-        ++pipe_read_b;
+        pipeline_cast.consumer_release(pipe_cast_read);
+        pipeline_main.consumer_release(pipe_read);
+        ++pipe_cast_read;
+        ++pipe_read;
       }
 
       auto mD =

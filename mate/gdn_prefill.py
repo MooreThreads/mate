@@ -3,8 +3,8 @@ from typing import Optional, Tuple, Union
 import torch
 
 from mate.api_logging import mate_api
-from mate.gdn_kernels.tilelang.gdn_chunk_local_cumsum import chunk_local_cumsum
 from mate.gdn_kernels.tilelang.gdn_kkt_solve import kkt_solve
+from mate.gdn_kernels.tilelang.gdn_l2norm import gdn_l2norm_
 from mate.gdn_kernels.tilelang.gdn_prefill import fused_chunk_gdn_prefill
 
 
@@ -21,6 +21,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_size: int = 64,
+    is_log_space: bool = True,
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -44,8 +45,9 @@ def chunk_gated_delta_rule(
             Multiplicative forget gate (alpha) of shape
             ``[total_seq_len, num_sab_heads]`` where
             ``num_sab_heads = max(num_q_heads, num_v_heads)``. Must be float32.
-            Values are interpreted as alpha in ``(0, 1]``; the TileLang kernel
-            converts alpha to log space before the local cumulative sum.
+            If ``is_log_space=True``, values are interpreted as ``log(alpha)``.
+            If ``is_log_space=False``, values are interpreted as alpha in
+            ``(0, 1]`` and the TileLang kernel converts alpha to log space.
             If None, defaults to all ones. Default: ``None``.
         beta (Optional[torch.Tensor]):
             Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
@@ -62,7 +64,10 @@ def chunk_gated_delta_rule(
             Cumulative sequence lengths of shape ``[num_seqs + 1]``, int64.
             Required for variable-length sequences (varlen mode).
         use_qk_l2norm_in_kernel (bool):
-            Whether to use QK L2 normalization in kernel. Default: ``False``.
+            Whether to L2-normalize Q and K in-place with the TileLang
+            normalization kernel before KKT/prefill. Default: ``False``.
+        is_log_space (bool):
+            Whether ``g`` is already in log space. Default: ``True``.
         output (Optional[torch.Tensor]):
             Pre-allocated output tensor of shape ``[total_seq_len, num_o_heads, head_size]``
             where ``num_o_heads = max(num_q_heads, num_v_heads)``.
@@ -148,10 +153,9 @@ def chunk_gated_delta_rule(
         scale = k.shape[-1] ** -0.5
 
     if use_qk_l2norm_in_kernel:
-        q = torch.nn.functional.normalize(q, p=2, dim=-1)
-        k = torch.nn.functional.normalize(k, p=2, dim=-1)
+        gdn_l2norm_(q)
+        gdn_l2norm_(k)
 
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     A = kkt_solve(
         k=k,
         b=beta,
@@ -173,6 +177,7 @@ def chunk_gated_delta_rule(
         output_h=False,
         output_o=True,
         cu_seqlens=cu_seqlens,
+        is_log_space=is_log_space,
     )
     o = o.to(q.dtype)
     if squeeze_varlen_output:

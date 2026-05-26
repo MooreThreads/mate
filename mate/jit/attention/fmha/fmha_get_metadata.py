@@ -321,6 +321,20 @@ def _fmha_get_metadata(
     assert num_heads_q % num_heads_kv == 0, (
         "num_heads_q must be divisible by num_heads_kv"
     )
+    if attention_chunk > 0:
+        fixed_seqlen = (
+            cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and cu_seqlens_k_new is None
+            and seqused_q is None
+            and seqused_k is None
+        )
+        if (
+            fixed_seqlen
+            and max_seqlen_q <= max_seqlen_k
+            and attention_chunk >= max_seqlen_k
+        ):
+            attention_chunk = 0
     is_causal, is_local, window_size_left, window_size_right = _resolve_mask(
         seqlen_q=max_seqlen_q,
         seqlen_k=max_seqlen_k,

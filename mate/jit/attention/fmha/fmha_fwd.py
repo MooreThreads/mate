@@ -200,6 +200,13 @@ mode_mask = [
         sweep=False,
     ),
     ParamSpec(
+        name="has_attention_chunk",
+        domain=[False, True],
+        default=False,
+        meaningful_if=lambda cfg: bool(cfg["is_local"]),
+        depends_on=("is_local",),
+    ),
+    ParamSpec(
         name="has_learnable_sink",
         domain=[False, True],
         default=False,
@@ -472,7 +479,6 @@ def _fmha_fwd(
 ):
     # Feature gates.
     assert q_v is None, "qv parameter is not supported yet"
-    assert attention_chunk == 0, "attention_chunk parameter is not supported yet"
     assert not ((k_new is None) ^ (v_new is None)), (
         "k_new and v_new must be provided together"
     )
@@ -687,6 +693,19 @@ def _fmha_fwd(
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
     qhead_per_kvhead = num_head // num_head_kv
+    if attention_chunk > 0:
+        fixed_seqlen = (
+            cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and cu_seqlens_k_new is None
+            and seqused_q is None
+            and seqused_k is None
+            and leftpad_k is None
+            and page_table is None
+            and k_new is None
+        )
+        if fixed_seqlen and seqlen_q <= seqlen_k and attention_chunk >= seqlen_k:
+            attention_chunk = 0
 
     is_causal, is_local, window_size_left, window_size_right = _resolve_mask(
         seqlen_q=seqlen_q,
@@ -811,6 +830,7 @@ def _fmha_fwd(
         "is_rotary": rotary_cos is not None,
         "is_rotary_interleaved": is_rotary_interleaved and rotary_cos is not None,
         "has_seqlens_rotary": seqlens_rotary is not None,
+        "has_attention_chunk": attention_chunk > 0,
     }
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 

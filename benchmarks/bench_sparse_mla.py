@@ -971,8 +971,7 @@ def _make_model1_decode_graph_runner(
     kernel = sparse_attention_decode_fwd_scheduled_kernel_model1(
         heads,
         DV,
-        indices.shape[-1],
-        extra_topk=extra_indices.shape[-1],
+        has_extra=extra_indices.shape[-1] > 0,
         kv_group=1,
         sm_scale=case.d_qk**-0.5,
         threads=640,
@@ -1248,6 +1247,19 @@ def _decode_cases(
             temp_metadata=True,
         )
         yield DecodeCase("model1_small_b4_s1", 512, 64, 4, 1, 512, 64, 64)
+        yield DecodeCase(
+            "model1_b1_s896_h64_topk2048",
+            512,
+            64,
+            1,
+            960,
+            8192,
+            2048,
+            64,
+            attn_sink=False,
+            topk_length=False,
+            extra_topk_length=False,
+        )
         if include_large:
             yield DecodeCase(
                 "model1_scheduled_large_compare",
@@ -1266,7 +1278,19 @@ def _decode_cases(
                 extra_topk_length=False,
             )
         return
-
+    yield DecodeCase(
+        "model1_b1_s896_h64_topk2048",
+        512,
+        64,
+        1,
+        960,
+        8192,
+        2048,
+        64,
+        attn_sink=False,
+        topk_length=False,
+        extra_topk_length=False,
+    )
     batches = [2] if quick else [2, 64, 74, 128]
     for bsz in batches:
         yield DecodeCase(f"v32_b{bsz}", 576, 128, bsz, 2, 32768, 2048, 64)

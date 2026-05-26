@@ -336,6 +336,7 @@ def _assert_decode_matches_reference(
     scale: float,
     use_qk_l2norm: bool,
     output: torch.Tensor | None = None,
+    output_rtol: float | None = None,
 ) -> None:
     state = input_state_ref.transpose(-2, -1).contiguous()
     state_ptr = state.data_ptr()
@@ -377,10 +378,259 @@ def _assert_decode_matches_reference(
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.transpose(-2, -1).contiguous()
 
-    atol = 1e-2 if q.dtype == torch.float16 else 5e-3
-    rtol = 1e-2 if q.dtype == torch.float16 else 5e-3
-    torch.testing.assert_close(out.squeeze(1), ref_o, atol=atol, rtol=rtol)
-    torch.testing.assert_close(returned_state, ref_state, atol=atol, rtol=rtol)
+    default_atol = 1e-3 if q.dtype == torch.float16 else 5e-3
+    default_rtol = 1e-3 if q.dtype == torch.float16 else 5e-3
+    torch.testing.assert_close(
+        out.squeeze(1),
+        ref_o,
+        atol=default_atol,
+        rtol=default_rtol if output_rtol is None else output_rtol,
+    )
+    torch.testing.assert_close(
+        returned_state,
+        ref_state,
+        atol=default_atol,
+        rtol=default_rtol,
+    )
+
+
+def _make_decode_pool_inputs(
+    *,
+    batch_size: int,
+    pool_size: int,
+    seed: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+
+    num_q_heads = 16
+    num_k_heads = 16
+    num_v_heads = 32
+    head_size = 128
+    dtype_torch = torch.bfloat16
+    device = _get_runtime_device(allow_skip=True)
+    _manual_seed_device(seed, device.type)
+
+    q = torch.randn(
+        batch_size, 1, num_q_heads, head_size, dtype=dtype_torch, device=device
+    )
+    k = torch.randn(
+        batch_size, 1, num_k_heads, head_size, dtype=dtype_torch, device=device
+    )
+    v = torch.randn(
+        batch_size, 1, num_v_heads, head_size, dtype=dtype_torch, device=device
+    )
+    k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+
+    state_pool = torch.randn(
+        pool_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    a = torch.randn(batch_size, 1, num_v_heads, dtype=dtype_torch, device=device) * 0.1
+    b_tensor = torch.randn(
+        batch_size,
+        1,
+        num_v_heads,
+        dtype=dtype_torch,
+        device=device,
+    )
+
+    return q, k, v, state_pool, A_log, a, dt_bias, b_tensor
+
+
+def _assert_decode_pool_matches_reference(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, _, _ = q.shape
+    _, _, HV, V = v.shape
+    assert T == 1
+    scale = 1.0
+
+    state_under_test = state_pool.clone()
+    state_ptr = state_under_test.data_ptr()
+    out, returned_state = mate.gated_delta_rule_decode(
+        q=q,
+        k=k,
+        v=v,
+        state=state_under_test,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b_tensor,
+        state_layout="VK",
+        state_indices=state_indices,
+        scale=scale,
+        use_qk_l2norm=True,
+    )
+    _synchronize_device(q.device.type)
+
+    assert returned_state.data_ptr() == state_ptr
+
+    ref_out = torch.zeros(B, T, HV, V, dtype=q.dtype, device=q.device)
+    ref_state = state_pool.clone()
+    valid_mask = state_indices >= 0
+    if valid_mask.any():
+        valid_batch = torch.where(valid_mask)[0]
+        valid_slots = state_indices[valid_batch].long()
+        gathered_state_kv = state_pool[valid_slots].transpose(-2, -1).contiguous()
+
+        ref_o, ref_state_kv = decode_delta_rule(
+            q[valid_batch].squeeze(1).float(),
+            k[valid_batch].squeeze(1).float(),
+            v[valid_batch].squeeze(1).float(),
+            gathered_state_kv,
+            A_log=A_log.float(),
+            a=a[valid_batch].squeeze(1).float(),
+            dt_bias=dt_bias.float(),
+            b=b_tensor[valid_batch].squeeze(1).float(),
+            scale_factor=scale,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            use_l2_norm=True,
+        )
+        ref_out[valid_batch, 0] = ref_o.to(q.dtype)
+        ref_state[valid_slots] = ref_state_kv.transpose(-2, -1).contiguous()
+
+    atol = 5e-3
+    rtol = 5e-3
+    out_4d = out.unsqueeze(1) if out.dim() == 3 else out
+    torch.testing.assert_close(out_4d, ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(state_under_test, ref_state, atol=atol, rtol=rtol)
+
+    invalid_mask = state_indices < 0
+    if invalid_mask.any():
+        assert torch.all(out_4d[invalid_mask] == 0)
+
+    valid_slots = state_indices[state_indices >= 0].long().unique()
+    untouched = torch.ones(
+        state_pool.shape[0],
+        dtype=torch.bool,
+        device=state_pool.device,
+    )
+    if valid_slots.numel() > 0:
+        untouched[valid_slots] = False
+    assert torch.equal(state_under_test[untouched], state_pool[untouched])
+    return out_4d, state_under_test
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
+def test_decode_kernel_pool_state_indices_pretranspose(
+    batch_size: int,
+    seed: int = _get_default_seed(),
+) -> None:
+    pool_multiplier = 3
+    pool_size = batch_size * pool_multiplier
+    q, k, v, state_pool, A_log, a, dt_bias, b_tensor = _make_decode_pool_inputs(
+        batch_size=batch_size,
+        pool_size=pool_size,
+        seed=seed,
+    )
+    state_indices = (
+        torch.arange(batch_size, dtype=torch.int32, device=q.device) * pool_multiplier
+    )
+
+    _assert_decode_pool_matches_reference(
+        q=q,
+        k=k,
+        v=v,
+        state_pool=state_pool,
+        state_indices=state_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_tensor=b_tensor,
+    )
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch_size", [4, 8, 32])
+def test_decode_kernel_pool_negative_state_indices_pretranspose(
+    batch_size: int,
+    seed: int = _get_default_seed(),
+) -> None:
+    pool_size = batch_size * 2
+    q, k, v, state_pool, A_log, a, dt_bias, b_tensor = _make_decode_pool_inputs(
+        batch_size=batch_size,
+        pool_size=pool_size,
+        seed=seed,
+    )
+    state_indices = torch.randperm(pool_size, device=q.device)[:batch_size].to(
+        torch.int32
+    )
+    state_indices[1::2] = -1
+
+    out, _ = _assert_decode_pool_matches_reference(
+        q=q,
+        k=k,
+        v=v,
+        state_pool=state_pool,
+        state_indices=state_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_tensor=b_tensor,
+    )
+    assert torch.all(out[state_indices < 0] == 0)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 32])
+def test_decode_kernel_pool_all_padding_state_indices_pretranspose(
+    batch_size: int,
+    seed: int = _get_default_seed(),
+) -> None:
+    pool_size = batch_size * 2
+    q, k, v, state_pool, A_log, a, dt_bias, b_tensor = _make_decode_pool_inputs(
+        batch_size=batch_size,
+        pool_size=pool_size,
+        seed=seed,
+    )
+    state_indices = torch.full(
+        (batch_size,),
+        -1,
+        dtype=torch.int32,
+        device=q.device,
+    )
+
+    out, state_under_test = _assert_decode_pool_matches_reference(
+        q=q,
+        k=k,
+        v=v,
+        state_pool=state_pool,
+        state_indices=state_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_tensor=b_tensor,
+    )
+    assert torch.all(out == 0)
+    assert torch.equal(state_under_test, state_pool)
 
 
 def _test_decode_kernel_pretranspose(
@@ -802,6 +1052,8 @@ def test_decode_kernel_strided_inputs_and_output_pretranspose(
         scale=scale,
         output=output,
         use_qk_l2norm=use_qk_l2norm,
+        # Allow one bf16-step rounding-boundary difference for strided output.
+        output_rtol=8e-3 if dtype_torch == torch.bfloat16 else None,
     )
 
 

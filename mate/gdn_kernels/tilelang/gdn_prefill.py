@@ -1,5 +1,4 @@
 import torch
-from mate.gdn_kernels.tilelang.gdn_utils import prepare_chunk_offsets
 from mate.utils import cosize
 import tilelang
 import tilelang.language as T
@@ -49,16 +48,15 @@ def tilelang_fused_chunk_gdn_prefill(
     b_dtype,
     h0_dtype,
     ht_dtype,
-    h_dtype,
     o_dtype,
     seqlen_dtype,
     use_initial_state,
     store_final_state,
     is_varlen,
+    is_log_space,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
-    num_chunks = T.dynamic("num_chunks")
     raw_batch_size = T.dynamic("raw_batch_size")
     block_S = chunk_size
     assert DV == 128, "gdn_prefill tilelang kernel currently supports DV=128 only"
@@ -71,7 +69,6 @@ def tilelang_fused_chunk_gdn_prefill(
         a_shape = (1, num_tokens, H, chunk_size)
         g_shape = (1, num_tokens, H)
         b_shape = (1, num_tokens, H)
-        h_shape = (1, num_chunks, H, DK, DV)
     else:
         q_shape = (batch_size, num_tokens, Hg, DK)
         k_shape = (batch_size, num_tokens, Hg, DK)
@@ -80,10 +77,22 @@ def tilelang_fused_chunk_gdn_prefill(
         a_shape = (batch_size, num_tokens, H, chunk_size)
         g_shape = (batch_size, num_tokens, H)
         b_shape = (batch_size, num_tokens, H)
-        h_shape = (batch_size, num_chunks, H, DK, DV)
     h0_shape = (raw_batch_size if is_varlen else batch_size, H, DK, DV)
     ht_shape = (raw_batch_size, H, DK, DV)
     seqlens_shape = (raw_batch_size + 1,) if is_varlen else (batch_size + 1,)
+
+    q_stride_b = T.dynamic("q_stride_b")
+    q_stride_t = T.dynamic("q_stride_t")
+    q_stride_h = T.dynamic("q_stride_h")
+    k_stride_b = T.dynamic("k_stride_b")
+    k_stride_t = T.dynamic("k_stride_t")
+    k_stride_h = T.dynamic("k_stride_h")
+    v_stride_b = T.dynamic("v_stride_b")
+    v_stride_t = T.dynamic("v_stride_t")
+    v_stride_h = T.dynamic("v_stride_h")
+    q_strides = (q_stride_b, q_stride_t, q_stride_h, 1)
+    k_strides = (k_stride_b, k_stride_t, k_stride_h, 1)
+    v_strides = (v_stride_b, v_stride_t, v_stride_h, 1)
 
     @T.macro
     def producer_phase(i):
@@ -124,17 +133,15 @@ def tilelang_fused_chunk_gdn_prefill(
 
     @T.prim_func
     def tilelang_fused_chunk_gdn_prefill_kernel(
-        q: T.Tensor(q_shape, dtype=qkva_dtype),
-        k: T.Tensor(k_shape, dtype=qkva_dtype),
-        v: T.Tensor(v_shape, dtype=qkva_dtype),
+        q: T.StridedTensor(q_shape, q_strides, qkva_dtype),
+        k: T.StridedTensor(k_shape, k_strides, qkva_dtype),
+        v: T.StridedTensor(v_shape, v_strides, qkva_dtype),
         a: T.Tensor(a_shape, dtype=qkva_dtype),
         g: T.Tensor(g_shape, dtype=g_dtype),
         b: T.Tensor(b_shape, dtype=b_dtype),
         h0: T.Tensor(h0_shape, dtype=h0_dtype),
         cu_seqlens: T.Tensor(seqlens_shape, dtype=seqlen_dtype),
-        chunk_offsets: T.Tensor(seqlens_shape, dtype=seqlen_dtype),
         o: T.Tensor(o_shape, dtype=o_dtype),
-        h: T.Tensor(h_shape, dtype=h_dtype),
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
     ):
         launch_batch_size = raw_batch_size if is_varlen else batch_size
@@ -154,16 +161,11 @@ def tilelang_fused_chunk_gdn_prefill(
             seq_len = seq_end_idx - seq_start_idx
             num_iters = T.alloc_var("int32")
             num_iters = T.ceildiv(seq_len, block_S)
-            full_num_iters = T.alloc_var("int32")
-            full_num_iters = seq_len // block_S
-            tail_num_iters = T.alloc_var("int32")
-            tail_num_iters = num_iters - full_num_iters
 
             q_shared = T.alloc_shared((2, block_S, DK), dtype=qkva_dtype)
             k_shared = T.alloc_shared((2, block_S, DK), dtype=qkva_dtype)
             scaled_k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
             v_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
-            o_shared = T.alloc_shared((block_S, DV), dtype=qkva_dtype)
             pa_shared = T.alloc_shared((2, block_S, block_S), dtype=qkva_dtype)
             g_shared = T.alloc_shared((2, block_S), dtype=accum_dtype, scope="shared")
             b_shared = T.alloc_shared((2, block_S), dtype=accum_dtype, scope="shared")
@@ -176,7 +178,6 @@ def tilelang_fused_chunk_gdn_prefill(
             g_exp_rev_shared = T.alloc_shared(
                 (2, block_S), dtype=accum_dtype, scope="shared"
             )
-
             h_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
             o_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
             uv_fragment = T.alloc_fragment((block_S, DV), dtype=accum_dtype)
@@ -191,14 +192,13 @@ def tilelang_fused_chunk_gdn_prefill(
             gb_is_free = T.alloc_barrier(arrive_count=[768] * 2)
             v_is_ready = T.alloc_barrier(arrive_count=32)
             v_is_free = T.alloc_barrier(arrive_count=128)
-            o_is_ready = T.alloc_barrier(arrive_count=128)
-            o_is_free = T.alloc_barrier(arrive_count=64)
 
             a_is_ready = T.alloc_barrier(arrive_count=[32] * 2)
             a_is_free = T.alloc_barrier(arrive_count=[128] * 2)
             inv_is_ready = T.alloc_barrier(arrive_count=[512] * 2)
             inv_is_free = T.alloc_barrier(arrive_count=[128] * 2)
             p_is_ready = T.alloc_barrier(arrive_count=[512] * 2)
+            scaled_k_is_ready = T.alloc_barrier(arrive_count=512)
             vd_is_ready = T.alloc_barrier(arrive_count=128)
             vd_is_free = T.alloc_barrier(arrive_count=512)
             h_is_ready = T.alloc_barrier(arrive_count=512)
@@ -208,20 +208,6 @@ def tilelang_fused_chunk_gdn_prefill(
             b_robust_desc = T.make_robust_desc(
                 T.address_of(b[batch_idx, seq_start_idx, 0]),
                 cosize((seq_end_idx - seq_start_idx, H)) * b_bytes,
-            )
-            g_bytes = 4 if g_dtype in (torch.float32, "float32") else 2
-            g_robust_desc = T.make_robust_desc(
-                T.address_of(g[batch_idx, seq_start_idx, 0]),
-                cosize((seq_end_idx - seq_start_idx, H)) * g_bytes,
-            )
-            qkva_bytes = (
-                2
-                if qkva_dtype in (torch.float16, torch.bfloat16, "float16", "bfloat16")
-                else 4
-            )
-            k_robust_desc = T.make_robust_desc(
-                T.address_of(k[batch_idx, seq_start_idx, 0, 0]),
-                cosize((seq_end_idx - seq_start_idx, Hg, DK)) * qkva_bytes,
             )
 
             tx = T.get_thread_binding()
@@ -295,8 +281,10 @@ def tilelang_fused_chunk_gdn_prefill(
                     T.barrier_arrive(vd_is_ready)
 
             with T.ws(1):
-                o_store_local = T.alloc_local([4], accum_dtype)
                 for i_s in T.serial(num_iters):
+                    store_left = seq_start_idx + i_s * block_S
+                    valid_seqs = T.min(seq_end_idx - store_left, block_S)
+
                     T.barrier_wait(q_is_ready[i_s % 2], consumer_phase(i_s))
                     T.barrier_wait(h_is_ready, i_s % 2)
                     T.gemm(
@@ -313,7 +301,6 @@ def tilelang_fused_chunk_gdn_prefill(
                     T.barrier_arrive(h_is_free)
 
                     T.barrier_wait(gb_is_ready[i_s % 2], consumer_phase(i_s))
-                    T.barrier_wait(o_is_free, T.bitwise_xor(i_s % 2, 1))
                     for j_s, j_v in T.Parallel(block_S, DV):
                         o_fragment[j_s, j_v] *= g_exp_shared[i_s % 2, j_s] * scale
                     T.barrier_arrive(gb_is_free[i_s % 2])
@@ -332,24 +319,13 @@ def tilelang_fused_chunk_gdn_prefill(
                     T.warpgroup_wait(0)
                     T.barrier_arrive(a_is_free[i_s % 2])
                     T.barrier_arrive(v_is_free)
-                    # S2[S] O
-                    # o_fragment's DV register order is not natural.  Reorder
-                    # while storing so linear o_shared still gets packed x4.
-                    stg_tx = tx % 8
-                    stg_ty = (tx - 128) // 8
-                    for j_r in T.unroll(block_S // 16):
-                        for j_p in T.unroll(2):
-                            for j_q in T.unroll(2):
-                                for j_u in T.unroll(4):
-                                    j_s = j_r * 16 + stg_ty
-                                    j_v = ((j_q * 4 + j_u) * 2 + j_p) * 8 + stg_tx
-                                    o_store_local[j_u] = o_fragment[j_s, j_v]
-                                for j_u in T.vectorized(4):
-                                    j_s = j_r * 16 + stg_ty
-                                    o_shared[
-                                        j_s, stg_tx * 8 + j_p * 64 + j_q * 4 + j_u
-                                    ] = o_store_local[j_u]
-                    T.barrier_arrive(o_is_ready)
+                    # S2[S] O.  o_fragment's DV register order is not natural;
+                    # remap it while storing directly to the global output.
+                    for j_s, j_v in T.Parallel(block_S, DV):
+                        if j_s < valid_seqs:
+                            o[batch_idx, store_left + j_s, bh, inv_perm_dv(j_v)] = (
+                                o_fragment[j_s, j_v]
+                            )
 
             with T.ws(2, 3, 4, 5):
                 # Initialize S
@@ -383,26 +359,17 @@ def tilelang_fused_chunk_gdn_prefill(
                     T.warpgroup_commit_batch()
 
                     load_left = seq_start_idx + i_s * block_S
-                    k_ldg_tx = (tx - 256) % 16
-                    k_ldg_ty = (tx - 256) // 16
-                    for j_r in T.unroll(block_S // 32):
-                        for j_u in T.vectorized(8):
-                            T.copy(
-                                k[
-                                    batch_idx,
-                                    load_left + j_r * 32 + k_ldg_ty,
-                                    bhg,
-                                    k_ldg_tx * 8 + j_u,
-                                ],
-                                scaled_k_shared[
-                                    j_r * 32 + k_ldg_ty,
-                                    k_ldg_tx * 8 + j_u,
-                                ],
-                                disable_tma=True,
-                                force_async_copy=True,
-                                src_robust_desc=k_robust_desc,
-                            )
-                    T.ptx_commit_group()
+                    load_right = load_left + block_S
+                    # Load the K tile used for the state update through TMA.
+                    # K can be a split-QKV strided view; TileLang emits a TMA
+                    # descriptor with the tensor strides, and TMA pads tail OOB.
+                    if tx == 256:
+                        T.copy(
+                            k[batch_idx, load_left:load_right, bhg, 0:DK],
+                            scaled_k_shared,
+                            barrier=scaled_k_is_ready,
+                        )
+                    T.barrier_arrive(scaled_k_is_ready)
 
                     T.barrier_wait(gb_is_ready[i_s % 2], consumer_phase(i_s))
                     # G = Lower(diag(g) @ I @ diag(1/g))
@@ -411,13 +378,16 @@ def tilelang_fused_chunk_gdn_prefill(
                             g_shared[i_s % 2, j_s] - g_shared[i_s % 2, j_t]
                         )
                     for j_s, j_t in T.Parallel(block_S, block_S):
-                        g_fragment[j_s, j_t] = T.exp2(g_fragment[j_s, j_t] * 1.442695)
-                    for j_s, j_t in T.Parallel(block_S, block_S):
                         g_fragment[j_s, j_t] = T.if_then_else(
-                            j_s >= j_t and j_s < valid_seqs,
+                            g_fragment[j_s, j_t] <= 0.0,
                             g_fragment[j_s, j_t],
-                            0.0,
+                            -float("inf"),
                         )
+                    for j_s, j_t in T.Parallel(block_S, block_S):
+                        g_fragment[j_s, j_t] = T.exp2(
+                            g_fragment[j_s, j_t] * 1.4426950408889634
+                        )
+
                     # Ag = G * Ar * b
                     T.barrier_wait(a_is_ready[i_s % 2], consumer_phase(i_s))
                     for j_s, j_t in T.Parallel(block_S, block_S):
@@ -426,21 +396,11 @@ def tilelang_fused_chunk_gdn_prefill(
                             * pa_shared[i_s % 2, j_s, j_t]
                             * b_shared[i_s % 2, j_t]
                         )
-
-                    T.ptx_wait_group(0)
-                    for j_r in T.unroll(block_S // 32):
-                        for j_u in T.vectorized(8):
-                            scaled_k_shared[
-                                j_r * 32 + k_ldg_ty,
-                                k_ldg_tx * 8 + j_u,
-                            ] = (
-                                scaled_k_shared[
-                                    j_r * 32 + k_ldg_ty,
-                                    k_ldg_tx * 8 + j_u,
-                                ]
-                                * g_exp_rev_shared[i_s % 2, j_r * 32 + k_ldg_ty]
-                            )
+                    T.lma_wait()
                     T.barrier_arrive(inv_is_ready[i_s % 2])
+                    T.barrier_wait(scaled_k_is_ready, i_s % 2)
+                    for j_s, j_k in T.Parallel(block_S, DK):
+                        scaled_k_shared[j_s, j_k] *= g_exp_rev_shared[i_s % 2, j_s]
 
                     T.warpgroup_wait(0)
                     T.barrier_arrive(q_is_free[i_s % 2])
@@ -490,6 +450,7 @@ def tilelang_fused_chunk_gdn_prefill(
                             T.copy(
                                 q[batch_idx, load_left:load_right, bhg, 0:DK],
                                 q_shared[i_s % 2, :, :],
+                                barrier=q_is_ready[i_s % 2],
                             )
                         T.barrier_arrive(q_is_ready[i_s % 2])
                 elif tx < 832:
@@ -501,6 +462,7 @@ def tilelang_fused_chunk_gdn_prefill(
                             T.copy(
                                 k[batch_idx, load_left:load_right, bhg, 0:DK],
                                 k_shared[i_s % 2, :, :],
+                                barrier=k_is_ready[i_s % 2],
                             )
                         T.barrier_arrive(k_is_ready[i_s % 2])
                 elif tx < 864:
@@ -512,6 +474,7 @@ def tilelang_fused_chunk_gdn_prefill(
                             T.copy(
                                 a[batch_idx, load_left:load_right, bh, 0:block_S],
                                 pa_shared[i_s % 2, :, :],
+                                barrier=a_is_ready[i_s % 2],
                             )
                         T.barrier_arrive(a_is_ready[i_s % 2])
                 elif tx < 896:
@@ -528,6 +491,7 @@ def tilelang_fused_chunk_gdn_prefill(
                                     :,
                                 ],
                                 v_shared,
+                                barrier=v_is_ready,
                             )
                         T.barrier_arrive(v_is_ready)
             with T.ws(7):
@@ -540,12 +504,6 @@ def tilelang_fused_chunk_gdn_prefill(
                             seq_end_idx - seq_start_idx - i_s * block_S, block_S
                         )
                         T.copy(
-                            g[batch_idx, load_left:load_right, bh],
-                            g_shared[i_s % 2, :],
-                            force_async_copy=True,
-                            src_robust_desc=g_robust_desc,
-                        )
-                        T.copy(
                             b[batch_idx, load_left:load_right, bh],
                             b_shared[i_s % 2, :],
                             force_async_copy=True,
@@ -554,47 +512,58 @@ def tilelang_fused_chunk_gdn_prefill(
                         T.ptx_commit_group()
                         T.ptx_wait_group(0)
                         T.sync_threads(1, 64)
+                        gb_lane = tx - 896
+                        gb_lane_in_warp = gb_lane % 32
+                        g_prefix = T.alloc_var(accum_dtype)
+                        g_peer = T.alloc_var(accum_dtype)
+                        if is_log_space:
+                            g_prefix = T.if_then_else(
+                                gb_lane < valid_seqs,
+                                g[batch_idx, load_left + gb_lane, bh],
+                                -float("inf"),
+                            )
+                        else:
+                            g_prefix = T.log(
+                                T.if_then_else(
+                                    gb_lane < valid_seqs,
+                                    g[batch_idx, load_left + gb_lane, bh],
+                                    1e-43,
+                                )
+                            )
+                        for j_shift in T.unroll(5):
+                            j_offset = 1 << j_shift
+                            g_peer = T.shfl_up(g_prefix, j_offset)
+                            if gb_lane_in_warp >= j_offset:
+                                g_prefix += g_peer
+                        g_shared[i_s % 2, gb_lane] = g_prefix
+                        T.lma_wait()
+                        T.sync_threads(1, 64)
+                        if gb_lane >= 32:
+                            g_prefix += g_shared[i_s % 2, 31]
+                            g_shared[i_s % 2, gb_lane] = g_prefix
+                        T.lma_wait()
+                        T.sync_threads(1, 64)
+                        for j_s in T.Parallel(block_S):
+                            g_exp_rev_shared[i_s % 2, j_s] = (
+                                g_shared[i_s % 2, valid_seqs - 1]
+                                - g_shared[i_s % 2, j_s]
+                            )
                         for j_s in T.Parallel(block_S):
                             g_exp_rev_shared[i_s % 2, j_s] = T.if_then_else(
-                                j_s < valid_seqs,
-                                T.exp2(
-                                    (
-                                        g_shared[i_s % 2, valid_seqs - 1]
-                                        - g_shared[i_s % 2, j_s]
-                                    )
-                                    * 1.442695
-                                ),
-                                0.0,
+                                g_exp_rev_shared[i_s % 2, j_s] <= 0,
+                                g_exp_rev_shared[i_s % 2, j_s],
+                                float("-inf"),
                             )
-                            g_exp_shared[i_s % 2, j_s] = T.if_then_else(
-                                j_s < valid_seqs,
-                                T.exp2(g_shared[i_s % 2, j_s] * 1.442695),
-                                0.0,
+
+                        for j_s in T.Parallel(block_S):
+                            g_exp_rev_shared[i_s % 2, j_s] = T.exp2(
+                                g_exp_rev_shared[i_s % 2, j_s] * 1.4426950408889634
                             )
+                            g_exp_shared[i_s % 2, j_s] = T.exp2(
+                                g_shared[i_s % 2, j_s] * 1.4426950408889634
+                            )
+                        T.lma_wait()
                         T.barrier_arrive(gb_is_ready[i_s % 2])
-                elif tx < 1024:
-                    for i_s in T.serial(full_num_iters):
-                        T.barrier_wait(o_is_ready, i_s % 2)
-                        load_left = seq_start_idx + i_s * block_S
-                        load_right = load_left + block_S
-                        if tx == 960:
-                            T.copy(o_shared, o[batch_idx, load_left:load_right, bh, :])
-                        T.tma_store_wait()
-                        T.barrier_arrive(o_is_free)
-                    if tail_num_iters > 0:
-                        i_s = full_num_iters
-                        store_left = seq_start_idx + i_s * block_S
-                        valid_seqs = seq_end_idx - store_left
-                        T.barrier_wait(o_is_ready, i_s % 2)
-                        for j_s, j_v in T.Parallel(block_S, DV):
-                            if j_s < valid_seqs:
-                                o[
-                                    batch_idx,
-                                    store_left + j_s,
-                                    bh,
-                                    j_v,
-                                ] = o_shared[j_s, j_v]
-                        T.barrier_arrive(o_is_free)
 
     def _symbol_part(value):
         return (
@@ -617,6 +586,7 @@ def tilelang_fused_chunk_gdn_prefill(
         f"_o{_symbol_part(o_dtype)}"
         f"_seq{_symbol_part(seqlen_dtype)}"
         f"_init{int(use_initial_state)}_final{int(store_final_state)}_var{int(is_varlen)}"
+        f"_log{int(is_log_space)}"
     )
     return tilelang_fused_chunk_gdn_prefill_kernel.with_attr("global_symbol", symbol)
 
@@ -637,28 +607,22 @@ def fused_chunk_gdn_prefill(
     output_o: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    is_log_space: bool = True,
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = v.shape
     scale = scale or K ** (-0.5)
     assert K == V == 128
     assert chunk_size == 64
+    assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
 
     if cu_seqlens is None:
         real_batch_size = batch_size
-        num_chunks = tilelang.cdiv(num_tokens, chunk_size) if output_h else 0
         cu_seqlens = torch.empty((batch_size + 1), dtype=torch.int32, device=k.device)
-        chunk_offsets = torch.empty(
-            (batch_size + 1), dtype=torch.int32, device=k.device
-        )
         seqlen_dtype = torch.int32
         is_varlen = False
     else:
         real_batch_size = len(cu_seqlens) - 1
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size).to(
-            cu_seqlens.dtype
-        )
-        num_chunks = chunk_offsets[-1].item() if output_h else 0
         seqlen_dtype = cu_seqlens.dtype
         is_varlen = True
 
@@ -667,7 +631,7 @@ def fused_chunk_gdn_prefill(
         initial_state = torch.empty(
             (real_batch_size, H, K, V), dtype=torch.float32, device=k.device
         )
-    h = torch.empty((batch_size, num_chunks, H, K, V), dtype=k.dtype, device=k.device)
+    h = None
 
     if output is None:
         o = torch.empty_like(v)
@@ -712,13 +676,13 @@ def fused_chunk_gdn_prefill(
         b_dtype=b.dtype,
         h0_dtype=initial_state.dtype,
         ht_dtype=final_state.dtype,
-        h_dtype=h.dtype,
         o_dtype=o.dtype,
         seqlen_dtype=seqlen_dtype,
         accum_dtype="float32",
         use_initial_state=use_initial_state,
         store_final_state=output_final_state,
         is_varlen=is_varlen,
+        is_log_space=is_log_space,
     )
     tilelang_fused_chunk_gdn_prefill_kernel(
         q,
@@ -729,9 +693,7 @@ def fused_chunk_gdn_prefill(
         b,
         initial_state,
         cu_seqlens,
-        chunk_offsets,
         o,
-        h,
         final_state,
     )
 
@@ -758,11 +720,11 @@ if __name__ == "__main__":
         b_dtype=torch.float32,
         h0_dtype=torch.float32,
         ht_dtype=torch.float32,
-        h_dtype=torch.float32,
         o_dtype=torch.float16,
         seqlen_dtype=torch.int32,
         accum_dtype="float32",
         use_initial_state=True,
         store_final_state=True,
         is_varlen=True,
+        is_log_space=True,
     )

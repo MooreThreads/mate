@@ -287,6 +287,7 @@ def test_metadata(
 @pytest.mark.parametrize("num_splits", [-1, 0, 5])
 @pytest.mark.parametrize("pack_gqa", [False])
 @pytest.mark.parametrize("mask", [None])
+@pytest.mark.parametrize("attention_chunk", [0, 65])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize(
     "seq_lens",
@@ -310,6 +311,7 @@ def test_varlen_func_bshd(
     headdim: tuple[int, int],
     dtype: torch.dtype,
     mask: Union[None, str, Tuple[int, int]],
+    attention_chunk: int,
     pack_gqa: bool,
     num_splits: int,
     backend: str,
@@ -389,7 +391,7 @@ def test_varlen_func_bshd(
             max_seqlen_k_new=0,
             causal=is_causal,
             window_size=window_size,
-            attention_chunk=0,
+            attention_chunk=attention_chunk,
             has_softcap=False,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
@@ -414,7 +416,7 @@ def test_varlen_func_bshd(
         v_descale=None,
         window_size=window_size,
         learnable_sink=None,
-        attention_chunk=0,
+        attention_chunk=attention_chunk,
         softcap=0.0,
         scheduler_metadata=metadata,
         num_splits=num_splits,
@@ -441,7 +443,7 @@ def test_varlen_func_bshd(
         k_descale=None,
         v_descale=None,
         window_size=window_size,
-        attention_chunk=0,
+        attention_chunk=attention_chunk,
         sink_token_length=0,
         learnable_sink=None,
         softcap=0.0,
@@ -1760,7 +1762,7 @@ def test_combine(
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("page_size", [None, 1, 64])
 @pytest.mark.parametrize(
-    "has_leftpad", [True], ids=lambda x: "leftpad" if x else "no_leftpad"
+    "has_leftpad", [True, False], ids=lambda x: "leftpad" if x else "no_leftpad"
 )
 @pytest.mark.parametrize(
     "has_batch_idx", [True], ids=lambda x: "batch_idx" if x else "no_batch_idx"
@@ -1796,8 +1798,10 @@ def test_combine(
 )
 @pytest.mark.parametrize(
     "batch_size",
-    [1, 10, 77],
+    [1, 77],
 )
+@pytest.mark.parametrize("softcap", [0.0, 50.0])
+@pytest.mark.parametrize("attention_chunk", [0, 65])
 @torch.inference_mode()
 def test_advance_features(
     batch_size,
@@ -1819,6 +1823,8 @@ def test_advance_features(
     new_kv,
     num_splits,
     dtype,
+    attention_chunk,
+    softcap,
 ) -> None:
     # Skip
     # if page_size is not None and seqlen_k % page_size != 0:
@@ -1841,6 +1847,7 @@ def test_advance_features(
     headdim_qk, headdim_vo = headdim
 
     rotary_dim = math.floor(int(rotary_fraction * headdim_qk) / 16) * 16
+    effective_local = local or attention_chunk > 0
 
     # init_tensors()
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -1922,11 +1929,15 @@ def test_advance_features(
         )
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
-        # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
+        # q RoPE consumes S positions for causal/local/chunked attention.
         (
             (
                 seqlen_k
-                - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new)
+                - (
+                    seqlen_q
+                    if (causal or effective_local) and rotary_dim > 1
+                    else seqlen_new
+                )
                 + 1
             )
             if new_kv
@@ -1991,7 +2002,7 @@ def test_advance_features(
         cos = torch.cos(angle).to(dtype=dtype)
         sin = torch.sin(angle).to(dtype=dtype)
         if not is_fake_mode():
-            if causal or local:
+            if causal or effective_local:
                 q_ro = apply_rotary_emb(
                     q,
                     cos,
@@ -2069,8 +2080,8 @@ def test_advance_features(
                 max_seqlen_k_new=seqlen_new if new_kv else 0,
                 causal=causal,
                 window_size=window_size,
-                attention_chunk=0,
-                has_softcap=False,
+                attention_chunk=attention_chunk,
+                has_softcap=softcap != 0.0,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
                 mp_margin=0,
@@ -2099,7 +2110,8 @@ def test_advance_features(
         rotary_seqlens=rotary_seqlens,
         causal=causal,
         window_size=window_size,
-        attention_chunk=0,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
         rotary_interleaved=rotary_interleaved,
         scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
@@ -2119,8 +2131,9 @@ def test_advance_features(
         causal=causal,
         qv=None,
         window_size=window_size,
-        attention_chunk=0,
+        attention_chunk=attention_chunk,
         key_leftpad=cache_leftpad,
+        softcap=softcap,
     )
 
     # compare()

@@ -15,3 +15,4 @@ MATE(**M**\USA **A**\I **T**\ensor **E**\ngine) is a centralized library for Gen
 
    api/attention
    api/gemm
+   api/hyperconnection

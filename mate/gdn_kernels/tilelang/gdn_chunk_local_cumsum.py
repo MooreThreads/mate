@@ -1,5 +1,4 @@
 import torch
-from mate.gdn_kernels.tilelang.gdn_utils import prepare_chunk_indices
 import tilelang
 import tilelang.language as T
 
@@ -37,10 +36,24 @@ def tilelang_chunk_local_cumsum(
     data_batch_size = T.dynamic("data_batch_size")
     real_batch_size = T.dynamic("real_batch_size")
     num_tokens = T.dynamic("num_tokens")
-    num_chunks = T.dynamic("num_chunks")
     block_S = chunk_size
 
     g_shape = (data_batch_size, num_tokens, H)
+
+    @T.macro
+    def locate_sequence(token_idx, cu_seqlens):
+        lo = T.alloc_var("int32")
+        hi = T.alloc_var("int32")
+        mid = T.alloc_var("int32")
+        lo = 0
+        hi = real_batch_size
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if cu_seqlens[mid + 1] <= token_idx:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
 
     @T.macro
     def kernel_body(
@@ -106,26 +119,65 @@ def tilelang_chunk_local_cumsum(
         def tilelang_chunk_local_cumsum_kernel(
             g_raw: T.Tensor(g_shape, dtype=g_dtype),
             cu_seqlens: T.Tensor([real_batch_size + 1], dtype=seqlen_dtype),
-            chunk_indices: T.Tensor([num_chunks, 2], dtype=seqlen_dtype),
             g_cumsum: T.Tensor(g_shape, dtype=g_dtype),
         ):
-            with T.Kernel(num_chunks, threads=128) as (bc,):
+            launch_num_chunks = T.ceildiv(num_tokens, block_S)
+            with T.Kernel(launch_num_chunks, threads=128) as (bc,):
                 bb = 0
-                batch_idx = chunk_indices[bc, 0]
-                chunk_idx = chunk_indices[bc, 1]
+                global_left = T.alloc_var("int32")
+                global_right = T.alloc_var("int32")
+                query_idx = T.alloc_var("int32")
+                batch_idx = T.alloc_var("int32")
+                chunk_idx = T.alloc_var("int32")
+                seq_start_idx = T.alloc_var("int32")
+                seq_end_idx = T.alloc_var("int32")
+                rel_idx = T.alloc_var("int32")
+                chunk_left = T.alloc_var("int32")
+
+                global_left = bc * block_S
+                global_right = T.min(global_left + block_S, num_tokens)
+
+                query_idx = global_left
+                batch_idx = locate_sequence(query_idx, cu_seqlens)
                 seq_start_idx = cu_seqlens[batch_idx]
                 seq_end_idx = cu_seqlens[batch_idx + 1]
+                rel_idx = query_idx - seq_start_idx
+                chunk_idx = T.ceildiv(rel_idx, block_S)
+                chunk_left = seq_start_idx + chunk_idx * block_S
+                while chunk_left >= seq_end_idx and seq_end_idx < num_tokens:
+                    batch_idx += 1
+                    seq_start_idx = seq_end_idx
+                    seq_end_idx = cu_seqlens[batch_idx + 1]
+                    chunk_idx = 0
+                    chunk_left = seq_start_idx
 
-                kernel_body(
-                    bb,
-                    bc,
-                    batch_idx,
-                    chunk_idx,
-                    seq_start_idx,
-                    seq_end_idx,
-                    g_raw,
-                    g_cumsum,
-                )
+                while chunk_left < global_right:
+                    kernel_body(
+                        bb,
+                        bc,
+                        batch_idx,
+                        chunk_idx,
+                        seq_start_idx,
+                        seq_end_idx,
+                        g_raw,
+                        g_cumsum,
+                    )
+
+                    query_idx = chunk_left + block_S
+                    if query_idx >= seq_end_idx:
+                        query_idx = seq_end_idx
+                        while seq_end_idx <= query_idx and seq_end_idx < num_tokens:
+                            batch_idx += 1
+                            seq_start_idx = seq_end_idx
+                            seq_end_idx = cu_seqlens[batch_idx + 1]
+                        if query_idx < seq_end_idx:
+                            chunk_idx = 0
+                            chunk_left = seq_start_idx
+                        else:
+                            chunk_left = global_right
+                    else:
+                        chunk_idx += 1
+                        chunk_left += block_S
 
     else:
 
@@ -170,7 +222,6 @@ def chunk_local_cumsum(
         seqlen_dtype = "int32"
         is_varlen = False
     else:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
         seqlen_dtype = cu_seqlens.dtype
         is_varlen = True
 
@@ -186,7 +237,7 @@ def chunk_local_cumsum(
         reverse=reverse,
     )
     if is_varlen:
-        tilelang_chunk_local_cumsum_kernel(g, cu_seqlens, chunk_indices, g_cumsum)
+        tilelang_chunk_local_cumsum_kernel(g, cu_seqlens, g_cumsum)
     else:
         tilelang_chunk_local_cumsum_kernel(g, g_cumsum, num_chunks)
 

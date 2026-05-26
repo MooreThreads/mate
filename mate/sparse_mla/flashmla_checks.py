@@ -44,7 +44,6 @@ def require_batch_topk_length(
 
 def check_model1_k_cache(k_cache: torch.Tensor, name: str = "k_cache") -> None:
     assert k_cache.dim() == 4, f"{name} must have shape [blocks, block, H_k, 584]"
-    assert k_cache.dtype == torch.uint8, f"{name} must be uint8"
     assert k_cache.shape[-1] == MODEL1_KV_BYTES_PER_TOKEN, (
         f"{name} last dimension must be {MODEL1_KV_BYTES_PER_TOKEN}"
     )

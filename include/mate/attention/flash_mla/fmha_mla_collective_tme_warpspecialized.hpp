@@ -251,6 +251,8 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
 
     typename Fusion::Params fusion;
     int64_t const*          ptr_cu_seqlens_q;
+
+    RobustDescriptor desc_pt;
   };
 
   template <class ProblemSize>
@@ -309,6 +311,8 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
                                                  },
                                                  nullptr);
 
+    RobustDescriptor desc_pt = make_robust_desc(args.ptr_page_table, B * get<0>(args.stride_page_table));
+
     return {tme_q_latent,
             tme_q_rope,
             tme_c_latent_paged,
@@ -320,7 +324,8 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
             args.sm_scale,
             args.sm_scale * log2e,
             args.fusion,
-            args.ptr_cu_seqlens_q};
+            args.ptr_cu_seqlens_q,
+            desc_pt};
   }
 
   template <class BlkCoord, class ProblemSize, class Workload>
@@ -463,8 +468,10 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
       int start_block_idx = workload.start_block_idx;
       int end_block_idx   = workload.end_block_idx;
 
-      int cur_page  = gPT(page_index);
-      int next_page = gPT(page_index + 1);
+      int cur_page, next_page;
+
+      MP31_ROBUST_LOAD<int>::copy(gPT(page_index), cur_page, true, params.desc_pt);
+      MP31_ROBUST_LOAD<int>::copy(gPT(page_index + 1), next_page, true, params.desc_pt);
       {
         MUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < IterationsQKLatent; ++i) {
@@ -513,8 +520,8 @@ struct FmhaMlaMainloopTmeWarpSpecialized {
       }
 
       while (start_block_idx < end_block_idx) {
-        cur_page  = next_page;
-        next_page = gPT(page_index + 1);
+        cur_page = next_page;
+        MP31_ROBUST_LOAD<int>::copy(gPT(page_index + 1), next_page, true, params.desc_pt);
 
         MUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < IterationsQKLatent; ++i) {

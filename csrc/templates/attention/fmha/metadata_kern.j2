@@ -77,12 +77,13 @@ void {{ func_name }} (
 
     // Shape params
     .b = batch_size,
-    .b_k = batch_size,
     .seqlen_q = seqlen_q,
     .seqlen_k = seqlen_k,
     .seqlen_knew = seqlen_k_new,
     .d = headdim,
     .dv = headdim_v,
+
+    .b_k = batch_size,
 
     // Ragged params
     .cu_seqlens_q = HasCuseqlensQ ? static_cast<uint32_t*>(cu_seqlens_q.value().data_ptr()) : nullptr,
@@ -116,7 +117,7 @@ void {{ func_name }} (
   // Schedule Kernel
   mate::attention::fmha::get_metadata_kernel<
     NumWarps, Sort,
-    IsPackGQA, IsCausal, L2Swizzle,
+    IsPackGQA, IsCausal, IsLocal, L2Swizzle,
     HasCuseqlensQ, HasSequsedQ,
     HasCuseqlensK, HasSequsedK,
     HasCuseqlensKNew, HasLeftpadK
@@ -127,6 +128,7 @@ void {{ func_name }} (
     params.b, !IsPackGQA ? params.h : params.h_k, HeadRatio,
     mp_count, params.num_splits,
     mutlass::FastDivmod(TileM), mutlass::FastDivmod(TileN),
+    params.window_size_left, params.window_size_right,
     static_cast<int32_t*>(num_m_blocks.data_ptr()),
     static_cast<int32_t*>(num_splits_dynamic.data_ptr()),
     static_cast<int32_t*>(batch_table.data_ptr()),

@@ -49,21 +49,25 @@ def _gdn_mtp_bytes(
     head_size: int,
     input_dtype: torch.dtype,
     output_dtype: torch.dtype,
+    state_dtype: torch.dtype,
     *,
     disable_state_update: bool,
     cache_intermediate_states: bool,
 ) -> int:
     num_o_heads = max(num_q_heads, num_v_heads)
     elem_size = _dtype_size(input_dtype)
+    state_elem_size = _dtype_size(state_dtype)
 
     q_bytes = batch_size * seq_len * num_q_heads * head_size * elem_size
     k_bytes = batch_size * seq_len * num_q_heads * head_size * elem_size
     v_bytes = batch_size * seq_len * num_v_heads * head_size * elem_size
     o_bytes = batch_size * seq_len * num_o_heads * head_size * _dtype_size(output_dtype)
-    state_read_bytes = batch_size * num_v_heads * head_size * head_size * 4
+    state_read_bytes = (
+        batch_size * num_v_heads * head_size * head_size * state_elem_size
+    )
     state_write_bytes = 0 if disable_state_update else state_read_bytes
     intermediate_bytes = (
-        batch_size * seq_len * num_v_heads * head_size * head_size * 4
+        batch_size * seq_len * num_v_heads * head_size * head_size * state_elem_size
         if cache_intermediate_states
         else 0
     )
@@ -94,6 +98,7 @@ def _make_inputs(
     num_v_heads: int,
     head_size: int,
     dtype: torch.dtype,
+    state_dtype: torch.dtype,
     *,
     cache_intermediate_states: bool,
 ) -> tuple[torch.Tensor, ...]:
@@ -109,7 +114,7 @@ def _make_inputs(
     )
     state = torch.randn(
         (batch_size, num_v_heads, head_size, head_size),
-        dtype=torch.float32,
+        dtype=state_dtype,
         device=device,
     )
     state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
@@ -129,7 +134,7 @@ def _make_inputs(
     intermediate = (
         torch.empty(
             (batch_size, seq_len, num_v_heads, head_size, head_size),
-            dtype=torch.float32,
+            dtype=state_dtype,
             device=device,
         )
         if cache_intermediate_states
@@ -145,6 +150,7 @@ def _make_runner(
     num_v_heads: int,
     head_size: int,
     dtype: torch.dtype,
+    state_dtype: torch.dtype,
     *,
     cache_intermediate_states: bool,
     disable_state_update: bool,
@@ -159,6 +165,7 @@ def _make_runner(
             num_v_heads=num_v_heads,
             head_size=head_size,
             dtype=dtype,
+            state_dtype=state_dtype,
             cache_intermediate_states=cache_intermediate_states,
         )
     )
@@ -175,7 +182,7 @@ def _make_runner(
     intermediate_arg = (
         intermediate
         if intermediate is not None
-        else torch.empty((1, 1, 1, 1, 1), dtype=torch.float32, device=q.device)
+        else torch.empty((1, 1, 1, 1, 1), dtype=state_dtype, device=q.device)
     )
     common_kwargs = dict(
         seq_len=seq_len,
@@ -186,6 +193,7 @@ def _make_runner(
         input_dtype=str(dtype).split(".")[-1],
         output_dtype=str(dtype).split(".")[-1],
         dt_bias_dtype=str(dt_bias.dtype).split(".")[-1],
+        state_dtype=str(state_dtype).split(".")[-1],
         use_qk_l2norm=True,
         disable_state_update=disable_state_update,
         use_identity_state_indices=False,
@@ -224,6 +232,7 @@ def _bench_one_shape(
     num_v_heads: int,
     head_size: int,
     dtype: torch.dtype,
+    state_dtype: torch.dtype,
     num_tests: int,
     *,
     cache_intermediate_states: bool,
@@ -238,6 +247,7 @@ def _bench_one_shape(
         num_v_heads=num_v_heads,
         head_size=head_size,
         dtype=dtype,
+        state_dtype=state_dtype,
         cache_intermediate_states=cache_intermediate_states,
         disable_state_update=disable_state_update,
         tile_v_override=tile_v_override,
@@ -258,6 +268,12 @@ def _bench_one_shape(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark MATE GDN MTP kernels.")
     parser.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
+    parser.add_argument(
+        "--state-dtype",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="State and intermediate-state buffer dtype.",
+    )
     parser.add_argument("--num-tests", type=int, default=10)
     parser.add_argument("--head-size", type=int, default=128)
     parser.add_argument(
@@ -311,6 +327,7 @@ def main():
         parser.error("--tile-v must be a positive integer.")
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    state_dtype = torch.float32 if args.state_dtype == "fp32" else torch.bfloat16
     head_configs = [_parse_head_config(spec) for spec in args.head_configs]
     cache_intermediate_states = args.cache_intermediate_states
     disable_state_update = not args.update_state
@@ -319,6 +336,7 @@ def main():
     print(f"Kernel: {KERNEL_NAME}")
     print(
         f"Config: D={args.head_size}, dtype={args.dtype}, "
+        f"state_dtype={args.state_dtype}, "
         f"head_configs={head_configs}, batches={tuple(args.batch_sizes)}, "
         f"seq_lens={tuple(args.seq_lens)}, cache_intermediate={cache_intermediate_states}, "
         f"update_state={not disable_state_update}, tile_v_override={args.tile_v}, "
@@ -343,6 +361,7 @@ def main():
                     num_v_heads=num_v_heads,
                     head_size=args.head_size,
                     dtype=dtype,
+                    state_dtype=state_dtype,
                     num_tests=args.num_tests,
                     cache_intermediate_states=cache_intermediate_states,
                     disable_state_update=disable_state_update,
@@ -364,6 +383,7 @@ def main():
                     head_size=args.head_size,
                     input_dtype=dtype,
                     output_dtype=dtype,
+                    state_dtype=state_dtype,
                     disable_state_update=disable_state_update,
                     cache_intermediate_states=cache_intermediate_states,
                 )

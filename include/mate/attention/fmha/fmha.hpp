@@ -143,6 +143,7 @@ struct FmhaFwdParams {
   bool is_rotary_interleaved;
 
   int window_size_left, window_size_right;
+  int attention_chunk;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const FmhaFwdParams& p) {

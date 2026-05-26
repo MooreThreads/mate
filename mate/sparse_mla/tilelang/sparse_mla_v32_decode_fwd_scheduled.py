@@ -228,20 +228,17 @@ def sparse_attention_fwd_kernel(
                     T.copy(
                         q[b_i, s_i, h0:h1, 0 : dim_qk // 2],
                         q_shared_l,
-                        force_async_copy=True,
-                        src_robust_desc=q_robust_desc,
+                        barrier=bar_q,
                     )
                     T.copy(
                         q[b_i, s_i, h0:h1, dim_qk // 2 : dim_qk],
                         q_shared_r,
-                        force_async_copy=True,
-                        src_robust_desc=q_robust_desc,
+                        barrier=bar_q,
                     )
                     T.copy(
                         q[b_i, s_i, h0:h1, dim_qk:],
                         q_tail_shared,
-                        force_async_copy=True,
-                        src_robust_desc=q_robust_desc,
+                        barrier=bar_q,
                     )
 
                     T.ptx_commit_group()
@@ -450,6 +447,7 @@ def sparse_attention_fwd_kernel(
                             v_shared_0,
                             acc_o_l_0,
                             policy=T.GemmWarpPolicy.FullRow,
+                            wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
                         stage_value_shared(v_shared_1, kv_reg_l, ldg_ty, ldg_tx, 2)
@@ -615,6 +613,7 @@ def sparse_attention_fwd_kernel(
                             v_shared_0,
                             acc_o_r_0,
                             policy=T.GemmWarpPolicy.FullRow,
+                            wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
 
@@ -633,6 +632,7 @@ def sparse_attention_fwd_kernel(
                             v_shared_1,
                             acc_o_r_1,
                             policy=T.GemmWarpPolicy.FullRow,
+                            wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
                         T.warpgroup_wait(0)

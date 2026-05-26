@@ -179,7 +179,7 @@ def run_bench(
             cu_seqlens_k=cfg.cu_seqlens_kv,
             cu_seqlens_k_new=None,
             cache_leftpad=None,
-            max_seqlen_k_new=None,
+            max_seqlen_k_new=0,
             causal=cfg.is_causal,
             window_size=cfg.window_size,
             page_size=cfg.page_size,

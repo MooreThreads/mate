@@ -92,6 +92,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
   constexpr bool IsEvenHeadDim = {{ 'true' if is_even_headdim else 'false' }};
   constexpr bool HasMetadata = {{ 'true' if has_metadata else 'false' }};
   constexpr bool EnableCP = {{ 'true' if enable_cp else 'false' }};
+  constexpr bool HasAttentionChunk = {{ 'true' if has_attention_chunk else 'false' }};
 
   // If no metadata, fallback to SingleTileScheduler without split.
   constexpr bool IsSplit = HasMetadata;
@@ -133,6 +134,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
                                                          IsRotaryInterleaved,
                                                          HasSeqlensRotary,
                                                          EnableCP,
+                                                         HasAttentionChunk,
                                                          NumPVConsumers>;
   using CollectiveEpilogue =
     mate::attention::fmha::CollectiveEpilogueFwd<Element,
@@ -281,6 +283,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .is_rotary_interleaved = IsRotaryInterleaved,
     .window_size_left = window_size_left,
     .window_size_right = window_size_right,
+    .attention_chunk = attention_chunk,
   };
   if (params.num_splits <= 0) {
     params.num_splits = mate::attention::fmha::get_num_splits(params, TileM, TileN);
@@ -370,6 +373,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
     // LocalMask
     .window_size_left = window_size_left,
     .window_size_right = window_size_right,
+    .attention_chunk = attention_chunk,
 
     // Sink Tensor
     .ptr_learnable_sink = static_cast<ElementSink const*>(params.learnable_sink_ptr),

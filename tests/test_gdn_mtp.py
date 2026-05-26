@@ -194,6 +194,7 @@ def _flashinfer_reference_with_state_indices(
     cache_intermediate_states: bool,
     disable_state_update: bool,
     use_qk_l2norm: bool,
+    state_dtype: torch.dtype = torch.float32,
     intermediate_pool_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, T_len, _, K = q.shape
@@ -202,13 +203,13 @@ def _flashinfer_reference_with_state_indices(
     device = q.device
 
     output = torch.zeros(B, T_len, HV, V, dtype=torch.float32, device=device)
-    final_pool_kv = state_vk.transpose(-2, -1).clone().contiguous().float()
+    final_pool_kv = state_vk.transpose(-2, -1).clone().contiguous().to(state_dtype)
     intermediate_size = (
         pool_size if intermediate_pool_size is None else intermediate_pool_size
     )
     intermediate_kv = (
         torch.zeros(
-            intermediate_size, T_len, HV, K, V, dtype=torch.float32, device=device
+            intermediate_size, T_len, HV, K, V, dtype=state_dtype, device=device
         )
         if cache_intermediate_states
         else None
@@ -233,7 +234,7 @@ def _flashinfer_reference_with_state_indices(
             softplus_threshold=20.0,
             use_l2_norm=use_qk_l2norm,
             cache_intermediate_states=cache_intermediate_states,
-            state_dtype=torch.float32,
+            state_dtype=state_dtype,
         )
         output[batch_idx].copy_(ref_out[0])
         if not disable_state_update:
@@ -286,11 +287,26 @@ def _tolerances(dtype: str) -> tuple[float, float, float, float]:
     return 1e-3, 1e-3, 1e-3, 1e-3
 
 
+def _state_tolerances(dtype: str, state_dtype: torch.dtype) -> tuple[float, float]:
+    _, _, atol_s, rtol_s = _tolerances(dtype)
+    if state_dtype == torch.bfloat16:
+        return 2e-2, 1e-2
+    return atol_s, rtol_s
+
+
+def _output_tolerances(dtype: str, state_dtype: torch.dtype) -> tuple[float, float]:
+    atol_o, rtol_o, _, _ = _tolerances(dtype)
+    if state_dtype == torch.bfloat16:
+        return 1e-2, 1e-2
+    return atol_o, rtol_o
+
+
 def _prepare_initial_state(
     *,
     pool_size: int,
     num_v_heads: int,
     head_size: int,
+    state_dtype: torch.dtype,
     device: torch.device,
     use_noncontiguous_state: bool,
 ) -> torch.Tensor:
@@ -300,7 +316,7 @@ def _prepare_initial_state(
             num_v_heads,
             head_size,
             head_size,
-            dtype=torch.float32,
+            dtype=state_dtype,
             device=device,
         ).transpose(-2, -1)
     return torch.randn(
@@ -308,7 +324,7 @@ def _prepare_initial_state(
         num_v_heads,
         head_size,
         head_size,
-        dtype=torch.float32,
+        dtype=state_dtype,
         device=device,
     )
 
@@ -690,6 +706,7 @@ def _run_mate_extra_mtp_case(
     num_k_heads: int = 16,
     num_v_heads: int = 32,
     dtype: str = "bfloat16",
+    state_dtype: torch.dtype = torch.float32,
     dt_bias_dtype: torch.dtype = torch.float32,
     cache_intermediate_states: bool,
     disable_state_update: bool,
@@ -811,6 +828,7 @@ def _run_mate_extra_mtp_case(
         pool_size=pool_size,
         num_v_heads=num_v_heads,
         head_size=K,
+        state_dtype=state_dtype,
         device=device,
         use_noncontiguous_state=use_noncontiguous_state,
     )
@@ -843,7 +861,7 @@ def _run_mate_extra_mtp_case(
             num_v_heads,
             V,
             K,
-            dtype=torch.float32,
+            dtype=state_dtype,
             device=device,
         )
         if cache_intermediate_states
@@ -907,6 +925,7 @@ def _run_mate_extra_mtp_case(
         cache_intermediate_states=cache_intermediate_states,
         disable_state_update=disable_state_update,
         use_qk_l2norm=use_qk_l2norm,
+        state_dtype=state_dtype,
         intermediate_pool_size=(
             intermediate_states_buffer.shape[0]
             if intermediate_states_buffer is not None
@@ -914,7 +933,8 @@ def _run_mate_extra_mtp_case(
         ),
     )
 
-    atol_o, rtol_o, atol_s, rtol_s = _tolerances(dtype)
+    atol_o, rtol_o = _output_tolerances(dtype, state_dtype)
+    atol_s, rtol_s = _state_tolerances(dtype, state_dtype)
     torch.testing.assert_close(out.float(), ref_out, atol=atol_o, rtol=rtol_o)
 
     if disable_state_update:
@@ -926,7 +946,7 @@ def _run_mate_extra_mtp_case(
         )
     else:
         torch.testing.assert_close(
-            returned_state.float(), ref_state, atol=atol_s, rtol=rtol_s
+            returned_state.float(), ref_state.float(), atol=atol_s, rtol=rtol_s
         )
 
     if intermediate_states_buffer is not None:
@@ -1123,6 +1143,42 @@ MATE_EXTRA_MTP_CASES = [
             use_qk_l2norm=False,
         ),
         id="identity_hv64_bf16_dt_bias_no_qk_l2norm",
+    ),
+    pytest.param(
+        dict(
+            batch_size=2,
+            seq_len=2,
+            state_dtype=torch.bfloat16,
+            cache_intermediate_states=True,
+            disable_state_update=True,
+            use_state_indices=False,
+        ),
+        id="bf16_state_identity_cache_readonly",
+    ),
+    pytest.param(
+        dict(
+            batch_size=4,
+            seq_len=4,
+            state_dtype=torch.bfloat16,
+            cache_intermediate_states=True,
+            disable_state_update=False,
+            use_state_indices=True,
+            use_negative_state_indices=True,
+            use_preallocated_output=True,
+        ),
+        id="bf16_state_pool_negative_cache_update",
+    ),
+    pytest.param(
+        dict(
+            batch_size=2,
+            seq_len=8,
+            state_dtype=torch.bfloat16,
+            cache_intermediate_states=False,
+            disable_state_update=False,
+            use_state_indices=False,
+            use_qk_l2norm=False,
+        ),
+        id="bf16_state_t8_no_cache_update_no_qk_l2norm",
     ),
 ]
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutlass/fast_math.h>
+
 #include <mute/tensor.hpp>
 
 #include "utils.hpp"
@@ -29,6 +31,7 @@ template <class TiledMmaQK,
           bool IsPackGQA,
           bool IsCausal,
           bool IsLocal,
+          bool HasAttentionChunk,
           bool EnableCP = false>
 struct Mask {
   static_assert(!(IsCausal && IsLocal), "IsCausal and IsLocal cannot be both true");
@@ -41,11 +44,14 @@ struct Mask {
 
   using IndexTensor = decltype(detail::make_identity_tensor_acc_qk(TileMN{}, ThrMMAQK{}));
 
-  int seqlen_k_limit_base;
-  int causal_limit_base;
-  int local_limit_left_base;
-  int local_limit_right_base;
-  int sink_limit_base;
+  int                 seqlen_k_limit_base;
+  int                 seqlen_q;
+  int                 seqlen_k;
+  int                 causal_limit_base;
+  int                 local_limit_left_base;
+  int                 local_limit_right_base;
+  int                 sink_limit_base;
+  mutlass::FastDivmod attention_chunk_divmod;
 
   // CP fields, read from seqlen_info at construction time
   int thread_col_offset;
@@ -60,25 +66,29 @@ struct Mask {
   IndexTensor tScS_mn;
 
   MUTLASS_DEVICE
-  Mask(int const         mma_thread_idx_,
-       SeqlenInfo const& seqlen_info,
-       int const         window_size_left,
-       int const         window_size_right,
-       int const         sink_token_length) {
+  Mask(int const                  mma_thread_idx_,
+       SeqlenInfo const&          seqlen_info,
+       int const                  window_size_left,
+       int const                  window_size_right,
+       int const                  sink_token_length,
+       mutlass::FastDivmod const& attention_chunk_divmod_) {
     auto thr_mma_qk_ = TiledMmaQK{}.get_thread_slice(mma_thread_idx_);
 
     Tensor tScS_mn_ = detail::make_identity_tensor_acc_qk(TileMN{}, thr_mma_qk_);
 
     thread_col_offset = get<1>(tScS_mn_(_0{}, _0{}));
 
-    seqlen_k_limit_base = seqlen_info.seqlen_k - thread_col_offset;
+    seqlen_q            = seqlen_info.seqlen_q;
+    seqlen_k            = seqlen_info.seqlen_k;
+    seqlen_k_limit_base = seqlen_k - thread_col_offset;
 
-    causal_limit_base = seqlen_info.seqlen_k - seqlen_info.seqlen_q - thread_col_offset + 1;
+    causal_limit_base = seqlen_k - seqlen_q - thread_col_offset + 1;
 
     local_limit_left_base  = causal_limit_base - window_size_left - 1;
     local_limit_right_base = causal_limit_base + window_size_right;
 
-    sink_limit_base = sink_token_length;
+    sink_limit_base        = sink_token_length;
+    attention_chunk_divmod = attention_chunk_divmod_;
 
     // CP: store fields from seqlen_info for use in apply()
     cp_world_size = seqlen_info.cp_world_size;
@@ -209,6 +219,14 @@ struct Mask {
 
         if constexpr (IsSeqlenKMask) {
           local_limit_right_col = std::min(local_limit_right_col, seqlen_k_limit);
+        }
+        if constexpr (HasAttentionChunk) {
+          int const chunk                = attention_chunk_divmod.divisor;
+          int const anchor               = row_idx + seqlen_k - seqlen_q;
+          int       col_limit_left_chunk = div_floor(attention_chunk_divmod, anchor) * chunk;
+          col_limit_left_chunk -= n_blk_idx * TileN + thread_col_offset;
+          local_limit_left_col  = std::max(local_limit_left_col, col_limit_left_chunk);
+          local_limit_right_col = std::min(local_limit_right_col, col_limit_left_chunk + chunk);
         }
 
         MUTE_UNROLL

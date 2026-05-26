@@ -1,4 +1,4 @@
-"""TileLang backend for the FP32-state VK-layout GDN MTP path."""
+"""TileLang backend for the VK-layout GDN MTP path."""
 
 import functools
 
@@ -59,6 +59,7 @@ def _get_mtp_fp32_vk_smem_kernel(
     input_dtype: str,
     output_dtype: str,
     dt_bias_dtype: str,
+    state_dtype: str,
     use_qk_l2norm: bool,
     cache_intermediate_states: bool,
     disable_state_update: bool,
@@ -70,12 +71,16 @@ def _get_mtp_fp32_vk_smem_kernel(
         raise ValueError(f"dim_v={dim_v} must be divisible by tile_v={tile_v}.")
     if ilp_rows not in (1, 2, 4, 8):
         raise ValueError(f"Unsupported ilp_rows={ilp_rows}. Expected 1, 2, 4, or 8.")
+    if state_dtype not in ("float32", "bfloat16"):
+        raise ValueError(
+            f"Unsupported state_dtype={state_dtype}. Expected float32 or bfloat16."
+        )
 
     qkv_dtype = input_dtype
     gate_batch_dtype = input_dtype
     gate_vec_dtype = "float32"
     dt_bias_vec_dtype = dt_bias_dtype
-    state_dtype = "float32"
+    state_storage_dtype = state_dtype
     accum_dtype = "float32"
     index_dtype = "int32"
 
@@ -166,11 +171,13 @@ def _get_mtp_fp32_vk_smem_kernel(
             dt_bias: T.Tensor([head], dt_bias_vec_dtype),
             b: T.StridedTensor(gate_shape, b_strides, gate_batch_dtype),
             scale_value: T.float32,
-            initial_state: T.Tensor([pool_size, head, dim_v, dim_k], state_dtype),
+            initial_state: T.Tensor(
+                [pool_size, head, dim_v, dim_k], state_storage_dtype
+            ),
             state_indices: T.StridedTensor(
                 state_indices_shape, state_indices_strides, index_dtype
             ),
-            intermediate_states: T.Tensor(intermediate_shape, state_dtype),
+            intermediate_states: T.Tensor(intermediate_shape, state_storage_dtype),
             output: T.StridedTensor(output_shape, output_strides, output_dtype),
         ):
             with T.Kernel(batch * num_v_tiles, head, threads=_DEFAULT_THREADS) as (
@@ -363,7 +370,10 @@ def _get_mtp_fp32_vk_smem_kernel(
                                                 hid,
                                                 global_row,
                                                 k_start + i,
-                                            ] = h_reg[r * vec_size + i]
+                                            ] = T.cast(
+                                                h_reg[r * vec_size + i],
+                                                state_storage_dtype,
+                                            )
 
                                 for offset in T.unroll(5):
                                     mask = 16 >> offset
@@ -387,7 +397,10 @@ def _get_mtp_fp32_vk_smem_kernel(
                                             hid,
                                             global_row,
                                             k_start + i,
-                                        ] = h_reg[r * vec_size + i]
+                                        ] = T.cast(
+                                            h_reg[r * vec_size + i],
+                                            state_storage_dtype,
+                                        )
                 else:
                     for row_base in range(0, tile_v, num_warps * ilp_rows):
                         row_idx = row_base + warp * ilp_rows
@@ -423,7 +436,7 @@ def run_gated_delta_rule_mtp_vk_fp32(
     disable_state_update: bool,
     use_qk_l2norm: bool,
 ) -> None:
-    """Run the FP32-state VK-layout MTP backend.
+    """Run the VK-layout MTP backend.
 
     Inputs are expected to be validated by ``mate.gdn_decode``. Negative
     ``state_indices`` entries are padding rows: output is zeroed and state is
@@ -453,7 +466,7 @@ def run_gated_delta_rule_mtp_vk_fp32(
         intermediate_arg = intermediate_states_buffer
     else:
         intermediate_arg = torch.empty(
-            (1, 1, 1, 1, 1), dtype=torch.float32, device=q.device
+            (1, 1, 1, 1, 1), dtype=state.dtype, device=q.device
         )
 
     kernel_kwargs = dict(
@@ -465,6 +478,7 @@ def run_gated_delta_rule_mtp_vk_fp32(
         input_dtype=str(q.dtype).split(".")[-1],
         output_dtype=str(output.dtype).split(".")[-1],
         dt_bias_dtype=str(dt_bias.dtype).split(".")[-1],
+        state_dtype=str(state.dtype).split(".")[-1],
         use_qk_l2norm=bool(use_qk_l2norm),
         disable_state_update=bool(disable_state_update),
         use_identity_state_indices=use_identity_state_indices,

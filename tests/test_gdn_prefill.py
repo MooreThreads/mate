@@ -74,19 +74,45 @@ def gen_qkv(
     head_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    *,
+    normalize_k: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     total_seq_len = sum(seq_lens)
-    q = torch.empty(
+    q_dim = num_qk_heads * head_size
+    k_dim = num_qk_heads * head_size
+    v_dim = num_v_heads * head_size
+    fused_dim = q_dim + k_dim + v_dim
+
+    mixed_qkv = torch.empty(total_seq_len, fused_dim, device=device, dtype=dtype)
+    q_flat, k_flat, v_flat = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+
+    q_dense = torch.empty(
         total_seq_len, num_qk_heads, head_size, device=device, dtype=dtype
     ).uniform_(-0.25, 0.25)
-    k = torch.empty(
+    k_dense = torch.empty(
         total_seq_len, num_qk_heads, head_size, device=device, dtype=dtype
     ).uniform_(-0.25, 0.25)
-    v = torch.empty(
+    v_dense = torch.empty(
         total_seq_len, num_v_heads, head_size, device=device, dtype=dtype
     ).uniform_(-0.25, 0.25)
-    k = F.normalize(k.float(), p=2.0, dim=-1).to(dtype)
-    return q.contiguous(), k.contiguous(), v.contiguous()
+    if normalize_k:
+        k_dense = F.normalize(k_dense.float(), p=2.0, dim=-1).to(dtype)
+
+    q_flat.copy_(q_dense.reshape(total_seq_len, q_dim))
+    k_flat.copy_(k_dense.reshape(total_seq_len, k_dim))
+    v_flat.copy_(v_dense.reshape(total_seq_len, v_dim))
+
+    q = q_flat.view(total_seq_len, num_qk_heads, head_size)
+    k = k_flat.view(total_seq_len, num_qk_heads, head_size)
+    v = v_flat.view(total_seq_len, num_v_heads, head_size)
+
+    assert q.stride() == (fused_dim, head_size, 1)
+    assert k.stride() == (fused_dim, head_size, 1)
+    assert v.stride() == (fused_dim, head_size, 1)
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+    return q, k, v
 
 
 def gen_gates(
@@ -101,6 +127,14 @@ def gen_gates(
         torch.randn(total_seq_len, num_heads, device=device, dtype=torch.float32)
     )
     return g, beta
+
+
+def _to_kernel_gate_space(g: torch.Tensor, is_log_space: bool) -> torch.Tensor:
+    return torch.log(g) if is_log_space else g
+
+
+def _safe_exp(x: torch.Tensor) -> torch.Tensor:
+    return torch.exp(torch.where(x <= 0, x, torch.full_like(x, -float("inf"))))
 
 
 def _inverse_from_neg_strict_lower(p: torch.Tensor) -> torch.Tensor:
@@ -167,23 +201,24 @@ def blockwise_gdn_prefill_reference(
                 g_h = g_blk[:, v_head]
                 beta_h = beta_blk[:, v_head]
 
-                gamma = torch.tril(torch.exp(g_h[:, None] - g_h[None, :]))
+                gamma = torch.tril(_safe_exp(g_h[:, None] - g_h[None, :]))
                 gram = k_h @ k_h.transpose(0, 1)
                 transition = -gram * beta_h[:, None] * torch.tril(gamma, diagonal=-1)
                 solve = _inverse_from_neg_strict_lower(transition)
 
                 old_state = state[v_head]
-                w = v_h - torch.exp(g_h).unsqueeze(-1) * (k_h @ old_state)
+                g_exp = _safe_exp(g_h)
+                w = v_h - g_exp.unsqueeze(-1) * (k_h @ old_state)
                 new_v = (solve * beta_h[None, :]) @ w
 
-                o_inter = torch.exp(g_h).unsqueeze(-1) * (q_h @ old_state)
+                o_inter = g_exp.unsqueeze(-1) * (q_h @ old_state)
                 attn = (q_h @ k_h.transpose(0, 1)) * gamma
                 output[left:right, v_head] = scale * (o_inter + attn @ new_v)
 
                 g_last = g_h[-1]
-                new_v_scaled = torch.exp(g_last - g_h).unsqueeze(-1) * new_v
+                new_v_scaled = _safe_exp(g_last - g_h).unsqueeze(-1) * new_v
                 next_state[v_head] = (
-                    torch.exp(g_last) * old_state + k_h.transpose(0, 1) @ new_v_scaled
+                    _safe_exp(g_last) * old_state + k_h.transpose(0, 1) @ new_v_scaled
                 )
 
             state = next_state
@@ -253,6 +288,9 @@ def _test_prefill_kernel(
     use_initial_state: bool,
     varlen: bool,
     seed: int,
+    is_log_space: bool = True,
+    use_zero_alpha: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> None:
     device = _get_runtime_device()
     _manual_seed(seed, device)
@@ -267,8 +305,11 @@ def _test_prefill_kernel(
         head_size=HEAD_SIZE,
         dtype=dtype,
         device=device,
+        normalize_k=not use_qk_l2norm_in_kernel,
     )
     g, beta = gen_gates(sum(seq_lens), num_v_heads, device)
+    if use_zero_alpha:
+        g[7::17, :] = 0.0
     initial_state = 0.05 * torch.randn(
         len(seq_lens),
         num_v_heads,
@@ -285,17 +326,23 @@ def _test_prefill_kernel(
     q_in, k_in, v_in, g_in, beta_in, cu_seqlens = _to_kernel_inputs(
         q, k, v, g, beta, seq_lens, varlen=varlen, device=device
     )
+    assert q_in.stride(-1) == k_in.stride(-1) == v_in.stride(-1) == 1
+    assert not q_in.is_contiguous()
+    assert not k_in.is_contiguous()
+    assert not v_in.is_contiguous()
+    kernel_g_in = _to_kernel_gate_space(g_in, is_log_space)
     actual_o, actual_state = chunk_gated_delta_rule(
         q=q_in,
         k=k_in,
         v=v_in,
-        g=g_in,
+        g=kernel_g_in,
         beta=beta_in,
         scale=scale,
         initial_state=kernel_initial_state,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        is_log_space=is_log_space,
     )
     _synchronize(device)
 
@@ -340,6 +387,8 @@ def _test_chunked_prefill(
     seq_lens2: list[int],
     scale: float | str,
     seed: int,
+    is_log_space: bool = True,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> None:
     assert len(seq_lens1) == len(seq_lens2)
     device = _get_runtime_device()
@@ -348,8 +397,24 @@ def _test_chunked_prefill(
     dtype = getattr(torch, dtype_name)
     scale = _resolve_scale(scale, HEAD_SIZE)
 
-    q1, k1, v1 = gen_qkv(seq_lens1, num_qk_heads, num_v_heads, HEAD_SIZE, dtype, device)
-    q2, k2, v2 = gen_qkv(seq_lens2, num_qk_heads, num_v_heads, HEAD_SIZE, dtype, device)
+    q1, k1, v1 = gen_qkv(
+        seq_lens1,
+        num_qk_heads,
+        num_v_heads,
+        HEAD_SIZE,
+        dtype,
+        device,
+        normalize_k=not use_qk_l2norm_in_kernel,
+    )
+    q2, k2, v2 = gen_qkv(
+        seq_lens2,
+        num_qk_heads,
+        num_v_heads,
+        HEAD_SIZE,
+        dtype,
+        device,
+        normalize_k=not use_qk_l2norm_in_kernel,
+    )
     g1, beta1 = gen_gates(sum(seq_lens1), num_v_heads, device)
     g2, beta2 = gen_gates(sum(seq_lens2), num_v_heads, device)
 
@@ -359,30 +424,34 @@ def _test_chunked_prefill(
     q2_in, k2_in, v2_in, g2_in, beta2_in, cu_seqlens2 = _to_kernel_inputs(
         q2, k2, v2, g2, beta2, seq_lens2, varlen=True, device=device
     )
+    kernel_g1_in = _to_kernel_gate_space(g1_in, is_log_space)
+    kernel_g2_in = _to_kernel_gate_space(g2_in, is_log_space)
 
     actual_o1, state1 = chunk_gated_delta_rule(
         q=q1_in,
         k=k1_in,
         v=v1_in,
-        g=g1_in,
+        g=kernel_g1_in,
         beta=beta1_in,
         scale=scale,
         initial_state=None,
         output_final_state=True,
         cu_seqlens=cu_seqlens1,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        is_log_space=is_log_space,
     )
     actual_o2, state2 = chunk_gated_delta_rule(
         q=q2_in,
         k=k2_in,
         v=v2_in,
-        g=g2_in,
+        g=kernel_g2_in,
         beta=beta2_in,
         scale=scale,
         initial_state=state1,
         output_final_state=True,
         cu_seqlens=cu_seqlens2,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        is_log_space=is_log_space,
     )
     _synchronize(device)
 
@@ -469,6 +538,37 @@ def test_gdn_prefill_matches_reference(
         use_initial_state=use_initial_state,
         varlen=varlen,
         seed=seed,
+    )
+
+
+def test_gdn_prefill_alpha_space_matches_reference() -> None:
+    seed = int(os.environ.get("SEED", "0")) + 8
+    _test_prefill_kernel(
+        dtype_name="float16",
+        num_qk_heads=1,
+        num_v_heads=1,
+        seq_lens=[64],
+        scale=1.0,
+        use_initial_state=False,
+        varlen=False,
+        seed=seed,
+        is_log_space=False,
+    )
+
+
+def test_gdn_prefill_log_space_neg_inf_matches_reference() -> None:
+    seed = int(os.environ.get("SEED", "0")) + 9
+    _test_prefill_kernel(
+        dtype_name="float16",
+        num_qk_heads=1,
+        num_v_heads=1,
+        seq_lens=[64],
+        scale=1.0,
+        use_initial_state=True,
+        varlen=False,
+        seed=seed,
+        is_log_space=True,
+        use_zero_alpha=True,
     )
 
 

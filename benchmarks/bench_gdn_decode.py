@@ -44,6 +44,7 @@ def _gdn_decode_bytes(
     head_size: int,
     input_dtype: torch.dtype,
     output_dtype: torch.dtype,
+    use_cache_indices: bool,
 ) -> int:
     num_o_heads = max(num_q_heads, num_v_heads)
     elem_size = _dtype_size(input_dtype)
@@ -57,6 +58,7 @@ def _gdn_decode_bytes(
     dt_bias_bytes = num_v_heads * 4
     a_bytes = batch_size * num_v_heads * elem_size
     b_bytes = batch_size * num_v_heads * elem_size
+    cache_indices_bytes = batch_size * 4 if use_cache_indices else 0
 
     return (
         q_bytes
@@ -68,6 +70,7 @@ def _gdn_decode_bytes(
         + dt_bias_bytes
         + a_bytes
         + b_bytes
+        + cache_indices_bytes
     )
 
 
@@ -77,6 +80,7 @@ def _make_inputs(
     num_v_heads: int,
     head_size: int,
     dtype: torch.dtype,
+    use_cache_indices: bool,
 ) -> tuple[torch.Tensor, ...]:
     device = torch.device("musa")
     q = torch.randn((batch_size, 1, num_q_heads, head_size), dtype=dtype, device=device)
@@ -91,7 +95,12 @@ def _make_inputs(
     dt_bias = torch.randn((num_v_heads,), dtype=torch.float32, device=device) * 0.1
     a = torch.randn((batch_size, 1, num_v_heads), dtype=dtype, device=device) * 0.1
     b = torch.randn((batch_size, 1, num_v_heads), dtype=dtype, device=device)
-    return q, k, v, state, A_log, a, dt_bias, b
+    state_indices = (
+        torch.arange(batch_size, dtype=torch.int32, device=device)
+        if use_cache_indices
+        else None
+    )
+    return q, k, v, state, A_log, a, dt_bias, b, state_indices
 
 
 def _bench_one_shape(
@@ -101,13 +110,15 @@ def _bench_one_shape(
     head_size: int,
     dtype: torch.dtype,
     num_tests: int,
+    use_cache_indices: bool,
 ) -> float:
-    q, k, v, state, A_log, a, dt_bias, b = _make_inputs(
+    q, k, v, state, A_log, a, dt_bias, b, state_indices = _make_inputs(
         batch_size=batch_size,
         num_q_heads=num_q_heads,
         num_v_heads=num_v_heads,
         head_size=head_size,
         dtype=dtype,
+        use_cache_indices=use_cache_indices,
     )
 
     def _runner():
@@ -121,6 +132,7 @@ def _bench_one_shape(
             dt_bias=dt_bias,
             b=b,
             state_layout="VK",
+            state_indices=state_indices,
             scale=None,
             use_qk_l2norm=True,
         )
@@ -155,6 +167,12 @@ def main():
         default=list(DEFAULT_HEAD_CONFIGS),
         help="Head configs in 'Hq,Hv' form. Default covers 8,16 / 16,32 / 16,64.",
     )
+    parser.add_argument(
+        "--cache-indices",
+        choices=["none", "identity", "both"],
+        default="none",
+        help="Benchmark without cache_indices, with identity cache_indices, or both.",
+    )
     args = parser.parse_args()
 
     if not (hasattr(torch, "musa") and torch.musa.is_available()):
@@ -162,17 +180,21 @@ def main():
 
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
     head_configs = [_parse_head_config(spec) for spec in args.head_configs]
+    cache_index_modes = (
+        ("none", "identity") if args.cache_indices == "both" else (args.cache_indices,)
+    )
 
     print(f"\nMUSA: {torch.musa.get_device_name(0)}")
     print(f"Kernel: {KERNEL_NAME}")
     print(
         f"Config: D={args.head_size}, dtype={args.dtype}, "
-        f"head_configs={head_configs}, batches={tuple(args.batch_sizes)}"
+        f"head_configs={head_configs}, batches={tuple(args.batch_sizes)}, "
+        f"cache_indices={args.cache_indices}"
     )
     print()
 
     header = (
-        f"{'Hq':>4s}  {'Hv':>4s}  {'B':>4s}  "
+        f"{'Hq':>4s}  {'Hv':>4s}  {'B':>4s}  {'cache':>8s}  "
         f"{'Latency(us)':>12s}  {'TFLOPS':>8s}  {'GB/s':>8s}"
     )
     print(header)
@@ -180,36 +202,41 @@ def main():
 
     for num_q_heads, num_v_heads in head_configs:
         for batch_size in args.batch_sizes:
-            seconds = _bench_one_shape(
-                batch_size=batch_size,
-                num_q_heads=num_q_heads,
-                num_v_heads=num_v_heads,
-                head_size=args.head_size,
-                dtype=dtype,
-                num_tests=args.num_tests,
-            )
-            flops = _gdn_decode_flops(
-                batch_size=batch_size,
-                num_q_heads=num_q_heads,
-                num_v_heads=num_v_heads,
-                head_size=args.head_size,
-            )
-            io_bytes = _gdn_decode_bytes(
-                batch_size=batch_size,
-                num_q_heads=num_q_heads,
-                num_v_heads=num_v_heads,
-                head_size=args.head_size,
-                input_dtype=dtype,
-                output_dtype=dtype,
-            )
-            latency_us = seconds * 1e6
-            tflops = flops / seconds / 1e12
-            bandwidth = io_bytes / seconds / 1e9
-            print(
-                f"{num_q_heads:>4d}  {num_v_heads:>4d}  {batch_size:>4d}  "
-                f"{latency_us:>12.3f}  {tflops:>8.3f}  {bandwidth:>8.3f}"
-            )
-            torch.musa.empty_cache()
+            for cache_mode in cache_index_modes:
+                use_cache_indices = cache_mode == "identity"
+                seconds = _bench_one_shape(
+                    batch_size=batch_size,
+                    num_q_heads=num_q_heads,
+                    num_v_heads=num_v_heads,
+                    head_size=args.head_size,
+                    dtype=dtype,
+                    num_tests=args.num_tests,
+                    use_cache_indices=use_cache_indices,
+                )
+                flops = _gdn_decode_flops(
+                    batch_size=batch_size,
+                    num_q_heads=num_q_heads,
+                    num_v_heads=num_v_heads,
+                    head_size=args.head_size,
+                )
+                io_bytes = _gdn_decode_bytes(
+                    batch_size=batch_size,
+                    num_q_heads=num_q_heads,
+                    num_v_heads=num_v_heads,
+                    head_size=args.head_size,
+                    input_dtype=dtype,
+                    output_dtype=dtype,
+                    use_cache_indices=use_cache_indices,
+                )
+                latency_us = seconds * 1e6
+                tflops = flops / seconds / 1e12
+                bandwidth = io_bytes / seconds / 1e9
+                print(
+                    f"{num_q_heads:>4d}  {num_v_heads:>4d}  {batch_size:>4d}  "
+                    f"{cache_mode:>8s}  {latency_us:>12.3f}  "
+                    f"{tflops:>8.3f}  {bandwidth:>8.3f}"
+                )
+                torch.musa.empty_cache()
 
 
 if __name__ == "__main__":

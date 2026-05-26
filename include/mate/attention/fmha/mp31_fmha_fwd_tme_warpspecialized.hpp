@@ -55,6 +55,7 @@ template <class Element_,
           bool IsRotaryInterleaved_,
           bool HasSeqlensRotary_,
           bool EnableCP_,
+          bool HasAttentionChunk_,
           int  NumPVConsumers_ = NumQKConsumers_>
 struct Mp31FmhaFwdTmeWarpSpecialized {
   using Element            = Element_;
@@ -99,7 +100,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
   static constexpr bool HasLearnableSink = HasLearnableSink_;
   static constexpr bool HasSoftcap       = HasSoftcap_;
 
-  static constexpr bool EnableCP = EnableCP_;
+  static constexpr bool EnableCP          = EnableCP_;
+  static constexpr bool HasAttentionChunk = HasAttentionChunk_;
 
   static constexpr bool IsAppendKV          = IsAppendKV_;
   static constexpr bool IsRotary            = IsRotary_;
@@ -167,7 +169,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                   HasCuseqlensKNew,
                                   HasSeqlensRotary,
                                   EnableCP>;
-  using BlockInfo  = BlockInfo<SeqlenInfo, TileM, TileN, HeadRatio, IsCausal, IsLocal, IsPackGQA, Split, EnableCP>;
+  using BlockInfo =
+      BlockInfo<SeqlenInfo, TileM, TileN, HeadRatio, IsCausal, IsLocal, IsPackGQA, HasAttentionChunk, Split, EnableCP>;
 
   // NOTE: RoPE not implemented yet.
   // using Rotary = Rotary<TileN, TileK, NumMmaThreads, Element>;
@@ -378,7 +381,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int const window_size_right = -1;
 
     // Chunk
-    // int const attention_chunk = 0;
+    int const attention_chunk = 0;
 
     // Learnable Sink
     ElementSink const* ptr_learnable_sink;
@@ -491,7 +494,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     float const softcap_val = 0.f;
 
     // Chunk
-    // mutlass::FastDivmod attention_chunk_divmod;
+    mutlass::FastDivmod attention_chunk_divmod;
 
     // Aux tensors
     uint32_t const* const kv_batch_idx     = nullptr;
@@ -524,9 +527,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                               get<2>(args.stride_Q) * qhead_per_k_head,
                                               get<3>(args.stride_Q));
     auto const stride_Q_packed  = mute::conditional_return<!IsPackGQA>(args.stride_Q, stride_Q_packed_);
-
-    Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_packed, stride_Q_packed);
-    TME_Q  tme_load_Q =
+    Tensor     mQ               = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_packed, stride_Q_packed);
+    TME_Q      tme_load_Q =
         make_tme_copy<TmeQInnerHint, TmeQOuterHint>(MP31_TME_LOAD{}, mQ, SmemLayoutTMELoadQ{}, TileShapeQ{});
 
     int  cosize_q = get<0>(args.shape_Q) == 0 ? 0 : cosize(make_layout(shape_Q_packed, stride_Q_packed));
@@ -574,16 +576,21 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     RobustDescriptor desc_V_new = make_robust_desc(args.ptr_V_new, cosize_k_new);
 
-    RobustDescriptor desc_Cos =
-        make_robust_desc(args.ptr_rotary_cos, cosize(make_layout(args.shape_rotary, args.stride_rotary_cos)));
-    RobustDescriptor desc_Sin =
-        make_robust_desc(args.ptr_rotary_sin, cosize(make_layout(args.shape_rotary, args.stride_rotary_sin)));
+    RobustDescriptor desc_Cos = make_robust_desc(
+        args.ptr_rotary_cos,
+        get<0>(args.shape_rotary) == 0 ? 0 : cosize(make_layout(args.shape_rotary, args.stride_rotary_cos)));
+    RobustDescriptor desc_Sin = make_robust_desc(
+        args.ptr_rotary_sin,
+        get<0>(args.shape_rotary) == 0 ? 0 : cosize(make_layout(args.shape_rotary, args.stride_rotary_sin)));
 
     // Qv
 
     float const log2e = std::log2(std::exp(1.0f));
+    // float const effective_softmax_scale = HasSoftcap ? args.softcap_val : args.softmax_scale;
 
-    int const page_size = IsPagedKV ? get<0>(args.shape_K) : 1;
+    int const           page_size = IsPagedKV ? get<0>(args.shape_K) : 1;
+    mutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
+    attention_chunk_divmod.divisor = args.attention_chunk;
 
     RobustDescriptor desc_page_table = make_robust_desc(args.ptr_pagetable, cosize(make_layout(args.shape_pagetable)));
 
@@ -677,6 +684,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         .softcap_val = args.softcap_val,
 
         // Chunk
+        .attention_chunk_divmod = attention_chunk_divmod,
 
         // Aux tensors
         .kv_batch_idx     = args.kv_batch_idx,
@@ -714,8 +722,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int const bidb      = get<2>(blk_coord);
     int const split_idx = get<3>(blk_coord);
 
-    auto [n_block_min, n_block_max] = BlockInfo::get_n_block_min_max(
-        seqlen_info, m_block, split_idx, /*splits*/ num_splits, params.window_size_left, params.window_size_right);
+    auto [n_block_min, n_block_max] = BlockInfo::get_n_block_min_max(seqlen_info,
+                                                                     m_block,
+                                                                     split_idx,
+                                                                     /*splits*/ num_splits,
+                                                                     params.window_size_left,
+                                                                     params.window_size_right,
+                                                                     params.attention_chunk_divmod);
 
     // If no valid block, no need to load.
     if (n_block_min >= n_block_max) {
@@ -965,8 +978,13 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int const bidb      = get<2>(blk_coord);
     int const split_idx = get<3>(blk_coord);
 
-    auto [n_block_min, n_block_max] = BlockInfo::get_n_block_min_max(
-        seqlen_info, m_block, split_idx, /*splits*/ num_splits, params.window_size_left, params.window_size_right);
+    auto [n_block_min, n_block_max] = BlockInfo::get_n_block_min_max(seqlen_info,
+                                                                     m_block,
+                                                                     split_idx,
+                                                                     /*splits*/ num_splits,
+                                                                     params.window_size_left,
+                                                                     params.window_size_right,
+                                                                     params.attention_chunk_divmod);
 
     TiledMmaQK tiled_mma_qk;
     TiledMmaPV tiled_mma_pv;
@@ -1081,8 +1099,22 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
 
     // constexpr int                   Rows = size<0>(layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
     // Softmax<Rows, HasLearnableSink> softmax{params.softmax_scale, params.softmax_scale_log2};
-    Mask<PermuteTiledMmaQK, SeqlenInfo, TileM, TileN, HeadRatio, IsPackGQA, IsCausal, IsLocal, EnableCP> mask(
-        thread_idx, seqlen_info, params.window_size_left, params.window_size_right, params.sink_token_length);
+    Mask<PermuteTiledMmaQK,
+         SeqlenInfo,
+         TileM,
+         TileN,
+         HeadRatio,
+         IsPackGQA,
+         IsCausal,
+         IsLocal,
+         HasAttentionChunk,
+         EnableCP>
+        mask(thread_idx,
+             seqlen_info,
+             params.window_size_left,
+             params.window_size_right,
+             params.sink_token_length,
+             params.attention_chunk_divmod);
 
     int n_block = n_block_max - 1;
 
@@ -1176,16 +1208,16 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
         auto mask_fn = [&](auto& tSrS, int n_block) {
           mask.template apply</*seqlenk mask*/ false>(tSrS, m_block, n_block);
         };
-        int const n_block_min_causal_local_mask =
-            BlockInfo::get_n_block_min_causal_local_mask(seqlen_info, m_block, n_block_min, params.window_size_right);
+        int const n_block_min_causal_local_mask = BlockInfo::get_n_block_min_causal_local_mask(
+            seqlen_info, m_block, n_block_min, params.window_size_right, params.attention_chunk_divmod);
 
         for (; n_block >= n_block_min_causal_local_mask; --n_block) {
           fwd_step(n_block, mask_fn, /* CheckInf */ mute::true_type{});
         }
       }
       // No mask iterations
-      int const n_block_min_before_local_mask =
-          BlockInfo::get_n_block_min_before_local_mask(seqlen_info, m_block, n_block_min, params.window_size_left);
+      int const n_block_min_before_local_mask = BlockInfo::get_n_block_min_before_local_mask(
+          seqlen_info, m_block, n_block_min, params.window_size_left, params.attention_chunk_divmod);
       auto no_mask_fn = [](auto& tSrS, int n_block) {};
       for (; n_block >= n_block_min_before_local_mask; --n_block) {
         fwd_step(n_block, no_mask_fn, /* CheckInf */ mute::false_type{});
@@ -1274,8 +1306,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
           mask.template apply</*seqlenk mask*/ false>(tSrS, m_block, n_block);
         };
 
-        int const n_block_min_causal_local_mask =
-            BlockInfo::get_n_block_min_causal_local_mask(seqlen_info, m_block, n_block_min, params.window_size_right);
+        int const n_block_min_causal_local_mask = BlockInfo::get_n_block_min_causal_local_mask(
+            seqlen_info, m_block, n_block_min, params.window_size_right, params.attention_chunk_divmod);
 
         for (; n_block >= n_block_min_causal_local_mask; --n_block) {
           fwd_step(n_block, mask_fn, /* IsFirstIter */ mute::false_type{}, /* CheckInf */ mute::true_type{});
@@ -1283,8 +1315,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
       }
 
       // No mask iterations
-      int const n_block_min_before_local_mask =
-          BlockInfo::get_n_block_min_before_local_mask(seqlen_info, m_block, n_block_min, params.window_size_left);
+      int const n_block_min_before_local_mask = BlockInfo::get_n_block_min_before_local_mask(
+          seqlen_info, m_block, n_block_min, params.window_size_left, params.attention_chunk_divmod);
       auto no_mask_fn = [](auto& tSrS, int n_block) {};
       for (; n_block >= n_block_min_before_local_mask; --n_block) {
         fwd_step(n_block, no_mask_fn, /* IsFirstIter */ mute::false_type{}, /* CheckInf */ mute::false_type{});
@@ -1356,8 +1388,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     int const bidb      = get<2>(blk_coord);
     int const split_idx = get<3>(blk_coord);
 
-    auto [n_block_new_min, n_block_new_max] = BlockInfo::get_n_block_k_new_min_max(
-        seqlen_info, m_block, bidb, split_idx, num_splits, params.window_size_left, params.window_size_right);
+    int const n_block_new_min = 0;
+    int const n_block_new_max = mute::ceil_div(static_cast<int>(seqlen_info.seqlen_k_new), TileN);
     // if (threadIdx.x == 0 && blockIdx.x == 0) {
     //   printf("MP=%d, bidm=%d, bidb=%d, bidh=%d, bids=%d, num_splits=%d, n_block_new_min=%d, n_block_new_max=%d\n",
     //          blockIdx.x,
@@ -1449,12 +1481,10 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                                    SeqlenInfo const&      seqlen_info,
                                    BlockCoord             blk_coord,
                                    int const              num_splits) {
-    int const m_block                       = get<0>(blk_coord);
-    int const bidh                          = get<1>(blk_coord);
-    int const bidb                          = get<2>(blk_coord);
-    int const split_idx                     = get<3>(blk_coord);
-    auto [n_block_new_min, n_block_new_max] = BlockInfo::get_n_block_k_new_min_max(
-        seqlen_info, m_block, bidb, split_idx, num_splits, params.window_size_left, params.window_size_right);
+    int const bidh            = get<1>(blk_coord);
+    int const bidb            = get<2>(blk_coord);
+    int const n_block_new_min = 0;
+    int const n_block_new_max = mute::ceil_div(static_cast<int>(seqlen_info.seqlen_k_new), TileN);
 
     if (n_block_new_max <= n_block_new_min) {
       return false;

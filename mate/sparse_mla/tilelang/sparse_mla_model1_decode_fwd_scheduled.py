@@ -37,9 +37,8 @@ from ...execution_context import raise_complete_if_dry_run
 def sparse_attention_decode_fwd_scheduled_kernel_model1(
     num_heads,
     dim,
-    topk,
     *,
-    extra_topk=0,
+    has_extra=False,
     kv_group=1,
     sm_scale=None,
     block_i=64,
@@ -54,16 +53,12 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
     )
-    assert topk % block_i == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
-    if extra_topk > 0:
-        assert extra_topk % block_i == 0, "extra_topk must be a multiple of block_i"
     if sm_scale is None:
         sm_scale = (1.0 / dim) ** 0.5 * 1.44269504
     else:
         sm_scale = sm_scale * 1.44269504
-
+    topk = T.dynamic("topk")
+    extra_topk = T.dynamic("extra_topk")
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     dim_bytes = 584
@@ -395,7 +390,7 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                 dynamic_total_blocks = T.alloc_var(T.int32)
                 dynamic_main_blocks = T.max(T.ceildiv(topk_length[b_i], block_i), 1)
                 dynamic_total_blocks = dynamic_main_blocks
-                if extra_topk > 0:
+                if has_extra:
                     dynamic_total_blocks += T.ceildiv(extra_topk_length[b_i], block_i)
                 start_block_idx = T.if_then_else(
                     b_i == begin_idx, sched_begin_block_idx, 0
@@ -410,14 +405,12 @@ def sparse_attention_decode_fwd_scheduled_kernel_model1(
                     T.copy(
                         q[b_i, s_i, h0:h1, 0:256],
                         q_shared_l,
-                        force_async_copy=True,
-                        src_robust_desc=q_robust_desc,
+                        barrier=bar_q,
                     )
                     T.copy(
                         q[b_i, s_i, h0:h1, 256:512],
                         q_shared_r,
-                        force_async_copy=True,
-                        src_robust_desc=q_robust_desc,
+                        barrier=bar_q,
                     )
                     T.ptx_commit_group()
                     T.ptx_wait_group(0)
@@ -1036,8 +1029,7 @@ def sparse_mla_decode_fwd_scheduled_interface_model1(
     kernel = sparse_attention_decode_fwd_scheduled_kernel_model1(
         heads,
         d_v,
-        topk,
-        extra_topk=extra_topk,
+        has_extra=extra_topk > 0,
         kv_group=kv_group,
         sm_scale=sm_scale,
         threads=threads,

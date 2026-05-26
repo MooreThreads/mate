@@ -2,7 +2,6 @@ import argparse
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from mate.gdn_prefill import chunk_gated_delta_rule
 from mate.testing.utils import bench_kineto
@@ -60,16 +59,16 @@ def bench_mate(
 
     cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int32, device=device)
 
-    q = torch.randn((1, total_tokens, h_qk, d), dtype=dtype, device=device)
-    k = F.normalize(
-        torch.randn((1, total_tokens, h_qk, d), dtype=torch.float32, device=device),
-        p=2,
-        dim=-1,
-    ).to(dtype)
-    v = torch.randn((1, total_tokens, h_v, d), dtype=dtype, device=device)
-    alpha = torch.exp(
-        -torch.rand(1, total_tokens, head_o, dtype=torch.float32, device=device)
+    mixed_qkv = torch.randn(
+        (1, total_tokens, (h_qk + h_qk + h_v) * d),
+        dtype=dtype,
+        device=device,
     )
+    q, k, v = torch.split(mixed_qkv, [h_qk * d, h_qk * d, h_v * d], dim=-1)
+    q = q.view(1, total_tokens, h_qk, d)
+    k = k.view(1, total_tokens, h_qk, d)
+    v = v.view(1, total_tokens, h_v, d)
+    log_alpha = -torch.rand(1, total_tokens, head_o, dtype=torch.float32, device=device)
     beta = torch.sigmoid(
         torch.randn(1, total_tokens, head_o, dtype=torch.float32, device=device)
     )
@@ -79,17 +78,17 @@ def bench_mate(
         q=q,
         k=k,
         v=v,
-        g=alpha,
+        g=log_alpha,
         beta=beta,
         scale=None,
         initial_state=h0,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=True,
     )
     kernel_names = (
-        "tilelang_chunk_local_cumsum_kernel_kernel",
-        "tilelang_kkt_solve_kernel_kernel",
+        "tilelang_gdn_l2norm_kernel",
+        "tilelang_kkt_solve_kernel",
         "tilelang_fused_chunk_gdn_prefill_kernel_",
     )
 
@@ -128,7 +127,7 @@ def main():
 
     print(f"\nMUSA: {torch.musa.get_device_name(0)}")
     print("Kernel: mate.gdn_prefill.chunk_gated_delta_rule")
-    print(f"dtype={args.dtype}")
+    print(f"dtype={args.dtype}, split_qkv=strided, qk_l2norm=standalone_inplace")
     print()
 
     header = (

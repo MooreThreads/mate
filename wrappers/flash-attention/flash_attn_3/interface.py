@@ -126,6 +126,10 @@ def flash_attn_varlen_func(
     out: Optional[torch.Tensor] = None,
 ):
     resolved_sink = _resolve_sink(sinks=sinks, s_aux=s_aux)
+    resolved_softmax_lse = _resolve_return_softmax_lse(
+        return_attn_probs=return_attn_probs,
+        return_softmax_lse=return_softmax_lse,
+    )
     resolved_page_table = _resolve_block_table(
         page_table=page_table, block_table=block_table
     )

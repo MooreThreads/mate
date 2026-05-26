@@ -117,6 +117,44 @@ def _validate_common_decode_inputs(
     return B, T, H, K, HV, V
 
 
+def _prepare_state_indices_kernel_arg(
+    state_indices: Optional[torch.Tensor],
+    *,
+    state: torch.Tensor,
+    batch_size: int,
+    q: torch.Tensor,
+    num_v_heads: int,
+    head_dim_v: int,
+    head_dim_k: int,
+) -> Optional[torch.Tensor]:
+    if state_indices is None:
+        if state.shape[0] != batch_size:
+            raise ValueError(
+                "state_indices=None uses identity mapping, so state must have "
+                f"shape [B={batch_size}, HV={num_v_heads}, V={head_dim_v}, K={head_dim_k}], "
+                f"got {tuple(state.shape)}"
+            )
+        return None
+
+    if state_indices.dim() != 1 or state_indices.shape[0] != batch_size:
+        raise ValueError(
+            f"state_indices must have shape [B={batch_size}], got {tuple(state_indices.shape)}"
+        )
+    if state_indices.device != q.device:
+        raise ValueError(
+            f"Expected state_indices to be on device {q.device}, got {state_indices.device}."
+        )
+    if state_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"state_indices must be int32 or int64, got {state_indices.dtype}."
+        )
+    return (
+        state_indices
+        if state_indices.dtype == torch.int32
+        else state_indices.to(dtype=torch.int32)
+    )
+
+
 def _gated_delta_rule_decode_pretranspose_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -132,6 +170,7 @@ def _gated_delta_rule_decode_pretranspose_impl(
     head_dim_k: int,
     num_v_heads: int,
     head_dim_v: int,
+    state_indices: Optional[torch.Tensor],
     scale: Optional[float],
     output: Optional[torch.Tensor],
     use_qk_l2norm: bool,
@@ -140,15 +179,28 @@ def _gated_delta_rule_decode_pretranspose_impl(
         raise ValueError(f"VK fp32 decode only supports T=1, got T={seq_len}")
     if state.dtype != torch.float32:
         raise ValueError(f"VK fp32 decode requires float32 state, got {state.dtype}")
-    if state.shape != (batch_size, num_v_heads, head_dim_v, head_dim_k):
+    if state.dim() != 4 or state.shape[1:] != (
+        num_v_heads,
+        head_dim_v,
+        head_dim_k,
+    ):
         raise ValueError(
-            f"Expected state [B={batch_size}, HV={num_v_heads}, V={head_dim_v}, "
-            f"K={head_dim_k}] for VK, got {state.shape}"
+            f"Expected state [pool_size, HV={num_v_heads}, V={head_dim_v}, "
+            f"K={head_dim_k}] for VK, got {tuple(state.shape)}"
         )
     if state.device != q.device:
         raise ValueError(
             f"Expected state to be on device {q.device}, got {state.device}."
         )
+    state_indices_kernel = _prepare_state_indices_kernel_arg(
+        state_indices,
+        state=state,
+        batch_size=batch_size,
+        q=q,
+        num_v_heads=num_v_heads,
+        head_dim_v=head_dim_v,
+        head_dim_k=head_dim_k,
+    )
 
     scale_value = head_dim_k**-0.5 if scale is None else float(scale)
 
@@ -159,11 +211,15 @@ def _gated_delta_rule_decode_pretranspose_impl(
             device=q.device,
         )
 
+    state_is_contiguous = state.is_contiguous()
+    state_kernel = state if state_is_contiguous else state.contiguous()
+
     gdn_decode_tilelang.run_gated_delta_rule_decode_vk_fp32(
         q=q,
         k=k,
         v=v,
-        state=state,
+        state=state_kernel,
+        state_indices=state_indices_kernel,
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -172,6 +228,9 @@ def _gated_delta_rule_decode_pretranspose_impl(
         scale=scale_value,
         use_qk_l2norm=use_qk_l2norm,
     )
+
+    if not state_is_contiguous:
+        state.copy_(state_kernel)
 
     return output, state
 
@@ -212,33 +271,15 @@ def _gated_delta_rule_mtp_vk_fp32_impl(
             f"K={head_dim_k}] for VK MTP, got {tuple(state.shape)}"
         )
 
-    pool_size = state.shape[0]
-    if state_indices is None:
-        if pool_size != batch_size:
-            raise ValueError(
-                "state_indices=None uses identity mapping, so state must have "
-                f"shape [B={batch_size}, HV={num_v_heads}, V={head_dim_v}, K={head_dim_k}], "
-                f"got {tuple(state.shape)}"
-            )
-        state_indices_kernel = None
-    else:
-        if state_indices.dim() != 1 or state_indices.shape[0] != batch_size:
-            raise ValueError(
-                f"state_indices must have shape [B={batch_size}], got {tuple(state_indices.shape)}"
-            )
-        if state_indices.device != q.device:
-            raise ValueError(
-                f"Expected state_indices to be on device {q.device}, got {state_indices.device}."
-            )
-        if state_indices.dtype not in (torch.int32, torch.int64):
-            raise ValueError(
-                f"state_indices must be int32 or int64, got {state_indices.dtype}."
-            )
-        state_indices_kernel = (
-            state_indices
-            if state_indices.dtype == torch.int32
-            else state_indices.to(dtype=torch.int32)
-        )
+    state_indices_kernel = _prepare_state_indices_kernel_arg(
+        state_indices,
+        state=state,
+        batch_size=batch_size,
+        q=q,
+        num_v_heads=num_v_heads,
+        head_dim_v=head_dim_v,
+        head_dim_k=head_dim_k,
+    )
 
     if output is None:
         output = torch.empty(
@@ -270,9 +311,10 @@ def _gated_delta_rule_mtp_vk_fp32_impl(
                 "intermediate_states_buffer dim 1 must be at least "
                 f"seq_len={seq_len}, got {intermediate_states_buffer.shape[1]}."
             )
-        if intermediate_states_buffer.dtype != torch.float32:
+        if intermediate_states_buffer.dtype != state.dtype:
             raise ValueError(
-                f"intermediate_states_buffer must be float32, got {intermediate_states_buffer.dtype}."
+                "intermediate_states_buffer dtype must match state dtype "
+                f"{state.dtype}, got {intermediate_states_buffer.dtype}."
             )
         if intermediate_states_buffer.device != q.device:
             raise ValueError(
@@ -332,8 +374,8 @@ def gated_delta_rule_decode(
 
     Single entry point for decode (``T=1``) and MTP/speculative decode (``T>1``).
     The API layer owns parameter semantics and backend dispatch. The current MATE
-    implementation supports the VK-layout + FP32-state TileLang backends for
-    single-token decode and MTP/speculative decode.
+    implementation supports the VK-layout + TileLang backends for single-token
+    decode with FP32 state and MTP/speculative decode with FP32 or BF16 state.
 
     Args:
         q (torch.Tensor):
@@ -364,7 +406,8 @@ def gated_delta_rule_decode(
         output (Optional[torch.Tensor]):
             Optional pre-allocated output tensor of shape ``[B, T, HV, V]``.
         intermediate_states_buffer (Optional[torch.Tensor]):
-            Optional rollback buffer for MTP/speculative decode.
+            Optional rollback buffer for MTP/speculative decode. Its dtype must
+            match ``state.dtype``.
         disable_state_update (bool):
             If True, state is treated as read-only on the MTP path.
         use_qk_l2norm (bool):
@@ -377,7 +420,7 @@ def gated_delta_rule_decode(
 
     Dispatch:
         - ``state_layout="VK"``, ``state.dtype=float32``, ``T=1`` -> TileLang pretranspose fp32 decode
-        - ``state_layout="VK"``, ``state.dtype=float32``, ``T>1`` -> TileLang fp32 MTP
+        - ``state_layout="VK"``, ``state.dtype=float32/bfloat16``, ``T>1`` -> TileLang MTP
         - Other combinations currently raise with a clear error
 
     Note:
@@ -421,26 +464,16 @@ def gated_delta_rule_decode(
         )
 
     # state_layout == "VK"
-    if state.dtype == torch.bfloat16:
-        if T not in (1, 2, 3, 4) or K != 128 or V != 128:
-            raise ValueError(
-                f"VK bf16 path requires T in {{1,2,3,4}} and K=V=128, got T={T}, K={K}, V={V}"
-            )
-        if use_pool:
-            raise NotImplementedError(
-                "VK bf16 path with state_indices (pool) is not implemented in MATE yet"
-            )
-        raise NotImplementedError("VK bf16 backend is not implemented in MATE yet")
-
-    if state.dtype != torch.float32:
+    if state.dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(
             f"VK layout supports bfloat16 or float32 state, got {state.dtype}"
         )
 
     if T == 1:
-        if use_pool:
+        if state.dtype == torch.bfloat16:
             raise NotImplementedError(
-                "VK fp32 T=1 with state_indices (pool) is not implemented yet"
+                "VK bfloat16 T=1 decode is not implemented in MATE yet; "
+                "the bfloat16 state backend currently supports the MTP path (T>1)."
             )
         if intermediate_states_buffer is not None:
             raise NotImplementedError(
@@ -448,7 +481,7 @@ def gated_delta_rule_decode(
             )
         if disable_state_update:
             raise NotImplementedError(
-                "VK fp32 T=1 does not support disable_state_update yet"
+                "VK fp32 T=1 does not support disable_state_update"
             )
         return _gated_delta_rule_decode_pretranspose_impl(
             q=q,
@@ -464,6 +497,7 @@ def gated_delta_rule_decode(
             head_dim_k=K,
             num_v_heads=HV,
             head_dim_v=V,
+            state_indices=state_indices,
             scale=scale,
             output=output,
             use_qk_l2norm=use_qk_l2norm,
@@ -471,7 +505,7 @@ def gated_delta_rule_decode(
 
     if K != 128 or V != 128:
         raise NotImplementedError(
-            f"VK fp32 MTP currently supports K=V=128 only, got K={K}, V={V}"
+            f"VK MTP currently supports K=V=128 only, got K={K}, V={V}"
         )
 
     return _gated_delta_rule_mtp_vk_fp32_impl(

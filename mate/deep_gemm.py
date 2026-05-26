@@ -385,8 +385,11 @@ def tf32_hc_prenorm_gemm(
     m = a.shape[0]
     n = b.shape[0]
     num_splits = 1 if num_splits is None or num_splits <= 1 else int(num_splits)
+    num_mps = _resolve_num_mps(a.device, 0)
 
-    get_hyperconnection_module(m, n).get_function("tf32_hc_prenorm_gemm")(
+    get_hyperconnection_module(m, n, num_splits, num_mps).get_function(
+        "tf32_hc_prenorm_gemm"
+    )(
         a,
         b,
         d,

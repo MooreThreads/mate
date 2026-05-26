@@ -11,6 +11,7 @@ from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
 from ...cpp_ext import get_mudnn_ldflags
 from ...utils import EXPORT_FUNC, TVM_HEADER
+from ....utils import ceil_div
 from .. import gemm_utils
 from .deep_gemm_utils import DEEP_GEMM_CUDA_FLAGS
 
@@ -24,15 +25,27 @@ class HcPrenormGemmJitConfig:
     num_mma_warp_squads: int
 
 
+HC_PRENORM_TILE_M_OPTIONS = (32, 64)
+HC_PRENORM_STAGE_OPTIONS = (3, 2)
+HC_PRENORM_SMEM_BYTES_PER_MP = 192 * 1024
+HC_PRENORM_BF16_BYTES = 2
+HC_PRENORM_FP32_BYTES = 4
+
 HC_PRENORM_CONFIGS: List[HcPrenormGemmJitConfig] = [
     HcPrenormGemmJitConfig(
-        tile_m=64,
+        tile_m=tile_m,
         tile_n=32,
         tile_k=32,
-        stages=3,
-        num_mma_warp_squads=3,
-    ),
+        stages=stages,
+        num_mma_warp_squads=2,
+    )
+    for stages in HC_PRENORM_STAGE_OPTIONS
+    for tile_m in HC_PRENORM_TILE_M_OPTIONS
 ]
+
+_HC_PRENORM_CONFIGS_BY_TILE_M_AND_STAGES = {
+    (cfg.tile_m, cfg.stages): cfg for cfg in HC_PRENORM_CONFIGS
+}
 
 
 _hc_prenorm_template_env = Environment(
@@ -57,13 +70,41 @@ def _hyperconnection_include_paths() -> list[Path]:
     ]
 
 
+def _hc_prenorm_waves(
+    m: int,
+    n: int,
+    num_splits: int,
+    num_mps: int,
+    cfg: HcPrenormGemmJitConfig,
+) -> int:
+    smem_per_stage = (
+        cfg.tile_m * cfg.tile_k * HC_PRENORM_BF16_BYTES
+        + cfg.tile_m * cfg.tile_k * HC_PRENORM_FP32_BYTES
+        + cfg.tile_n * cfg.tile_k * HC_PRENORM_FP32_BYTES
+    )
+    ctas_per_mp = max(1, HC_PRENORM_SMEM_BYTES_PER_MP // (cfg.stages * smem_per_stage))
+    total_ctas = max(num_splits, 1) * ceil_div(m, cfg.tile_m) * ceil_div(n, cfg.tile_n)
+    return ceil_div(total_ctas, max(num_mps, 1) * ctas_per_mp)
+
+
 @functools.cache
-def select_hc_prenorm_config(m: int, n: int) -> HcPrenormGemmJitConfig:
-    best = HC_PRENORM_CONFIGS[0]
-    for cfg in HC_PRENORM_CONFIGS:
-        if cfg.tile_n >= n and cfg.tile_m <= m:
-            best = cfg
-    return best
+def select_hc_prenorm_config(
+    m: int,
+    n: int,
+    num_splits: int = 1,
+    num_mps: int = 1,
+) -> HcPrenormGemmJitConfig:
+    target_tile_m = 32 if m <= 32 else 64
+    cfg_2stage = _HC_PRENORM_CONFIGS_BY_TILE_M_AND_STAGES[(target_tile_m, 2)]
+    cfg_3stage = _HC_PRENORM_CONFIGS_BY_TILE_M_AND_STAGES[(target_tile_m, 3)]
+    target_stages = (
+        2
+        if _hc_prenorm_waves(m, n, num_splits, num_mps, cfg_2stage)
+        < _hc_prenorm_waves(m, n, num_splits, num_mps, cfg_3stage)
+        else 3
+    )
+
+    return _HC_PRENORM_CONFIGS_BY_TILE_M_AND_STAGES[(target_tile_m, target_stages)]
 
 
 def hc_prenorm_config_dict(cfg: HcPrenormGemmJitConfig) -> Dict[str, object]:
@@ -122,8 +163,8 @@ def _load_hyperconnection_module(frozen_config: tuple[int, int, int, int, int]):
 
 
 @functools.cache
-def get_hyperconnection_module(m: int, n: int):
-    config = select_hc_prenorm_config(m, n)
+def get_hyperconnection_module(m: int, n: int, num_splits: int = 1, num_mps: int = 1):
+    config = select_hc_prenorm_config(m, n, num_splits, num_mps)
     frozen_config = (
         config.tile_m,
         config.tile_n,

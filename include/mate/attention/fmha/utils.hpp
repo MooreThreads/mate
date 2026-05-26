@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutlass/fast_math.h>
 #include <mutlass/numeric_conversion.h>
 
 #include <mute/atom/mma_atom.hpp>
@@ -111,6 +112,14 @@ MUTE_HOST_DEVICE int round_up_headdim(int headdim) {
     return 256;
   }
   return 512;
+}
+
+MUTE_HOST_DEVICE int div_floor(mutlass::FastDivmod const& divmod, int dividend) {
+  return dividend >= 0 ? divmod.divide(dividend) : -1 - divmod.divide(-1 - dividend);
+}
+
+MUTE_HOST_DEVICE int div_ceil(mutlass::FastDivmod const& divmod, int dividend) {
+  return dividend >= 0 ? divmod.divide(dividend + divmod.divisor - 1) : -divmod.divide(-dividend);
 }
 
 }  // namespace mate::attention::fmha

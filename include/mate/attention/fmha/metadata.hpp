@@ -176,6 +176,7 @@ template <int  NumWarps,
           bool Sort,
           bool PackGQA,
           bool Causal,
+          bool IsLocal,
           bool L2Swizzle        = false,
           bool HasCuSeqlensQ    = false,
           bool HasSequsedQ      = false,
@@ -199,6 +200,8 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
                                     int                   num_splits_static,
                                     mutlass::FastDivmod   blockm_divmod,
                                     mutlass::FastDivmod   blockn_divmod,
+                                    int                   window_size_left,
+                                    int                   window_size_right,
                                     // int* const tile_count_semaphore,
                                     int* const num_m_blocks_ptr,
                                     int* const num_splits_dynamic_ptr,
@@ -293,6 +296,14 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
       seqlen_new = seqlen_k_new_static;
     }
     seqlen = seqlen - leftpad_k + seqlen_new;
+    if constexpr (IsLocal) {
+      // Native FA3 metadata does not account for SWA/local invalid tiles. Cap
+      // the estimate here until a VarlenDynamic-style scheduler can skip them,
+      // then compare performance.
+      int const seqlen_loaded =
+          std::max(0, std::min(seqlen, window_size_left + window_size_right + 1 + blockm_divmod.divisor));
+      seqlen = seqlen_loaded;
+    }
     return batch_idx < num_batch && lane < kNumBatchPerWarp ? blockn_divmod.div(seqlen + blockn_divmod.divisor - 1) : 0;
   };
 
