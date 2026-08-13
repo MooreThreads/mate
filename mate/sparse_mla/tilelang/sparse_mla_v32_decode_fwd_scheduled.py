@@ -334,16 +334,16 @@ def sparse_attention_fwd_kernel(
                     kv_reg_l_bf16_load = T.alloc_local([32], T.bfloat16)
                     kv_reg_l_fp8 = T.view(kv_reg_l_bf16_load, [64], kv_latent_dtype)
                     quant_local_l = T.alloc_local([2, 2], T.float32)
-                    ldg_tx = (tid) % 8
-                    ldg_ty = (tid) // 8
+                    c0_ldg_tx = (tid) % 8
+                    c0_ldg_ty = (tid) // 8
                     T.fill(sumexp, 0)
                     T.fill(m_i, -(2**30))
                     T.fill(acc_o_l_0, 0)
                     T.fill(acc_o_l_1, 0)
                     for i_i in range(start_block_idx, end_block_idx):
                         T.barrier_wait(bar_kv0_ready, (phase_count[0] & 1))
-                        T.copy(quant_shared[ldg_ty, 0:2], quant_local_l[0, :])
-                        T.copy(quant_shared[ldg_ty + 32, 0:2], quant_local_l[1, :])
+                        T.copy(quant_shared[c0_ldg_ty, 0:2], quant_local_l[0, :])
+                        T.copy(quant_shared[c0_ldg_ty + 32, 0:2], quant_local_l[1, :])
                         T.annotate_layout(
                             {
                                 kv_shared_l[
@@ -361,8 +361,8 @@ def sparse_attention_fwd_kernel(
                                 for v in T.vectorized(4):
                                     kv_reg_l_bf16_load[r * 16 + u * 4 + v] = (
                                         kv_shared_l[
-                                            (ldg_ty + r * 32),
-                                            64 * u + ldg_tx * 8 + v,
+                                            (c0_ldg_ty + r * 32),
+                                            64 * u + c0_ldg_tx * 8 + v,
                                         ]
                                     )
                         T.lma_wait()
@@ -386,7 +386,8 @@ def sparse_attention_fwd_kernel(
                             for u in T.unroll(2):
                                 for v in T.vectorized(8):
                                     kv_shared_l[
-                                        ldg_ty + r * 32, 64 * u + ldg_tx * 8 + v
+                                        c0_ldg_ty + r * 32,
+                                        64 * u + c0_ldg_tx * 8 + v,
                                     ] = kv_reg_l[r * 32 + u * 8 + v]
 
                         for r in T.unroll(2):
@@ -394,8 +395,8 @@ def sparse_attention_fwd_kernel(
                                 for v in T.vectorized(4):
                                     kv_reg_l_bf16_load[r * 16 + (u + 2) * 4 + v] = (
                                         kv_shared_l[
-                                            (ldg_ty + r * 32),
-                                            64 * (u + 2) + ldg_tx * 8 + v,
+                                            (c0_ldg_ty + r * 32),
+                                            64 * (u + 2) + c0_ldg_tx * 8 + v,
                                         ]
                                     )
                         T.lma_wait()
@@ -418,7 +419,8 @@ def sparse_attention_fwd_kernel(
                             for u in T.unroll(2):
                                 for v in T.vectorized(8):
                                     kv_shared_l[
-                                        ldg_ty + r * 32, 64 * (u + 2) + ldg_tx * 8 + v
+                                        c0_ldg_ty + r * 32,
+                                        64 * (u + 2) + c0_ldg_tx * 8 + v,
                                     ] = kv_reg_l[r * 32 + (u + 2) * 8 + v]
 
                         T.lma_wait()
@@ -506,7 +508,9 @@ def sparse_attention_fwd_kernel(
 
                         T.lma_wait()
                         T.barrier_arrive(bar_p_ready)
-                        stage_value_shared(v_shared_0, kv_reg_l, ldg_ty, ldg_tx, 0)
+                        stage_value_shared(
+                            v_shared_0, kv_reg_l, c0_ldg_ty, c0_ldg_tx, 0
+                        )
                         T.lma_wait()
                         T.barrier_arrive(bar_vl0_ready)
                         T.barrier_wait(bar_vl0_ready, (phase_count[0] & 1))
@@ -519,7 +523,9 @@ def sparse_attention_fwd_kernel(
                             wg_wait=-1,
                         )
                         T.warpgroup_commit_batch()
-                        stage_value_shared(v_shared_1, kv_reg_l, ldg_ty, ldg_tx, 2)
+                        stage_value_shared(
+                            v_shared_1, kv_reg_l, c0_ldg_ty, c0_ldg_tx, 2
+                        )
 
                         T.warpgroup_wait(0)
                         T.barrier_arrive(bar_vl0_free)
@@ -576,12 +582,12 @@ def sparse_attention_fwd_kernel(
                     quant_local_r = T.alloc_local([2, 2], T.float32)
                     T.fill(acc_o_r_0, 0)
                     T.fill(acc_o_r_1, 0)
-                    ldg_tx = (tid - 256) % 8
-                    ldg_ty = (tid - 256) // 8
+                    c1_ldg_tx = (tid - 256) % 8
+                    c1_ldg_ty = (tid - 256) // 8
                     for i_i in range(start_block_idx, end_block_idx):
                         T.barrier_wait(bar_kv1_ready, (phase_count[0] & 1))
-                        T.copy(quant_shared[ldg_ty, 2:4], quant_local_r[0, :])
-                        T.copy(quant_shared[ldg_ty + 32, 2:4], quant_local_r[1, :])
+                        T.copy(quant_shared[c1_ldg_ty, 2:4], quant_local_r[0, :])
+                        T.copy(quant_shared[c1_ldg_ty + 32, 2:4], quant_local_r[1, :])
 
                         T.annotate_layout(
                             {
@@ -599,8 +605,8 @@ def sparse_attention_fwd_kernel(
                             for u in T.unroll(2):
                                 for v in T.vectorized(4):
                                     kv_reg_r_bf16[r * 16 + u * 4 + v] = kv_shared_r[
-                                        ldg_ty + r * 32,
-                                        64 * u + ldg_tx * 8 + v,
+                                        c1_ldg_ty + r * 32,
+                                        64 * u + c1_ldg_tx * 8 + v,
                                     ]
                         T.lma_wait()
 
@@ -623,7 +629,8 @@ def sparse_attention_fwd_kernel(
                             for u in T.unroll(2):
                                 for v in T.vectorized(8):
                                     kv_shared_r[
-                                        ldg_ty + r * 32, 64 * u + ldg_tx * 8 + v
+                                        c1_ldg_ty + r * 32,
+                                        64 * u + c1_ldg_tx * 8 + v,
                                     ] = kv_reg_r[r * 32 + u * 8 + v]
 
                         for r in T.unroll(2):
@@ -631,8 +638,8 @@ def sparse_attention_fwd_kernel(
                                 for v in T.vectorized(4):
                                     kv_reg_r_bf16[r * 16 + (u + 2) * 4 + v] = (
                                         kv_shared_r[
-                                            (ldg_ty + r * 32),
-                                            64 * (u + 2) + ldg_tx * 8 + v,
+                                            (c1_ldg_ty + r * 32),
+                                            64 * (u + 2) + c1_ldg_tx * 8 + v,
                                         ]
                                     )
                         T.lma_wait()
@@ -656,7 +663,8 @@ def sparse_attention_fwd_kernel(
                             for u in T.unroll(2):
                                 for v in T.vectorized(8):
                                     kv_shared_r[
-                                        ldg_ty + r * 32, 64 * (u + 2) + ldg_tx * 8 + v
+                                        c1_ldg_ty + r * 32,
+                                        64 * (u + 2) + c1_ldg_tx * 8 + v,
                                     ] = kv_reg_r[r * 32 + (u + 2) * 8 + v]
 
                         T.lma_wait()
@@ -664,7 +672,9 @@ def sparse_attention_fwd_kernel(
 
                         T.barrier_wait(bar_vl0_free, (phase_count[0] & 1))
 
-                        stage_value_shared(v_shared_0, kv_reg_r, ldg_ty, ldg_tx, 0)
+                        stage_value_shared(
+                            v_shared_0, kv_reg_r, c1_ldg_ty, c1_ldg_tx, 0
+                        )
 
                         T.lma_wait()
                         T.barrier_arrive(bar_vr0_ready)
@@ -688,7 +698,9 @@ def sparse_attention_fwd_kernel(
 
                         T.barrier_wait(bar_vl1_free, (phase_count[0] & 1))
 
-                        stage_value_shared(v_shared_1, kv_reg_r, ldg_ty, ldg_tx, 2)
+                        stage_value_shared(
+                            v_shared_1, kv_reg_r, c1_ldg_ty, c1_ldg_tx, 2
+                        )
                         T.lma_wait()
                         T.warpgroup_wait(0)
                         # T.barrier_arrive(bar_vr0_free)
@@ -728,9 +740,9 @@ def sparse_attention_fwd_kernel(
                 elif tid >= 512:
                     kperm_mask_local = T.alloc_local([4], "bool")
                     kperm_indices_local = T.alloc_local([4], "int32")
-                    # producer: 128 ldg_ty 16
-                    ldg_tx = (tid - 512) % 8
-                    ldg_ty = (tid - 512) // 8
+                    # producer: 128 threads, 16 producer_ldg_ty rows
+                    producer_ldg_tx = (tid - 512) % 8
+                    producer_ldg_ty = (tid - 512) // 8
                     ldg_scale_tx = (tid - 512) % 2
                     ldg_scale_ty = (tid - 512) // 2
                     for i_i in range(start_block_idx, end_block_idx):
@@ -746,8 +758,8 @@ def sparse_attention_fwd_kernel(
                             i_i,
                             effective_topk,
                             seq_len_kv,
-                            ldg_ty,
-                            ldg_tx,
+                            producer_ldg_ty,
+                            producer_ldg_tx,
                             phase_count[0],
                             kperm_indices_local,
                             kperm_mask_local,
@@ -775,10 +787,11 @@ def sparse_attention_fwd_kernel(
                                         k_pe[
                                             kperm_indices_local[r],
                                             g_i,
-                                            32 * u + ldg_tx * 4 + v,
+                                            32 * u + producer_ldg_tx * 4 + v,
                                         ],
                                         kv_shared_l[
-                                            r * 16 + ldg_ty, 64 * u + ldg_tx * 8 + v
+                                            r * 16 + producer_ldg_ty,
+                                            64 * u + producer_ldg_tx * 8 + v,
                                         ],
                                         force_async_copy=True,
                                         src_robust_desc=kv_robust_desc,
@@ -824,9 +837,12 @@ def sparse_attention_fwd_kernel(
                                     k_pe[
                                         kperm_indices_local[r],
                                         g_i,
-                                        dim_qk // 2 + 8 + ldg_tx * 8 + v,
+                                        dim_qk // 2 + 8 + producer_ldg_tx * 8 + v,
                                     ],
-                                    k_tail_shared[r * 16 + ldg_ty, ldg_tx * 8 + v],
+                                    k_tail_shared[
+                                        r * 16 + producer_ldg_ty,
+                                        producer_ldg_tx * 8 + v,
+                                    ],
                                     force_async_copy=True,
                                     src_robust_desc=kv_robust_desc,
                                 )
@@ -855,10 +871,14 @@ def sparse_attention_fwd_kernel(
                                         k_pe[
                                             kperm_indices_local[r],
                                             g_i,
-                                            dim_qk // 4 + 32 * u + ldg_tx * 4 + v,
+                                            dim_qk // 4
+                                            + 32 * u
+                                            + producer_ldg_tx * 4
+                                            + v,
                                         ],
                                         kv_shared_r[
-                                            r * 16 + ldg_ty, 64 * u + ldg_tx * 8 + v
+                                            r * 16 + producer_ldg_ty,
+                                            64 * u + producer_ldg_tx * 8 + v,
                                         ],
                                         force_async_copy=True,
                                         src_robust_desc=kv_robust_desc,
