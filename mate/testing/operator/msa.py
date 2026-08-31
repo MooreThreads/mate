@@ -137,8 +137,10 @@ class MsaWorkload:
             raise ValueError("num_q_heads must be divisible by num_kv_heads")
 
         if self.api is MsaApi.SPARSE_FWD:
-            if self.num_q_heads // self.num_kv_heads not in (8, 16):
-                raise ValueError("MSA forward requires a local Hq/Hkv ratio of 8 or 16")
+            if self.num_q_heads // self.num_kv_heads not in (1, 8, 16):
+                raise ValueError(
+                    "MSA forward requires a local Hq/Hkv ratio of 1, 8, or 16"
+                )
             if self.topk != 16:
                 raise ValueError("MSA forward currently requires topk == 16")
             if self.kv_layout is not MsaKvLayout.PAGED:

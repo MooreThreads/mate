@@ -12,16 +12,17 @@ namespace mate::attention::msa::collective {
 
 using namespace mute;
 
-// Store a physical M16 tile as two adjacent TP8 query tokens:
-//   rows  0..7  -> q_abs + 0
-//   rows  8..15 -> q_abs + 1
-template <class Element_>
-struct MsaFwdPairEpilogue {
+// Store a physical M16 tile as adjacent query tokens. HeadRatio and
+// QueriesPerTile must exactly fill the physical rows.
+template <class Element_, int HeadRatio_, int QueriesPerTile_>
+struct MsaFwdPackedQueryEpilogue {
   using Element = Element_;
 
-  static constexpr int HeadRatio      = 8;
-  static constexpr int QueriesPerTile = 2;
+  static constexpr int HeadRatio      = HeadRatio_;
+  static constexpr int QueriesPerTile = QueriesPerTile_;
   static constexpr int HeadDim        = 128;
+
+  static_assert(HeadRatio * QueriesPerTile == 16);
 
   static constexpr bool IsSupportedElement = std::is_same_v<Element, mutlass::float_e4m3_t> ||
                                              std::is_same_v<Element, mutlass::half_t> ||
@@ -109,5 +110,11 @@ struct MsaFwdPairEpilogue {
     }
   }
 };
+
+template <class Element>
+using MsaFwdPairEpilogue = MsaFwdPackedQueryEpilogue<Element, 8, 2>;
+
+template <class Element>
+using MsaFwdQueryPack16Epilogue = MsaFwdPackedQueryEpilogue<Element, 1, 16>;
 
 }  // namespace mate::attention::msa::collective

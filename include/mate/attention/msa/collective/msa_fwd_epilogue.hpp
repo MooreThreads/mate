@@ -58,7 +58,7 @@ struct MsaFwdEpilogue {
       return false;
     }
     int const ratio = problem_size.num_qo_heads / problem_size.num_kv_heads;
-    return (ratio == 8 || ratio == HeadRatio) && args.ptr_o != nullptr && args.ptr_lse != nullptr;
+    return (ratio == 1 || ratio == 8 || ratio == HeadRatio) && args.ptr_o != nullptr && args.ptr_lse != nullptr;
   }
 
   template <class AccPV, class Lse, class TiledMmaPV, class WorkTile>

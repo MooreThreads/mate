@@ -7,6 +7,7 @@ from mate.jit.msa_ops import (
     _msa_fwd,
     gen_msa_ops_aot,
     make_msa_fwd_config,
+    make_msa_fwd_mixed_config,
 )
 
 
@@ -26,9 +27,30 @@ def test_msa_fwd_config_uses_the_fixed_sqmma_tile_shape(dtype, element):
     assert config["element"] == element
     assert config["head_ratio"] == 16
     assert config["head_dim"] == 128
+    assert config["tile_q"] == 128
     assert config["tile_kv"] == 128
     assert config["topk"] == 16
+    assert config["element_output_dtype"] == config["element_dtype"]
+    assert not config["mixed_pv"]
     assert not {"q_stages", "k_stages", "v_stages"}.intersection(config)
+
+
+@pytest.mark.parametrize("q_block_size", [64, 128])
+@pytest.mark.parametrize("topk", [8, 16, 24, 32])
+def test_msa_fwd_mixed_config_specializes_query_block_and_topk(
+    q_block_size: int,
+    topk: int,
+):
+    config = make_msa_fwd_mixed_config(topk, q_block_size)
+
+    assert config["name"] == f"bf16_fp8pv_bf16out_qb{q_block_size}_topk{topk}"
+    assert config["tile_q"] == q_block_size
+    assert config["tile_kv"] == 128
+    assert config["topk"] == topk
+    assert config["element_dtype"] == "dl_bfloat16"
+    assert config["element_pv_dtype"] == "dl_float8_e4m3fn"
+    assert config["element_output_dtype"] == "dl_bfloat16"
+    assert config["mixed_pv"]
 
 
 def test_msa_aot_specs_cover_all_forward_dtypes_and_causal_modes():
@@ -54,7 +76,7 @@ def test_msa_fwd_rejects_unsupported_sqmma_head_ratio():
     qo_offset = torch.tensor([127], dtype=torch.int32, device="cpu")
     page_table = torch.tensor([[0]], dtype=torch.int32, device="cpu")
 
-    with pytest.raises(ValueError, match="8 or 16"):
+    with pytest.raises(ValueError, match="1, 8, or 16"):
         _msa_fwd(
             q,
             k,
@@ -68,6 +90,51 @@ def test_msa_fwd_rejects_unsupported_sqmma_head_ratio():
             max_seqlen_k=128,
             causal=True,
         )
+
+
+def test_msa_fwd_ratio1_accepts_block_level_querypack16_lut(monkeypatch):
+    q = torch.empty((256, 1, 128), dtype=torch.float16, device="cpu")
+    k = torch.empty((16, 128, 1, 128), dtype=torch.float16, device="cpu")
+    v = torch.empty_like(k)
+    blocks = torch.zeros((2, 1, 16), dtype=torch.int32, device="cpu")
+    cu_q = torch.tensor([0, 256], dtype=torch.int32, device="cpu")
+    kv_len = torch.tensor([2048], dtype=torch.int32, device="cpu")
+    qo_offset = torch.tensor([0], dtype=torch.int32, device="cpu")
+    page_table = torch.arange(16, dtype=torch.int32).view(1, 16)
+    calls = []
+
+    class FakeModule:
+        def get_function(self, name):
+            assert name == "msa_fwd_f16_causal_0"
+
+            def fake_kernel(*args):
+                calls.append(args)
+
+            return fake_kernel
+
+    monkeypatch.setattr(
+        "mate.jit.msa_ops.get_msa_fwd_module",
+        lambda dtype, causal: FakeModule(),
+    )
+
+    out, lse = _msa_fwd(
+        q,
+        k,
+        v,
+        blocks,
+        cu_q,
+        kv_len,
+        qo_offset,
+        page_table,
+        max_seqlen_q=256,
+        max_seqlen_k=2048,
+        causal=False,
+    )
+
+    assert out.shape == q.shape
+    assert lse.shape == (256, 1)
+    assert len(calls) == 1
+    assert calls[0][3] is blocks
 
 
 def _online_same_dtype_p_reference(
@@ -139,6 +206,76 @@ def _online_same_dtype_p_reference(
                 )
 
     return out.to(dtype), lse
+
+
+@pytest.mark.skipif(
+    not _HAS_MUSA,
+    reason="MUSA is required for MSA forward",
+)
+def test_msa_fwd_ratio1_querypack16_matches_reference():
+    device = torch.device("musa")
+    dtype = torch.bfloat16
+    total_q = 257
+    num_pages = 20
+    kv_len = num_pages * 128
+    softmax_scale = 128**-0.5
+
+    torch.manual_seed(20260830)
+    q = (torch.randn((total_q, 1, 128), device=device) * 0.25).to(dtype)
+    k = (torch.randn((num_pages, 128, 1, 128), device=device) * 0.25).to(dtype)
+    v = (torch.randn((num_pages, 128, 1, 128), device=device) * 0.25).to(dtype)
+    query_blocks = (total_q + 127) // 128
+    block_indexes_cpu = torch.stack(
+        [
+            (torch.arange(16, dtype=torch.int32) + query_block * 3) % num_pages
+            for query_block in range(query_blocks)
+        ]
+    ).unsqueeze(1)
+    block_indexes = block_indexes_cpu.to(device)
+    cu_seqlens_q = torch.tensor([0, total_q], dtype=torch.int32, device=device)
+    seqused_k = torch.tensor([kv_len], dtype=torch.int32, device=device)
+    qo_offset = torch.tensor([0], dtype=torch.int32, device=device)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+        1, num_pages
+    )
+
+    out, lse = _msa_fwd(
+        q,
+        k,
+        v,
+        block_indexes,
+        cu_seqlens_q,
+        seqused_k,
+        qo_offset,
+        page_table,
+        max_seqlen_q=total_q,
+        max_seqlen_k=kv_len,
+        causal=False,
+        softmax_scale=softmax_scale,
+    )
+    torch.musa.synchronize()
+
+    token_block_indexes = block_indexes_cpu.repeat_interleave(128, dim=0)[:total_q]
+    expected_out, expected_lse = _online_same_dtype_p_reference(
+        q,
+        k,
+        v,
+        token_block_indexes,
+        causal=False,
+        qo_offset=0,
+        kv_len=kv_len,
+        softmax_scale=softmax_scale,
+        dtype=dtype,
+    )
+    actual = out.float().cpu()
+    expected = expected_out.float()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.reshape(-1), expected.reshape(-1), dim=0
+    ).item()
+
+    assert cosine > 0.995
+    assert (actual - expected).abs().max().item() < 0.03
+    assert (lse.float().cpu() - expected_lse).abs().max().item() < 0.02
 
 
 @pytest.mark.parametrize("causal", [False, True])

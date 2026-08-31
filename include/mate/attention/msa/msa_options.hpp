@@ -38,7 +38,14 @@ enum class Tag {
   UseLSULoadK,
   UseLSULoadV,
   PackQueryPair,
+  PackQuery16,
   ParallelKTiles,
+  SparseTopK,
+  SparseQueryBlockSize,
+  UseBlockQKScale,
+  UseQueryQKScale,
+  ElementPV,
+  ElementOutput,
 };
 
 template <class Value>
@@ -78,6 +85,27 @@ template <class Value>
 using PackQueryPair = Option<Tag::PackQueryPair, Value>;
 
 template <class Value>
+using PackQuery16 = Option<Tag::PackQuery16, Value>;
+
+template <class Value>
 using ParallelKTiles = Option<Tag::ParallelKTiles, Value>;
+
+template <class Value>
+using SparseTopK = Option<Tag::SparseTopK, Value>;
+
+template <class Value>
+using SparseQueryBlockSize = Option<Tag::SparseQueryBlockSize, Value>;
+
+template <class Value>
+using UseBlockQKScale = Option<Tag::UseBlockQKScale, Value>;
+
+template <class Value>
+using UseQueryQKScale = Option<Tag::UseQueryQKScale, Value>;
+
+template <class Value>
+using ElementPV = Option<Tag::ElementPV, Value>;
+
+template <class Value>
+using ElementOutput = Option<Tag::ElementOutput, Value>;
 
 }  // namespace mate::attention::msa

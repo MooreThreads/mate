@@ -29,7 +29,7 @@ CUDA_FLAGS = [
     "-mllvm",
     "-mtgpu-load-cluster-mutation=1",
     "-mllvm",
-    "--num-dwords-of-load-in-mutation=64",
+    "--num-dwords-of-load-in-mutation=32",
 ]
 
 INCLUDE_PATHS = [
@@ -464,14 +464,141 @@ def make_msa_fwd_config(
     dtype: Optional[torch.dtype] = None,
 ) -> dict[str, object]:
     dtype = _resolve_fwd_dtype(dtype)
-    return {
+    config = {
         **MSA_FWD_DTYPE_CONFIG[dtype],
         "causal": bool(causal),
         "head_ratio": 16,
         "head_dim": 128,
+        "tile_q": 128,
         "tile_kv": 128,
         "topk": 16,
+        "mixed_pv": False,
+        "block_qk_scale": False,
+        "query_qk_scale": False,
+        "has_qk_scale": False,
     }
+    config["element_output_dtype"] = config["element_dtype"]
+    return config
+
+
+def make_msa_fwd_mixed_config(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> dict[str, object]:
+    if q_block_size not in (64, 128):
+        raise ValueError(
+            f"mixed-PV MSA q_block_size must be 64 or 128, got {q_block_size}"
+        )
+    name = f"bf16_fp8pv_bf16out_qb{q_block_size}_topk{topk}"
+    return {
+        "name": name,
+        "element": "mutlass::bfloat16_t",
+        "element_dtype": "dl_bfloat16",
+        "element_pv": "mutlass::float_e4m3_t",
+        "element_pv_dtype": "dl_float8_e4m3fn",
+        "element_output": "mutlass::bfloat16_t",
+        "element_output_dtype": "dl_bfloat16",
+        "causal": False,
+        "head_ratio": 16,
+        "head_dim": 128,
+        "tile_q": int(q_block_size),
+        "tile_kv": 128,
+        "topk": int(topk),
+        "mixed_pv": True,
+        "block_qk_scale": False,
+        "query_qk_scale": False,
+        "has_qk_scale": False,
+    }
+
+
+def make_msa_fwd_fp8_bf16out_config(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> dict[str, object]:
+    if _FP8_E4M3_DTYPE is None:
+        raise RuntimeError("torch.float8_e4m3fn is unavailable")
+    if q_block_size not in (64, 128):
+        raise ValueError(f"FP8 MSA q_block_size must be 64 or 128, got {q_block_size}")
+    return {
+        "name": f"fp8qk_fp8pv_bf16out_qb{q_block_size}_topk{topk}",
+        "element": "mutlass::float_e4m3_t",
+        "element_dtype": "dl_float8_e4m3fn",
+        "element_pv": "mutlass::float_e4m3_t",
+        "element_pv_dtype": "dl_float8_e4m3fn",
+        "element_output": "mutlass::bfloat16_t",
+        "element_output_dtype": "dl_bfloat16",
+        "causal": False,
+        "head_ratio": 16,
+        "head_dim": 128,
+        "tile_q": int(q_block_size),
+        "tile_kv": 128,
+        "topk": int(topk),
+        "mixed_pv": True,
+        "block_qk_scale": False,
+        "query_qk_scale": False,
+        "has_qk_scale": False,
+    }
+
+
+def make_msa_fwd_int8_fp8_bf16out_config(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> dict[str, object]:
+    if _FP8_E4M3_DTYPE is None:
+        raise RuntimeError("torch.float8_e4m3fn is unavailable")
+    if q_block_size not in (64, 128):
+        raise ValueError(
+            f"INT8/FP8 MSA q_block_size must be 64 or 128, got {q_block_size}"
+        )
+    return {
+        "name": f"int8qk_fp8pv_bf16out_qb{q_block_size}_topk{topk}",
+        "element": "int8_t",
+        "element_dtype": "dl_int8",
+        "element_pv": "mutlass::float_e4m3_t",
+        "element_pv_dtype": "dl_float8_e4m3fn",
+        "element_output": "mutlass::bfloat16_t",
+        "element_output_dtype": "dl_bfloat16",
+        "causal": False,
+        "head_ratio": 16,
+        "head_dim": 128,
+        "tile_q": int(q_block_size),
+        "tile_kv": 128,
+        "topk": int(topk),
+        "mixed_pv": True,
+        "block_qk_scale": False,
+        "query_qk_scale": True,
+        "has_qk_scale": True,
+    }
+
+
+def make_msa_fwd_int8_global_fp8_bf16out_config(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> dict[str, object]:
+    config = make_msa_fwd_int8_fp8_bf16out_config(topk, q_block_size)
+    config.update(
+        {
+            "name": f"int8qk_global_fp8pv_bf16out_qb{q_block_size}_topk{topk}",
+            "query_qk_scale": False,
+            "has_qk_scale": False,
+        }
+    )
+    return config
+
+
+def make_msa_fwd_int8_block_fp8_bf16out_config(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> dict[str, object]:
+    config = make_msa_fwd_int8_fp8_bf16out_config(topk, q_block_size)
+    config.update(
+        {
+            "name": f"int8qk_blockfused_fp8pv_bf16out_qb{q_block_size}_topk{topk}",
+            "block_qk_scale": True,
+            "query_qk_scale": False,
+        }
+    )
+    return config
 
 
 def _render_msa_fwd_kernel_source(config: dict[str, object]) -> str:
@@ -501,9 +628,122 @@ def gen_msa_fwd_spec(
     )
 
 
+def gen_msa_fwd_mixed_spec(topk: int = 16, q_block_size: int = 128) -> JitSpec:
+    config = make_msa_fwd_mixed_config(topk, q_block_size)
+    dispatch_name = f"msa_fwd_{config['name']}_causal_0"
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        dispatch_name,
+        [source_file],
+        generated_sources={source_file: _render_msa_fwd_kernel_source(config)},
+        extra_cflags=list(CXX_FLAGS),
+        extra_cuda_cflags=list(CUDA_FLAGS),
+        extra_include_paths=list(INCLUDE_PATHS),
+    )
+
+
+def gen_msa_fwd_fp8_bf16out_spec(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> JitSpec:
+    config = make_msa_fwd_fp8_bf16out_config(topk, q_block_size)
+    dispatch_name = f"msa_fwd_{config['name']}_causal_0"
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        dispatch_name,
+        [source_file],
+        generated_sources={source_file: _render_msa_fwd_kernel_source(config)},
+        extra_cflags=list(CXX_FLAGS),
+        extra_cuda_cflags=list(CUDA_FLAGS),
+        extra_include_paths=list(INCLUDE_PATHS),
+    )
+
+
+def gen_msa_fwd_int8_fp8_bf16out_spec(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> JitSpec:
+    config = make_msa_fwd_int8_fp8_bf16out_config(topk, q_block_size)
+    dispatch_name = f"msa_fwd_{config['name']}_causal_0"
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        dispatch_name,
+        [source_file],
+        generated_sources={source_file: _render_msa_fwd_kernel_source(config)},
+        extra_cflags=list(CXX_FLAGS),
+        extra_cuda_cflags=list(CUDA_FLAGS),
+        extra_include_paths=list(INCLUDE_PATHS),
+    )
+
+
+def gen_msa_fwd_int8_global_fp8_bf16out_spec(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> JitSpec:
+    config = make_msa_fwd_int8_global_fp8_bf16out_config(topk, q_block_size)
+    dispatch_name = f"msa_fwd_{config['name']}_causal_0"
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        dispatch_name,
+        [source_file],
+        generated_sources={source_file: _render_msa_fwd_kernel_source(config)},
+        extra_cflags=list(CXX_FLAGS),
+        extra_cuda_cflags=list(CUDA_FLAGS),
+        extra_include_paths=list(INCLUDE_PATHS),
+    )
+
+
+def gen_msa_fwd_int8_block_fp8_bf16out_spec(
+    topk: int = 16,
+    q_block_size: int = 128,
+) -> JitSpec:
+    config = make_msa_fwd_int8_block_fp8_bf16out_config(topk, q_block_size)
+    dispatch_name = f"msa_fwd_{config['name']}_causal_0"
+    source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
+    return gen_jit_spec(
+        dispatch_name,
+        [source_file],
+        generated_sources={source_file: _render_msa_fwd_kernel_source(config)},
+        extra_cflags=list(CXX_FLAGS),
+        extra_cuda_cflags=list(CUDA_FLAGS),
+        extra_include_paths=list(INCLUDE_PATHS),
+    )
+
+
 @functools.cache
 def get_msa_fwd_module(dtype: torch.dtype, causal: bool):
     return gen_msa_fwd_spec(dtype=dtype, causal=causal).build_and_load()
+
+
+@functools.cache
+def get_msa_fwd_mixed_module(topk: int = 16, q_block_size: int = 128):
+    return gen_msa_fwd_mixed_spec(topk, q_block_size).build_and_load()
+
+
+@functools.cache
+def get_msa_fwd_fp8_bf16out_module(topk: int = 16, q_block_size: int = 128):
+    return gen_msa_fwd_fp8_bf16out_spec(topk, q_block_size).build_and_load()
+
+
+@functools.cache
+def get_msa_fwd_int8_fp8_bf16out_module(topk: int = 16, q_block_size: int = 128):
+    return gen_msa_fwd_int8_fp8_bf16out_spec(topk, q_block_size).build_and_load()
+
+
+@functools.cache
+def get_msa_fwd_int8_global_fp8_bf16out_module(
+    topk: int = 16,
+    q_block_size: int = 128,
+):
+    return gen_msa_fwd_int8_global_fp8_bf16out_spec(topk, q_block_size).build_and_load()
+
+
+@functools.cache
+def get_msa_fwd_int8_block_fp8_bf16out_module(
+    topk: int = 16,
+    q_block_size: int = 128,
+):
+    return gen_msa_fwd_int8_block_fp8_bf16out_spec(topk, q_block_size).build_and_load()
 
 
 def _require_int32_vector(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -564,20 +804,30 @@ def _msa_fwd(
     total_q = int(q.shape[0])
     num_q_heads = int(q.shape[1])
     num_kv_heads = int(k.shape[2])
+    batch_size = int(cu_seqlens_q.numel() - 1)
     if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
         raise ValueError("MSA SQMMA forward requires Hq to be divisible by Hkv")
-    if num_q_heads // num_kv_heads not in (8, 16):
-        raise ValueError("MSA SQMMA forward requires local Hq/Hkv ratio 8 or 16")
-    expected_blocks_shape = (total_q, num_kv_heads, 16)
-    if tuple(kv_block_indexes.shape) != expected_blocks_shape:
+    head_ratio = num_q_heads // num_kv_heads
+    if head_ratio not in (1, 8, 16):
+        raise ValueError("MSA SQMMA forward requires local Hq/Hkv ratio 1, 8, or 16")
+    token_blocks_shape = (total_q, num_kv_heads, 16)
+    query_block_rows = batch_size * ((int(max_seqlen_q) + 127) // 128)
+    query_blocks_shape = (query_block_rows, num_kv_heads, 16)
+    query_pack16 = (
+        head_ratio == 1
+        and not causal
+        and total_q > 1
+        and tuple(kv_block_indexes.shape) == query_blocks_shape
+    )
+    if tuple(kv_block_indexes.shape) != token_blocks_shape and not query_pack16:
         raise ValueError(
-            f"kv_block_indexes must have shape {expected_blocks_shape}, "
+            f"kv_block_indexes must have shape {token_blocks_shape}, or "
+            f"{query_blocks_shape} for non-causal ratio-1 QueryPack16; "
             f"got {tuple(kv_block_indexes.shape)}"
         )
     if kv_block_indexes.dtype != torch.int32:
         raise TypeError("kv_block_indexes must use torch.int32")
 
-    batch_size = int(cu_seqlens_q.numel() - 1)
     if tuple(seqused_k.shape) != (batch_size,):
         raise ValueError("seqused_k must contain one value per batch")
     if tuple(qo_offset.shape) != (batch_size,):

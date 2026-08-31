@@ -28,22 +28,31 @@ using namespace mute;
 // so no K-to-Q CSR schedule or partial-output combine is involved.
 template <class Element_, int QStages_ = 1, int KStages_ = 2, int VStages_ = 2, class... Options_>
 struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
-  using Element            = Element_;
-  using ElementAccumulator = float;
+  using Element                  = Element_;
+  using ElementPV                = find_option_t<Tag::ElementPV, Element, Options_...>;
+  using ElementAccumulator       = float;
+  static constexpr bool IsInt8QK = std::is_same_v<Element, int8_t>;
+  using ElementAccumulatorQK     = std::conditional_t<IsInt8QK, int32_t, float>;
 
-  static constexpr bool IsCausal      = find_option_t<Tag::IsCausal, std::false_type, Options_...>::value;
-  static constexpr bool PackQueryPair = find_option_t<Tag::PackQueryPair, std::false_type, Options_...>::value;
+  static constexpr bool IsCausal        = find_option_t<Tag::IsCausal, std::false_type, Options_...>::value;
+  static constexpr bool PackQueryPair   = find_option_t<Tag::PackQueryPair, std::false_type, Options_...>::value;
+  static constexpr bool PackQuery16     = find_option_t<Tag::PackQuery16, std::false_type, Options_...>::value;
+  static constexpr bool UseBlockQKScale = find_option_t<Tag::UseBlockQKScale, std::false_type, Options_...>::value;
+  static constexpr bool UseQueryQKScale = find_option_t<Tag::UseQueryQKScale, std::false_type, Options_...>::value;
+  static_assert(!(PackQueryPair && PackQuery16));
 
-  // SQMMA is physically M=16. The logical GQA ratio is runtime 8 or 16; for
-  // ratio 8 the Q TME descriptor has extent 8 and hardware OOB constant-fill
-  // supplies the unused physical rows.
-  static constexpr int HeadRatio         = 16;
-  static constexpr int TileM             = HeadRatio;
-  static constexpr int TileN             = 128;
-  static constexpr int HeadDim           = 128;
-  static constexpr int SparseBlockSize   = 128;
-  static constexpr int PageSize          = SparseBlockSize;
-  static constexpr int TopK              = 16;
+  // SQMMA is physically M=16. The logical GQA ratio is runtime 1, 8, or 16;
+  // smaller ratios use a correspondingly smaller Q TME extent and hardware
+  // OOB constant-fill supplies the unused physical rows.
+  static constexpr int HeadRatio       = 16;
+  static constexpr int TileM           = HeadRatio;
+  static constexpr int TileN           = 128;
+  static constexpr int HeadDim         = 128;
+  static constexpr int SparseBlockSize = 128;
+  static constexpr int SparseQueryBlockSize =
+      find_option_t<Tag::SparseQueryBlockSize, std::integral_constant<int, SparseBlockSize>, Options_...>::value;
+  static constexpr int PageSize = SparseBlockSize;
+  static constexpr int TopK     = find_option_t<Tag::SparseTopK, std::integral_constant<int, 16>, Options_...>::value;
   static constexpr int PairUnionCapacity = 2 * TopK;
   static constexpr int QStages           = QStages_;
   static constexpr int KStages           = KStages_;
@@ -66,27 +75,38 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   // 128 bits; both choices contain 16 elements.
   static constexpr int KLoadVectorBits = 16 * sizeof_bits_v<Element>;
 
-  static constexpr bool IsSupportedElement = std::is_same_v<Element, mutlass::float_e4m3_t> ||
-                                             std::is_same_v<Element, mutlass::half_t> ||
-                                             std::is_same_v<Element, mutlass::bfloat16_t>;
-  static_assert(IsSupportedElement, "MSA forward supports FP8 E4M3, FP16, and BF16.");
-  static_assert(QStages == 1, "Q is resident for one MSA forward work item and uses one stage.");
+  static constexpr bool IsSupportedElement =
+      std::is_same_v<Element, mutlass::float_e4m3_t> || std::is_same_v<Element, mutlass::half_t> ||
+      std::is_same_v<Element, mutlass::bfloat16_t> || std::is_same_v<Element, int8_t>;
+  static constexpr bool IsSupportedElementPV = std::is_same_v<ElementPV, mutlass::float_e4m3_t> ||
+                                               std::is_same_v<ElementPV, mutlass::half_t> ||
+                                               std::is_same_v<ElementPV, mutlass::bfloat16_t>;
+  static_assert(IsSupportedElement, "MSA forward supports INT8, FP8 E4M3, FP16, and BF16.");
+  static_assert(IsSupportedElementPV, "MSA PV supports FP8 E4M3, FP16, and BF16.");
+  static_assert(QStages == (PackQuery16 ? 2 : 1),
+                "QueryPack16 keeps two Q tiles resident; other paths use one Q stage.");
   static_assert(KStages >= 1 && VStages >= 1, "K/V TME pipelines require at least one stage.");
+  static_assert(SparseQueryBlockSize == 64 || SparseQueryBlockSize == 128,
+                "QueryPack16 supports 64- or 128-token sparse query blocks.");
   static_assert(NumMmaWarpSquads == 1, "TileM=16 requires exactly one SQMMA consumer warp-squad.");
 
   using TileShapeQK = Shape<Int<TileM>, Int<TileN>, Int<HeadDim>>;
   using TileShapePV = Shape<Int<TileM>, Int<HeadDim>, Int<TileN>>;
 
   using AtomLayoutQK = Layout<Shape<_1, _1, _1>>;
-  using TiledMmaQK   = decltype(mute::make_tiled_mma(
-      mute::MP31::SQMMA::
-          ss_op_selector<Element, Element, ElementAccumulator, TileShapeQK, TCE::Major::K, TCE::Major::K, Int<TileM>>(),
-      AtomLayoutQK{}));
+  using TiledMmaQK   = decltype(mute::make_tiled_mma(mute::MP31::SQMMA::ss_op_selector<Element,
+                                                                                       Element,
+                                                                                       ElementAccumulatorQK,
+                                                                                       TileShapeQK,
+                                                                                       TCE::Major::K,
+                                                                                       TCE::Major::K,
+                                                                                       Int<TileM>>(),
+                                                   AtomLayoutQK{}));
   static_assert(decltype(size(TiledMmaQK{}))::value == NumConsumerThreads);
 
   using AtomLayoutPV = Layout<Shape<_1, _1, _1>>;
-  using TiledMmaPV   = decltype(mute::make_tiled_mma(mute::MP31::SQMMA::ss_op_selector<Element,
-                                                                                       Element,
+  using TiledMmaPV   = decltype(mute::make_tiled_mma(mute::MP31::SQMMA::ss_op_selector<ElementPV,
+                                                                                       ElementPV,
                                                                                        ElementAccumulator,
                                                                                        TileShapePV,
                                                                                        TCE::Major::K,
@@ -103,10 +123,10 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
                    ss_smem_selector_B<TCE::Major::K, Element, typename TiledMmaQK::Atom::MMA_Op, TileShapeQK>());
   using SmemAtomLayoutP =
       decltype(mutlass::gemm::collective::detail::
-                   ss_smem_selector_A<TCE::Major::K, Element, typename TiledMmaPV::Atom::MMA_Op, TileShapePV>());
+                   ss_smem_selector_A<TCE::Major::K, ElementPV, typename TiledMmaPV::Atom::MMA_Op, TileShapePV>());
   using SmemAtomLayoutV =
       decltype(mutlass::gemm::collective::detail::
-                   ss_smem_selector_B<TCE::Major::MN, Element, typename TiledMmaPV::Atom::MMA_Op, TileShapePV>());
+                   ss_smem_selector_B<TCE::Major::MN, ElementPV, typename TiledMmaPV::Atom::MMA_Op, TileShapePV>());
 
   using SmemLayoutQ = decltype(tile_to_shape(
       SmemAtomLayoutQ{}, make_shape(shape<0>(TileShapeQK{}), shape<2>(TileShapeQK{}), Int<QStages>{})));
@@ -117,12 +137,14 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   using SmemLayoutV = decltype(tile_to_shape(
       SmemAtomLayoutV{}, make_shape(shape<1>(TileShapePV{}), shape<2>(TileShapePV{}), Int<VStages>{})));
 
-  // Q is physically [total_q, Hq, D]. The ordinary path maps one query's 16
-  // heads to M16. The pair path maps (8 heads, 2 adjacent queries) to those
-  // same 16 physical rows.
-  using QRowTile       = std::conditional_t<PackQueryPair,
-                                            Layout<Shape<_8, _2>, Stride<_1, _8>>,
-                                            Layout<Shape<Int<HeadRatio>, _1>, Stride<_1, Int<HeadRatio>>>>;
+  // Q is physically [total_q, Hq, D]. Packed paths use the token coordinate
+  // to fill M16: 8 heads x 2 tokens, or 1 head x 16 tokens.
+  using QRowTile =
+      std::conditional_t<PackQueryPair,
+                         Layout<Shape<_8, _2>, Stride<_1, _8>>,
+                         std::conditional_t<PackQuery16,
+                                            Layout<Shape<_1, _16>, Stride<_1, _1>>,
+                                            Layout<Shape<Int<HeadRatio>, _1>, Stride<_1, Int<HeadRatio>>>>>;
   using SmemLayoutQTme = decltype(flatten(composition(SmemLayoutQ{}, make_tile(QRowTile{}, _, _))));
 
   using ShapeQTme  = Shape<int32_t, int32_t, int32_t, int32_t>;  // (head_local, token_q, d, head_kv)
@@ -132,8 +154,10 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   using ShapeVTme  = Shape<int32_t, int32_t, int32_t, int32_t>;  // (d, token_in_page, head_kv, page)
   using StrideVTme = Stride<_1, int64_t, int64_t, int64_t>;
 
-  using TmeTileShapeQ =
-      std::conditional_t<PackQueryPair, Shape<_8, _2, Int<HeadDim>>, Shape<Int<HeadRatio>, _1, Int<HeadDim>>>;
+  using TmeTileShapeQ = std::conditional_t<
+      PackQueryPair,
+      Shape<_8, _2, Int<HeadDim>>,
+      std::conditional_t<PackQuery16, Shape<_1, _16, Int<HeadDim>>, Shape<Int<HeadRatio>, _1, Int<HeadDim>>>>;
   using TmeTileShapeV = Shape<Int<HeadDim>, Int<TileN>>;
 
   using TME_Q = decltype(make_tme_copy(
@@ -157,21 +181,21 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   using TME_V = decltype(make_tme_copy(
       MP31_TME_LOAD{},
       make_tensor(
-          make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideVTme{}, int32_t(0)), StrideVTme{}),
+          make_gmem_ptr(static_cast<ElementPV const*>(nullptr)), repeat_like(StrideVTme{}, int32_t(0)), StrideVTme{}),
       take<0, 2>(SmemLayoutV{})));
 
   // P is converted and stored through 128-bit register/shared-memory vectors.
   // This is independent of the wider 16-bit K TME permutation above.
-  static constexpr int CvtFragmentSize = 128 / sizeof_bits_v<Element>;
+  static constexpr int CvtFragmentSize = 128 / sizeof_bits_v<ElementPV>;
   using FragmentTypeR2S                = mute::uint_bit_t<128>;
   static_assert(TmeLoadKBuilder::Fragment == 16, "K TME permutation must span 16 elements.");
-  static_assert(CvtFragmentSize * sizeof_bits_v<Element> == 128, "P conversion must use 128-bit fragments.");
+  static_assert(CvtFragmentSize * sizeof_bits_v<ElementPV> == 128, "P conversion must use 128-bit fragments.");
   static_assert(TmeLoadKBuilder::Fragment % CvtFragmentSize == 0,
                 "P conversion fragments must evenly partition the K permutation.");
   using PermuteTileForQK = Tile<Underscore, typename TmeLoadKBuilder::MmaPermuteTile, Underscore>;
   using PermuteTiledMmaQK =
       decltype(::mate::attention::fmha::convert_to_permuted_mma(TiledMmaQK{}, PermuteTileForQK{}));
-  using R2SCopyAtom  = Copy_Atom<UniversalCopy<FragmentTypeR2S>, Element>;
+  using R2SCopyAtom  = Copy_Atom<UniversalCopy<FragmentTypeR2S>, ElementPV>;
   using R2STiledCopy = decltype(make_tiled_copy_C(R2SCopyAtom{}, PermuteTiledMmaQK{}));
 
   using MainloopPipelineQ = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<QStages>;
@@ -189,11 +213,11 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   static constexpr int TmeTransactionBytesK =
       mutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutK{})) * sizeof_bits_v<Element>);
   static constexpr int TmeTransactionBytesV =
-      mutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutV{})) * sizeof_bits_v<Element>);
+      mutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutV{})) * sizeof_bits_v<ElementPV>);
 
   static_assert(TmeTransactionBytesQ == TileM * HeadDim * int(sizeof(Element)));
   static_assert(TmeTransactionBytesK == TileN * HeadDim * int(sizeof(Element)));
-  static_assert(TmeTransactionBytesV == TileN * HeadDim * int(sizeof(Element)));
+  static_assert(TmeTransactionBytesV == TileN * HeadDim * int(sizeof(ElementPV)));
 
   struct PairUnionStorage {
     alignas(16) int blocks[PairUnionCapacity];
@@ -204,11 +228,11 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   using PairUnionStorageT = std::conditional_t<PackQueryPair, PairUnionStorage, EmptyPairUnionStorage>;
 
   struct SharedStorage {
-    mute::array_aligned<Element, cosize_v<SmemLayoutQ>, SmemAlignmentBytes> smem_q;
-    mute::array_aligned<Element, cosize_v<SmemLayoutK>, SmemAlignmentBytes> smem_k;
-    mute::array_aligned<Element, cosize_v<SmemLayoutP>, SmemAlignmentBytes> smem_p;
-    mute::array_aligned<Element, cosize_v<SmemLayoutV>, SmemAlignmentBytes> smem_v;
-    PairUnionStorageT                                                       pair_union;
+    mute::array_aligned<Element, cosize_v<SmemLayoutQ>, SmemAlignmentBytes>   smem_q;
+    mute::array_aligned<Element, cosize_v<SmemLayoutK>, SmemAlignmentBytes>   smem_k;
+    mute::array_aligned<ElementPV, cosize_v<SmemLayoutP>, SmemAlignmentBytes> smem_p;
+    mute::array_aligned<ElementPV, cosize_v<SmemLayoutV>, SmemAlignmentBytes> smem_v;
+    PairUnionStorageT                                                         pair_union;
   };
   static_assert(sizeof(SharedStorage) <= 196608, "MSA forward exceeds MP31 shared-memory capacity.");
 
@@ -228,33 +252,38 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   // folding k_scale into the logits scale, while v_scale is folded into the
   // existing final softmax normalization before O is cast to Element.
   struct Arguments {
-    Element const* ptr_q              = nullptr;
-    Element const* ptr_k              = nullptr;
-    Element const* ptr_v              = nullptr;
-    int32_t const* ptr_q2k            = nullptr;
-    int32_t const* ptr_page_table     = nullptr;
-    int32_t const* ptr_kv_page_indptr = nullptr;
-    float          softmax_scale      = 1.0f;
-    float          k_scale            = 1.0f;
-    float          v_scale            = 1.0f;
+    Element const*   ptr_q              = nullptr;
+    Element const*   ptr_k              = nullptr;
+    ElementPV const* ptr_v              = nullptr;
+    float const*     ptr_q_scale        = nullptr;
+    float const*     ptr_k_scale        = nullptr;
+    int32_t const*   ptr_q2k            = nullptr;
+    int32_t const*   ptr_page_table     = nullptr;
+    int32_t const*   ptr_kv_page_indptr = nullptr;
+    float            softmax_scale      = 1.0f;
+    float            k_scale            = 1.0f;
+    float            v_scale            = 1.0f;
   };
 
   struct TensorParams {
-    Element const* ptr_q;
-    Element const* ptr_k;
-    Element const* ptr_v;
-    int32_t const* ptr_q2k;
-    int32_t const* ptr_page_table;
-    int32_t const* ptr_kv_page_indptr;
-    int            total_q;
-    int            total_k;
-    int            num_qo_heads;
-    int            num_kv_heads;
-    int            num_pages;
-    int            max_pages_per_batch;
-    float          softmax_scale;
-    float          softmax_scale_log2;
-    float          v_scale;
+    Element const*   ptr_q;
+    Element const*   ptr_k;
+    ElementPV const* ptr_v;
+    float const*     ptr_q_scale;
+    float const*     ptr_k_scale;
+    int32_t const*   ptr_q2k;
+    int32_t const*   ptr_page_table;
+    int32_t const*   ptr_kv_page_indptr;
+    int              total_q;
+    int              total_k;
+    int              num_qo_heads;
+    int              num_kv_heads;
+    int              num_pages;
+    int              max_pages_per_batch;
+    int              max_q_blocks_per_batch;
+    float            softmax_scale;
+    float            softmax_scale_log2;
+    float            v_scale;
   };
 
   struct TmeLoadQParams {
@@ -350,12 +379,15 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     Tensor mK = make_tensor(make_gmem_ptr(args.ptr_k), shape_k, stride_k);
     Tensor mV = make_tensor(make_gmem_ptr(args.ptr_v), shape_v, stride_v);
 
-    constexpr float Log2e                   = 1.4426950408889634f;
-    float const     effective_softmax_scale = args.softmax_scale * args.k_scale;
-    TensorParams    tensor_args{
+    constexpr float Log2e = 1.4426950408889634f;
+    float const     effective_softmax_scale =
+        (UseBlockQKScale || UseQueryQKScale) ? args.softmax_scale : args.softmax_scale * args.k_scale;
+    TensorParams tensor_args{
         args.ptr_q,
         args.ptr_k,
         args.ptr_v,
+        args.ptr_q_scale,
+        args.ptr_k_scale,
         args.ptr_q2k,
         args.ptr_page_table,
         args.ptr_kv_page_indptr,
@@ -365,6 +397,7 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
         problem_size.num_kv_heads,
         num_pages,
         max_pages_per_batch,
+        mutlass::ceil_div(problem_size.max_seqlen_q, SparseQueryBlockSize),
         effective_softmax_scale,
         effective_softmax_scale * Log2e,
         args.v_scale,
@@ -399,14 +432,29 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
         return false;
       }
     }
+    if constexpr (PackQuery16) {
+      if (ratio != 1 || IsCausal) {
+        return false;
+      }
+    }
     return problem_size.batch_size > 0 && problem_size.total_k > 0 && problem_size.num_kv_heads > 0 &&
-           problem_size.num_qo_heads % problem_size.num_kv_heads == 0 && (ratio == 8 || ratio == HeadRatio) &&
-           problem_size.max_seqlen_q > 0 && problem_size.max_seqlen_k > 0 && args.ptr_q != nullptr &&
-           args.ptr_k != nullptr && args.ptr_v != nullptr && args.ptr_q2k != nullptr && args.ptr_page_table != nullptr;
+           problem_size.num_qo_heads % problem_size.num_kv_heads == 0 &&
+           (ratio == 1 || ratio == 8 || ratio == HeadRatio) && problem_size.max_seqlen_q > 0 &&
+           problem_size.max_seqlen_k > 0 && args.ptr_q != nullptr && args.ptr_k != nullptr && args.ptr_v != nullptr &&
+           args.ptr_q2k != nullptr && args.ptr_page_table != nullptr;
   }
 
   MUTLASS_DEVICE static int sparse_block(Params const& params, int q_abs, int head_kv, int topk_slot) {
     int64_t offset = (int64_t(q_abs) * params.args.num_kv_heads + int64_t(head_kv)) * TopK + int64_t(topk_slot);
+    return params.args.ptr_q2k[offset];
+  }
+
+  template <class WorkTile>
+  MUTLASS_DEVICE static int query_pack_sparse_block(Params const& params, WorkTile const& work_tile, int topk_slot) {
+    static_assert(PackQuery16, "block-level LUT is only valid for QueryPack16");
+    int q_block = work_tile.batch_idx * params.args.max_q_blocks_per_batch + work_tile.q_local / SparseQueryBlockSize;
+    int64_t offset =
+        (int64_t(q_block) * params.args.num_kv_heads + int64_t(work_tile.head_kv)) * TopK + int64_t(topk_slot);
     return params.args.ptr_q2k[offset];
   }
 
@@ -686,14 +734,23 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
                               WorkTile const& work_tile) const {
     int64_t page_begin    = page_table_begin(params, work_tile);
     int     num_blocks    = selected_block_count(work_tile);
-    int     logical_block = sparse_block(params, work_tile.q_abs, work_tile.head_kv, 0);
-    int     previous_page = physical_page(params, work_tile, page_begin, logical_block);
+    int     logical_block = 0;
+    if constexpr (PackQuery16) {
+      logical_block = query_pack_sparse_block(params, work_tile, 0);
+    } else {
+      logical_block = sparse_block(params, work_tile.q_abs, work_tile.head_kv, 0);
+    }
+    int previous_page = physical_page(params, work_tile, page_begin, logical_block);
 
     issue_k(params, pipeline, shared_storage, work_tile, previous_page);
 
     MUTLASS_PRAGMA_NO_UNROLL
     for (int topk_slot = 1; topk_slot < num_blocks; ++topk_slot) {
-      logical_block    = sparse_block(params, work_tile.q_abs, work_tile.head_kv, topk_slot);
+      if constexpr (PackQuery16) {
+        logical_block = query_pack_sparse_block(params, work_tile, topk_slot);
+      } else {
+        logical_block = sparse_block(params, work_tile.q_abs, work_tile.head_kv, topk_slot);
+      }
       int current_page = physical_page(params, work_tile, page_begin, logical_block);
       issue_k(params, pipeline, shared_storage, work_tile, current_page);
       issue_v(params, pipeline, shared_storage, work_tile, previous_page);
@@ -752,6 +809,66 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   MUTLASS_DEVICE void release_v(Pipeline& pipeline) const {
     pipeline.v.consumer_release(pipeline.v_read);
     ++pipeline.v_read;
+  }
+
+  template <class TiledMma, class TensorA, class TensorB>
+  MUTLASS_DEVICE auto mma_qk_to_float(TiledMma const& tiled_mma_qk,
+                                      TensorA const&  operand_q,
+                                      TensorB const&  operand_k) const {
+    Tensor acc_raw = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
+    clear(acc_raw);
+    mute::gemm(tiled_mma_qk, operand_q, operand_k, acc_raw);
+    mate::warpsquad_commit_batch();
+    mate::warpsquad_wait();
+    if constexpr (IsInt8QK) {
+      Tensor acc_float = make_fragment_like<ElementAccumulator>(acc_raw);
+      ::mate::attention::fmha::convert_type(acc_raw, acc_float);
+      return acc_float;
+    } else {
+      return acc_raw;
+    }
+  }
+
+  template <class WorkTile>
+  MUTLASS_DEVICE float block_qk_scale(Params const&   params,
+                                      WorkTile const& work_tile,
+                                      int             logical_block,
+                                      int             consumer_thread_idx) const {
+    if constexpr (!UseBlockQKScale) {
+      return 1.0f;
+    } else {
+      int   lane_idx = consumer_thread_idx % NumThreadsPerWarp;
+      float qk_scale = 1.0f;
+      if (lane_idx == 0) {
+        int q_block =
+            work_tile.batch_idx * params.args.max_q_blocks_per_batch + work_tile.q_local / SparseQueryBlockSize;
+        int k_block = work_tile.batch_idx * params.args.max_pages_per_batch +
+                      max(0, min(logical_block, params.args.max_pages_per_batch - 1));
+        float q_scale = params.args.ptr_q_scale[int64_t(q_block) * params.args.num_kv_heads + work_tile.head_kv];
+        float k_scale = params.args.ptr_k_scale[int64_t(k_block) * params.args.num_kv_heads + work_tile.head_kv];
+        qk_scale      = q_scale * k_scale;
+      }
+      return __shfl_sync(uint32_t(-1), qk_scale, 0);
+    }
+  }
+
+  template <class WorkTile>
+  MUTLASS_DEVICE float query_qk_scale(Params const& params, WorkTile const& work_tile, int consumer_thread_idx) const {
+    if constexpr (!UseQueryQKScale) {
+      return 1.0f;
+    } else {
+      int   lane_idx = consumer_thread_idx % NumThreadsPerWarp;
+      float scale    = 1.0f;
+      if (lane_idx == 0) {
+        int q_block =
+            work_tile.batch_idx * params.args.max_q_blocks_per_batch + work_tile.q_local / SparseQueryBlockSize;
+        int   k_block = work_tile.batch_idx * params.args.max_pages_per_batch;
+        float q_scale = params.args.ptr_q_scale[int64_t(q_block) * params.args.num_kv_heads + work_tile.head_kv];
+        float k_scale = params.args.ptr_k_scale[int64_t(k_block) * params.args.num_kv_heads + work_tile.head_kv];
+        scale         = q_scale * k_scale;
+      }
+      return __shfl_sync(uint32_t(-1), scale, 0);
+    }
   }
 
   template <class WorkTile, class AccQK>
@@ -885,6 +1002,188 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     }
   }
 
+  template <class WorkTile, class AccQK>
+  MUTLASS_DEVICE void apply_query_pack_qk_mask(WorkTile const& work_tile,
+                                               int             logical_block,
+                                               int             consumer_thread_idx,
+                                               AccQK&          acc_qk) const {
+    static_assert(PackQuery16, "query-pack masking is only valid for QueryPack16");
+    float neg_inf = -std::numeric_limits<float>::infinity();
+    if (!valid_sparse_block(work_tile, logical_block)) {
+      mute::fill(acc_qk, neg_inf);
+      return;
+    }
+
+    int  logical_begin     = logical_block * SparseBlockSize;
+    bool whole_block_valid = work_tile.q_count == TileM && logical_begin + TileN <= work_tile.kv_len;
+    if (whole_block_valid) {
+      return;
+    }
+
+    TiledMmaQK tiled_mma_qk;
+    auto       thr_mma_qk = tiled_mma_qk.get_thread_slice(consumer_thread_idx);
+    Tensor     acc_qk_mn =
+        make_tensor(acc_qk.data(), ::mate::attention::fmha::layout_acc_mn(tiled_mma_qk, acc_qk.layout()));
+    Tensor cQK      = make_identity_tensor(make_shape(Int<TileM>{}, Int<TileN>{}));
+    Tensor tCcQK    = thr_mma_qk.partition_C(cQK);
+    Tensor tCcQK_mn = make_tensor(tCcQK.data(), ::mate::attention::fmha::layout_acc_mn(tiled_mma_qk, tCcQK.layout()));
+
+    MUTLASS_PRAGMA_UNROLL
+    for (int m = 0; m < size<0>(acc_qk_mn); ++m) {
+      int  query_in_tile = static_cast<int>(get<0>(tCcQK_mn(m, 0)));
+      bool active_row    = query_in_tile < work_tile.q_count;
+      MUTLASS_PRAGMA_UNROLL
+      for (int n = 0; n < size<1>(acc_qk_mn); ++n) {
+        int mma_col     = static_cast<int>(get<1>(tCcQK_mn(m, n)));
+        int logical_col = (mma_col % (TileN / TmeLoadKBuilder::Fragment)) * TmeLoadKBuilder::Fragment +
+                          mma_col / (TileN / TmeLoadKBuilder::Fragment);
+        if (!active_row || logical_begin + logical_col >= work_tile.kv_len) {
+          acc_qk_mn(m, n) = neg_inf;
+        }
+      }
+    }
+  }
+
+  template <class WorkTile>
+  MUTLASS_DEVICE auto compute_query_pair(Params const&   params,
+                                         Pipeline&       pipeline,
+                                         SharedStorage&  shared_storage,
+                                         WorkTile const& first_work_tile,
+                                         WorkTile const& second_work_tile,
+                                         int             consumer_thread_idx) const {
+    static_assert(PackQuery16, "query-pair compute is only valid for QueryPack16");
+    static_assert(QStages >= 2, "query-pair compute requires two resident Q stages");
+
+    PipelineQState first_q_state = pipeline.q_read;
+    pipeline.q.consumer_wait(first_q_state);
+    ++pipeline.q_read;
+    PipelineQState second_q_state = pipeline.q_read;
+    pipeline.q.consumer_wait(second_q_state);
+    ++pipeline.q_read;
+
+    TiledMmaQK tiled_mma_qk;
+    TiledMmaPV tiled_mma_pv;
+    auto       thr_mma_qk = tiled_mma_qk.get_thread_slice(consumer_thread_idx);
+    auto       thr_mma_pv = tiled_mma_pv.get_thread_slice(consumer_thread_idx);
+
+    Tensor sQ0 = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{})(_, _, first_q_state.index());
+    Tensor sQ1 = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{})(_, _, second_q_state.index());
+    Tensor sK  = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
+    Tensor sP  = make_tensor(make_smem_ptr(shared_storage.smem_p.data()), SmemLayoutP{});
+    Tensor sV  = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
+
+    Tensor tSrQ0 = thr_mma_qk.partition_fragment_A(sQ0);
+    Tensor tSrQ1 = thr_mma_qk.partition_fragment_A(sQ1);
+    Tensor tSrK  = thr_mma_qk.partition_fragment_B(sK);
+    Tensor tSrP  = thr_mma_pv.partition_fragment_A(sP);
+    Tensor tSrV  = thr_mma_pv.partition_fragment_B(sV);
+
+    Tensor acc_pv0 = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
+    Tensor acc_pv1 = partition_fragment_C(tiled_mma_pv, take<0, 2>(TileShapePV{}));
+    clear(acc_pv0);
+    clear(acc_pv1);
+    auto acc_pv0_mn =
+        make_tensor(acc_pv0.data(), ::mate::attention::fmha::layout_acc_mn(tiled_mma_pv, acc_pv0.layout()));
+    constexpr int              SoftmaxRows = decltype(size<0>(acc_pv0_mn))::value;
+    float                      qk_scale0   = query_qk_scale(params, first_work_tile, consumer_thread_idx);
+    float                      qk_scale1   = query_qk_scale(params, second_work_tile, consumer_thread_idx);
+    MsaFwdSoftmax<SoftmaxRows> softmax0{params.args.softmax_scale * qk_scale0,
+                                        params.args.softmax_scale_log2 * qk_scale0};
+    MsaFwdSoftmax<SoftmaxRows> softmax1{params.args.softmax_scale * qk_scale1,
+                                        params.args.softmax_scale_log2 * qk_scale1};
+
+    R2STiledCopy tiled_copy_r2s;
+    auto         thr_copy_r2s = tiled_copy_r2s.get_thread_slice(consumer_thread_idx);
+    Tensor       tPsP         = thr_copy_r2s.partition_D(mute::as_position_independent_swizzle_tensor(sP));
+    auto         write_p      = [&](auto const& acc_qk) {
+      Tensor p_fragment = make_fragment_like<ElementPV>(acc_qk);
+      ::mate::attention::fmha::convert_type<CvtFragmentSize>(acc_qk, p_fragment);
+      Tensor tPrP = thr_copy_r2s.retile_S(p_fragment);
+      copy(tiled_copy_r2s, tPrP, tPsP);
+      __syncwarp();
+    };
+    auto get_logical_block = [&](int topk_slot) {
+      int lane_idx      = consumer_thread_idx % NumThreadsPerWarp;
+      int logical_block = 0;
+      if (lane_idx == 0) {
+        logical_block = query_pack_sparse_block(params, first_work_tile, topk_slot);
+      }
+      return __shfl_sync(uint32_t(-1), logical_block, 0);
+    };
+
+    int logical_block = get_logical_block(0);
+    wait_k(pipeline);
+    Tensor acc_qk0 = mma_qk_to_float(tiled_mma_qk, tSrQ0, tSrK(_, _, _, pipeline.k_read.index()));
+    Tensor acc_qk1 = mma_qk_to_float(tiled_mma_qk, tSrQ1, tSrK(_, _, _, pipeline.k_read.index()));
+    release_k(pipeline);
+
+    float block_qk_scale0 = block_qk_scale(params, first_work_tile, logical_block, consumer_thread_idx);
+    float block_qk_scale1 = block_qk_scale(params, second_work_tile, logical_block, consumer_thread_idx);
+    apply_query_pack_qk_mask(first_work_tile, logical_block, consumer_thread_idx, acc_qk0);
+    apply_query_pack_qk_mask(second_work_tile, logical_block, consumer_thread_idx, acc_qk1);
+    Tensor correction_scales0 = make_tensor<ElementAccumulator>(Shape<Int<SoftmaxRows>>{});
+    Tensor correction_scales1 = make_tensor<ElementAccumulator>(Shape<Int<SoftmaxRows>>{});
+    clear(correction_scales0);
+    clear(correction_scales1);
+    mute::copy(softmax0.template online_softmax<true, true>(acc_qk0, tiled_mma_qk, block_qk_scale0),
+               correction_scales0);
+    mute::copy(softmax1.template online_softmax<true, true>(acc_qk1, tiled_mma_qk, block_qk_scale1),
+               correction_scales1);
+
+    write_p(acc_qk0);
+    wait_v(pipeline);
+    mute::gemm(tiled_mma_pv, tSrP, tSrV(_, _, _, pipeline.v_read.index()), acc_pv0);
+    mate::warpsquad_commit_batch();
+    mate::warpsquad_wait();
+    write_p(acc_qk1);
+    mute::gemm(tiled_mma_pv, tSrP, tSrV(_, _, _, pipeline.v_read.index()), acc_pv1);
+    mate::warpsquad_commit_batch();
+    mate::warpsquad_wait();
+    release_v(pipeline);
+
+    int num_blocks = selected_block_count(first_work_tile);
+    MUTLASS_PRAGMA_NO_UNROLL
+    for (int topk_slot = 1; topk_slot < num_blocks; ++topk_slot) {
+      logical_block = get_logical_block(topk_slot);
+      wait_k(pipeline);
+      Tensor acc_qk0_next = mma_qk_to_float(tiled_mma_qk, tSrQ0, tSrK(_, _, _, pipeline.k_read.index()));
+      Tensor acc_qk1_next = mma_qk_to_float(tiled_mma_qk, tSrQ1, tSrK(_, _, _, pipeline.k_read.index()));
+      release_k(pipeline);
+
+      block_qk_scale0 = block_qk_scale(params, first_work_tile, logical_block, consumer_thread_idx);
+      block_qk_scale1 = block_qk_scale(params, second_work_tile, logical_block, consumer_thread_idx);
+      apply_query_pack_qk_mask(first_work_tile, logical_block, consumer_thread_idx, acc_qk0_next);
+      apply_query_pack_qk_mask(second_work_tile, logical_block, consumer_thread_idx, acc_qk1_next);
+      mute::copy(softmax0.template online_softmax<false, true>(acc_qk0_next, tiled_mma_qk, block_qk_scale0),
+                 correction_scales0);
+      mute::copy(softmax1.template online_softmax<false, true>(acc_qk1_next, tiled_mma_qk, block_qk_scale1),
+                 correction_scales1);
+      softmax0.rescale_o(acc_pv0, tiled_mma_pv, correction_scales0);
+      softmax1.rescale_o(acc_pv1, tiled_mma_pv, correction_scales1);
+
+      write_p(acc_qk0_next);
+      wait_v(pipeline);
+      mute::gemm(tiled_mma_pv, tSrP, tSrV(_, _, _, pipeline.v_read.index()), acc_pv0);
+      mate::warpsquad_commit_batch();
+      mate::warpsquad_wait();
+      write_p(acc_qk1_next);
+      mute::gemm(tiled_mma_pv, tSrP, tSrV(_, _, _, pipeline.v_read.index()), acc_pv1);
+      mate::warpsquad_commit_batch();
+      mate::warpsquad_wait();
+      release_v(pipeline);
+    }
+
+    pipeline.q.consumer_release(first_q_state);
+    pipeline.q.consumer_release(second_q_state);
+    Tensor sink_values0 = make_tensor<ElementAccumulator>(Shape<Int<SoftmaxRows>>{});
+    Tensor sink_values1 = make_tensor<ElementAccumulator>(Shape<Int<SoftmaxRows>>{});
+    clear(sink_values0);
+    clear(sink_values1);
+    Tensor lse0 = softmax0.tail(acc_pv0, tiled_mma_pv, sink_values0, params.args.v_scale);
+    Tensor lse1 = softmax1.tail(acc_pv1, tiled_mma_pv, sink_values1, params.args.v_scale);
+    return mute::make_tuple(acc_pv0, lse0, acc_pv1, lse1);
+  }
+
   template <bool UsePairUnion = false, class WorkTile>
   MUTLASS_DEVICE auto compute(Params const&   params,
                               Pipeline&       pipeline,
@@ -917,7 +1216,8 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     clear(acc_pv);
     auto acc_pv_mn = make_tensor(acc_pv.data(), ::mate::attention::fmha::layout_acc_mn(tiled_mma_pv, acc_pv.layout()));
     constexpr int              SoftmaxRows = decltype(size<0>(acc_pv_mn))::value;
-    MsaFwdSoftmax<SoftmaxRows> softmax{params.args.softmax_scale, params.args.softmax_scale_log2};
+    float                      qk_scale    = query_qk_scale(params, work_tile, consumer_thread_idx);
+    MsaFwdSoftmax<SoftmaxRows> softmax{params.args.softmax_scale * qk_scale, params.args.softmax_scale_log2 * qk_scale};
 
     R2STiledCopy tiled_copy_r2s;
     auto         thr_copy_r2s = tiled_copy_r2s.get_thread_slice(consumer_thread_idx);
@@ -929,6 +1229,8 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
       if (lane_idx == 0) {
         if constexpr (UsePairUnion) {
           logical_block = union_blocks[topk_slot];
+        } else if constexpr (PackQuery16) {
+          logical_block = query_pack_sparse_block(params, work_tile, topk_slot);
         } else {
           logical_block = sparse_block(params, work_tile.q_abs, work_tile.head_kv, topk_slot);
         }
@@ -958,7 +1260,7 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     }
 
     auto write_p = [&](auto const& acc_qk) {
-      Tensor p_fragment = make_fragment_like<Element>(acc_qk);
+      Tensor p_fragment = make_fragment_like<ElementPV>(acc_qk);
       ::mate::attention::fmha::convert_type<CvtFragmentSize>(acc_qk, p_fragment);
       Tensor tPrP = thr_copy_r2s.retile_S(p_fragment);
       copy(tiled_copy_r2s, tPrP, tPsP);
@@ -969,17 +1271,16 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     if constexpr (!UsePairUnion) {
       wait_k(pipeline);
     }
-    Tensor acc_qk = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
-    clear(acc_qk);
-    mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, pipeline.k_read.index()), acc_qk);
-    mate::warpsquad_commit_batch();
-    mate::warpsquad_wait();
+    Tensor acc_qk = mma_qk_to_float(tiled_mma_qk, tSrQ, tSrK(_, _, _, pipeline.k_read.index()));
     release_k(pipeline);
 
     Tensor correction_scales = make_tensor<ElementAccumulator>(Shape<Int<SoftmaxRows>>{});
     clear(correction_scales);
+    float current_block_qk_scale = block_qk_scale(params, work_tile, logical_block, consumer_thread_idx);
     if constexpr (UsePairUnion) {
       apply_pair_qk_mask(work_tile, logical_block, get_membership_mask(0), consumer_thread_idx, acc_qk);
+    } else if constexpr (PackQuery16) {
+      apply_query_pack_qk_mask(work_tile, logical_block, consumer_thread_idx, acc_qk);
     } else {
       apply_qk_mask(work_tile, logical_block, consumer_thread_idx, acc_qk);
     }
@@ -988,7 +1289,8 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
         release_q(pipeline);
       }
     }
-    mute::copy(softmax.template online_softmax<true, true>(acc_qk, tiled_mma_qk), correction_scales);
+    mute::copy(softmax.template online_softmax<true, true>(acc_qk, tiled_mma_qk, current_block_qk_scale),
+               correction_scales);
     write_p(acc_qk);
     // Q is only an operand of QK.  Releasing it here (for a one-block
     // selection) lets the producer start the next work item's Q TME while
@@ -1003,16 +1305,12 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     for (int topk_slot = 1; topk_slot < num_blocks; ++topk_slot) {
       logical_block = get_logical_block(topk_slot);
       wait_k(pipeline);
-      Tensor acc_qk_next = partition_fragment_C(tiled_mma_qk, take<0, 2>(TileShapeQK{}));
-      clear(acc_qk_next);
-      mute::gemm(tiled_mma_qk, tSrQ, tSrK(_, _, _, pipeline.k_read.index()), acc_qk_next);
-      mate::warpsquad_commit_batch();
+      Tensor acc_qk_next = mma_qk_to_float(tiled_mma_qk, tSrQ, tSrK(_, _, _, pipeline.k_read.index()));
 
       wait_v(pipeline);
       mute::gemm(tiled_mma_pv, tSrP, tSrV(_, _, _, pipeline.v_read.index()), acc_pv);
       mate::warpsquad_commit_batch();
 
-      mate::warpsquad_wait<1>();
       release_k(pipeline);
 
       // After the last QK MMA, no consumer instruction reads Q again.  Move
@@ -1026,6 +1324,8 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
 
       if constexpr (UsePairUnion) {
         apply_pair_qk_mask(work_tile, logical_block, get_membership_mask(topk_slot), consumer_thread_idx, acc_qk_next);
+      } else if constexpr (PackQuery16) {
+        apply_query_pack_qk_mask(work_tile, logical_block, consumer_thread_idx, acc_qk_next);
       } else {
         apply_qk_mask(work_tile, logical_block, consumer_thread_idx, acc_qk_next);
       }
@@ -1034,7 +1334,9 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
           release_q(pipeline);
         }
       }
-      mute::copy(softmax.template online_softmax<false, true>(acc_qk_next, tiled_mma_qk), correction_scales);
+      current_block_qk_scale = block_qk_scale(params, work_tile, logical_block, consumer_thread_idx);
+      mute::copy(softmax.template online_softmax<false, true>(acc_qk_next, tiled_mma_qk, current_block_qk_scale),
+                 correction_scales);
 
       mate::warpsquad_wait<0>();
       release_v(pipeline);

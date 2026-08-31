@@ -98,6 +98,86 @@ struct MsaFwdKernelTmeWarpSpecialized {
     typename CollectiveMainloop::Pipeline pipeline(barrier_storage);
     __syncthreads();
 
+    if constexpr (CollectiveMainloop::PackQuery16) {
+      if (warp_squad_idx < CollectiveMainloop::NumProducerWarpSquads) {
+        auto work_tile = scheduler.get_initial_work(params.scheduler);
+        while (work_tile.is_valid(params.scheduler)) {
+#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
+          __musa_loop_transparent_outermost();
+#endif
+          auto second_work_tile = scheduler.get_next_work(params.scheduler, work_tile);
+          bool same_group =
+              second_work_tile.is_valid(params.scheduler) && second_work_tile.work_idx == work_tile.work_idx;
+          bool has_second = same_group && TileScheduler::is_valid_query(second_work_tile);
+
+          if (TileScheduler::is_valid_query(work_tile)) {
+            if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::QLoadWarpInProducer) {
+              mainloop.load_q(params.mainloop, pipeline, shared_storage, work_tile);
+              if (has_second) {
+                mainloop.load_q(params.mainloop, pipeline, shared_storage, second_work_tile);
+              }
+            }
+            if (lane_idx == 0 && warp_idx_in_warp_squad == CollectiveMainloop::KVLoadWarpInProducer) {
+              mainloop.load_kv(params.mainloop, pipeline, shared_storage, work_tile);
+            }
+          }
+
+          work_tile = same_group ? scheduler.get_next_work(params.scheduler, second_work_tile) : second_work_tile;
+        }
+      } else if (warp_squad_idx < CollectiveMainloop::NumProducerWarpSquads + CollectiveMainloop::NumMmaWarpSquads) {
+        auto work_tile = scheduler.get_initial_work(params.scheduler);
+        while (work_tile.is_valid(params.scheduler)) {
+#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
+          __musa_loop_transparent_outermost();
+#endif
+          auto second_work_tile = scheduler.get_next_work(params.scheduler, work_tile);
+          bool same_group =
+              second_work_tile.is_valid(params.scheduler) && second_work_tile.work_idx == work_tile.work_idx;
+          bool has_second = same_group && TileScheduler::is_valid_query(second_work_tile);
+
+          if (TileScheduler::is_valid_query(work_tile)) {
+            if (has_second) {
+              auto result = mainloop.compute_query_pair(
+                  params.mainloop, pipeline, shared_storage, work_tile, second_work_tile, consumer_thread_idx);
+              auto& acc_pv0 = mute::get<0>(result);
+              auto& lse0    = mute::get<1>(result);
+              auto& acc_pv1 = mute::get<2>(result);
+              auto& lse1    = mute::get<3>(result);
+              if (consumer_thread_idx < int(mute::size(typename CollectiveMainloop::TiledMmaPV{}))) {
+                epilogue.store(params.epilogue,
+                               acc_pv0,
+                               lse0,
+                               typename CollectiveMainloop::TiledMmaPV{},
+                               work_tile,
+                               consumer_thread_idx);
+                epilogue.store(params.epilogue,
+                               acc_pv1,
+                               lse1,
+                               typename CollectiveMainloop::TiledMmaPV{},
+                               second_work_tile,
+                               consumer_thread_idx);
+              }
+            } else {
+              auto result = mainloop.compute(params.mainloop, pipeline, shared_storage, work_tile, consumer_thread_idx);
+              auto& acc_pv = mute::get<0>(result);
+              auto& lse    = mute::get<1>(result);
+              if (consumer_thread_idx < int(mute::size(typename CollectiveMainloop::TiledMmaPV{}))) {
+                epilogue.store(params.epilogue,
+                               acc_pv,
+                               lse,
+                               typename CollectiveMainloop::TiledMmaPV{},
+                               work_tile,
+                               consumer_thread_idx);
+              }
+            }
+          }
+
+          work_tile = same_group ? scheduler.get_next_work(params.scheduler, second_work_tile) : second_work_tile;
+        }
+      }
+      return;
+    }
+
     if (warp_squad_idx < CollectiveMainloop::NumProducerWarpSquads) {
       MUTLASS_PRAGMA_NO_UNROLL
       for (auto work_tile = scheduler.get_initial_work(params.scheduler); work_tile.is_valid(params.scheduler);

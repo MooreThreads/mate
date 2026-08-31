@@ -10,12 +10,18 @@
 namespace {
 
 using Element = {{ element }};
+{% if mixed_pv %}
+using ElementPV = {{ element_pv }};
+using ElementOutput = {{ element_output }};
+{% endif %}
 
 static constexpr bool kIsCausal = {{ "true" if causal else "false" }};
-// Both local GQA ratios use physical M16 SQMMA. Ratio-8 prefill dispatches
-// to the two-query pair-union kernel; decode and ratio-16 use one query/CTA.
+// All local GQA/MHA ratios use physical M16 SQMMA. Ratio-8 prefill dispatches
+// to the two-query pair-union kernel. Non-causal ratio-1 can consume one LUT
+// per 128-query routing block and pack 16 adjacent queries into M16.
 static constexpr int  kHeadRatio = {{ head_ratio }};
 static constexpr int  kHeadDim   = {{ head_dim }};
+static constexpr int  kTileQ     = {{ tile_q }};
 static constexpr int  kTileKV    = {{ tile_kv }};
 static constexpr int  kTopK      = {{ topk }};
 
@@ -30,12 +36,32 @@ template <int HeadRatio>
 using Builder = msa::MsaFwdBuilder<
     Element,
     HeadRatio,
-    msa::IsCausal<std::integral_constant<bool, kIsCausal>>>;
+    msa::IsCausal<std::integral_constant<bool, kIsCausal>>,
+    msa::SparseTopK<std::integral_constant<int, kTopK>>>;
+{% if mixed_pv %}
+using KernelRatio1QueryPack16 = typename msa::MsaFwdQueryPack16MixedBuilder<
+    Element,
+    ElementPV,
+    ElementOutput,
+    msa::IsCausal<std::integral_constant<bool, kIsCausal>>,
+    msa::SparseQueryBlockSize<std::integral_constant<int, kTileQ>>,
+    msa::UseBlockQKScale<std::integral_constant<bool, {{ "true" if block_qk_scale else "false" }}>>,
+    msa::UseQueryQKScale<std::integral_constant<bool, {{ "true" if query_qk_scale else "false" }}>>,
+    msa::SparseTopK<std::integral_constant<int, kTopK>>>::Kernel;
+{% else %}
+using KernelRatio1  = typename Builder<1>::Kernel;
 using KernelRatio8  = typename Builder<8>::Kernel;
 using KernelRatio16 = typename Builder<16>::Kernel;
 using KernelRatio8PairUnion = typename msa::MsaFwdPairUnionBuilder<
     Element,
-    msa::IsCausal<std::integral_constant<bool, kIsCausal>>>::Kernel;
+    msa::IsCausal<std::integral_constant<bool, kIsCausal>>,
+    msa::SparseTopK<std::integral_constant<int, kTopK>>>::Kernel;
+using KernelRatio1QueryPack16 = typename msa::MsaFwdQueryPack16Builder<
+    Element,
+    msa::IsCausal<std::integral_constant<bool, kIsCausal>>,
+    msa::SparseQueryBlockSize<std::integral_constant<int, kTileQ>>,
+    msa::SparseTopK<std::integral_constant<int, kTopK>>>::Kernel;
+{% endif %}
 
 }  // namespace
 
@@ -43,6 +69,10 @@ void {{ func_name }}(
     ffi::TensorView q,
     ffi::TensorView k,
     ffi::TensorView v,
+{% if has_qk_scale %}
+    ffi::TensorView q_scale_blocks,
+    ffi::TensorView k_scale_blocks,
+{% endif %}
     ffi::TensorView kv_block_indexes,
     ffi::TensorView cu_seqlens_q,
     ffi::TensorView seqused_k,
@@ -60,6 +90,10 @@ void {{ func_name }}(
   CHECK_MUSA(q);
   CHECK_MUSA(k);
   CHECK_MUSA(v);
+{% if has_qk_scale %}
+  CHECK_MUSA(q_scale_blocks);
+  CHECK_MUSA(k_scale_blocks);
+{% endif %}
   CHECK_MUSA(kv_block_indexes);
   CHECK_MUSA(cu_seqlens_q);
   CHECK_MUSA(seqused_k);
@@ -71,6 +105,10 @@ void {{ func_name }}(
   CHECK_DIM(3, q);
   CHECK_DIM(4, k);
   CHECK_DIM(4, v);
+{% if has_qk_scale %}
+  CHECK_DIM(2, q_scale_blocks);
+  CHECK_DIM(2, k_scale_blocks);
+{% endif %}
   CHECK_DIM(3, kv_block_indexes);
   CHECK_DIM(1, cu_seqlens_q);
   CHECK_DIM(1, seqused_k);
@@ -80,18 +118,30 @@ void {{ func_name }}(
 
   CHECK_INPUT_TYPE(q, {{ element_dtype }});
   CHECK_INPUT_TYPE(k, {{ element_dtype }});
+{% if has_qk_scale %}
+  CHECK_INPUT_TYPE(q_scale_blocks, dl_float32);
+  CHECK_INPUT_TYPE(k_scale_blocks, dl_float32);
+{% endif %}
+{% if mixed_pv %}
+  CHECK_INPUT_TYPE(v, {{ element_pv_dtype }});
+{% else %}
   CHECK_INPUT_TYPE(v, {{ element_dtype }});
+{% endif %}
   CHECK_INPUT_TYPE(kv_block_indexes, dl_int32);
   CHECK_INPUT_TYPE(cu_seqlens_q, dl_int32);
   CHECK_INPUT_TYPE(seqused_k, dl_int32);
   CHECK_INPUT_TYPE(qo_offset, dl_int32);
   CHECK_INPUT_TYPE(page_table, dl_int32);
-  CHECK_INPUT_TYPE(out, {{ element_dtype }});
+  CHECK_INPUT_TYPE(out, {{ element_output_dtype }});
   CHECK_INPUT_TYPE(lse, dl_float32);
 
   CHECK_CONTIGUOUS(q);
   CHECK_CONTIGUOUS(k);
   CHECK_CONTIGUOUS(v);
+{% if has_qk_scale %}
+  CHECK_CONTIGUOUS(q_scale_blocks);
+  CHECK_CONTIGUOUS(k_scale_blocks);
+{% endif %}
   CHECK_CONTIGUOUS(kv_block_indexes);
   CHECK_CONTIGUOUS(cu_seqlens_q);
   CHECK_CONTIGUOUS(seqused_k);
@@ -102,6 +152,10 @@ void {{ func_name }}(
 
   CHECK_DEVICE(k, q);
   CHECK_DEVICE(v, q);
+{% if has_qk_scale %}
+  CHECK_DEVICE(q_scale_blocks, q);
+  CHECK_DEVICE(k_scale_blocks, q);
+{% endif %}
   CHECK_DEVICE(kv_block_indexes, q);
   CHECK_DEVICE(cu_seqlens_q, q);
   CHECK_DEVICE(seqused_k, q);
@@ -129,6 +183,13 @@ void {{ func_name }}(
   int num_kv_heads = static_cast<int>(k.size(2));
   int num_pages    = static_cast<int>(k.size(0));
   int total_k      = num_pages * kTileKV;
+  int query_block_rows = batch_size * ((static_cast<int>(max_seqlen_q) + kTileQ - 1) / kTileQ);
+{% if has_qk_scale %}
+  TVM_FFI_ICHECK_EQ(q_scale_blocks.size(0), query_block_rows);
+  TVM_FFI_ICHECK_EQ(q_scale_blocks.size(1), num_kv_heads);
+  TVM_FFI_ICHECK_EQ(k_scale_blocks.size(0), batch_size * ((static_cast<int>(max_seqlen_k) + kTileKV - 1) / kTileKV));
+  TVM_FFI_ICHECK_EQ(k_scale_blocks.size(1), num_kv_heads);
+{% endif %}
 
   TVM_FFI_ICHECK_GE(batch_size, 0);
   TVM_FFI_ICHECK_EQ(seqused_k.size(0), batch_size);
@@ -143,8 +204,10 @@ void {{ func_name }}(
   TVM_FFI_ICHECK_GT(num_kv_heads, 0);
   TVM_FFI_ICHECK_EQ(num_q_heads % num_kv_heads, 0);
   int const head_ratio = num_q_heads / num_kv_heads;
-  TVM_FFI_ICHECK(head_ratio == 8 || head_ratio == kHeadRatio);
-  TVM_FFI_ICHECK_EQ(kv_block_indexes.size(0), total_q);
+  TVM_FFI_ICHECK(head_ratio == 1 || head_ratio == 8 || head_ratio == kHeadRatio);
+  bool const use_query_pack16 = head_ratio == 1 && !kIsCausal && total_q > 1 &&
+                                kv_block_indexes.size(0) == query_block_rows;
+  TVM_FFI_ICHECK(kv_block_indexes.size(0) == total_q || use_query_pack16);
   TVM_FFI_ICHECK_EQ(kv_block_indexes.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(kv_block_indexes.size(2), kTopK);
   TVM_FFI_ICHECK_EQ(out.size(0), total_q);
@@ -184,7 +247,18 @@ void {{ func_name }}(
         {
             static_cast<Element const*>(q.data_ptr()),
             static_cast<Element const*>(k.data_ptr()),
+{% if mixed_pv %}
+            static_cast<ElementPV const*>(v.data_ptr()),
+{% else %}
             static_cast<Element const*>(v.data_ptr()),
+{% endif %}
+{% if has_qk_scale %}
+            static_cast<float const*>(q_scale_blocks.data_ptr()),
+            static_cast<float const*>(k_scale_blocks.data_ptr()),
+{% else %}
+            nullptr,
+            nullptr,
+{% endif %}
             static_cast<int32_t const*>(kv_block_indexes.data_ptr()),
             static_cast<int32_t const*>(page_table.data_ptr()),
             kv_page_indptr.has_value()
@@ -195,7 +269,11 @@ void {{ func_name }}(
             static_cast<float>(v_scale),
         },
         {
+{% if mixed_pv %}
+            static_cast<ElementOutput*>(out.data_ptr()),
+{% else %}
             static_cast<Element*>(out.data_ptr()),
+{% endif %}
             static_cast<float*>(lse.data_ptr()),
         },
         {
@@ -219,7 +297,17 @@ void {{ func_name }}(
     MATE_CHECK_MUSA_KERNEL_LAUNCH();
   };
 
-  if (head_ratio == 8) {
+{% if mixed_pv %}
+  TVM_FFI_ICHECK(use_query_pack16);
+  launch(KernelTag<KernelRatio1QueryPack16>{});
+{% else %}
+  if (head_ratio == 1) {
+    if (use_query_pack16) {
+      launch(KernelTag<KernelRatio1QueryPack16>{});
+    } else {
+      launch(KernelTag<KernelRatio1>{});
+    }
+  } else if (head_ratio == 8) {
     if (max_seqlen_q > 1) {
       launch(KernelTag<KernelRatio8PairUnion>{});
     } else {
@@ -228,6 +316,7 @@ void {{ func_name }}(
   } else {
     launch(KernelTag<KernelRatio16>{});
   }
+{% endif %}
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});

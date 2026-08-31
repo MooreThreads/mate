@@ -774,6 +774,7 @@ def _normalize_kv_block_indexes(
     num_kv_heads: int,
     num_qo_heads: int,
     qhead_per_kv: int,
+    query_block_rows: Optional[int] = None,
 ) -> torch.Tensor:
     if kv_block_indexes.dtype != torch.int32:
         raise TypeError(
@@ -781,13 +782,16 @@ def _normalize_kv_block_indexes(
         )
     if kv_block_indexes.ndim != 3:
         raise ValueError(
-            "kv_block_indexes must have shape [total_q, Hkv or Hq, topK], got "
+            "kv_block_indexes must have shape [rows, Hkv or Hq, topK], got "
             f"{tuple(kv_block_indexes.shape)}"
         )
-    if int(kv_block_indexes.shape[0]) != total_q:
+    valid_rows = {total_q}
+    if query_block_rows is not None:
+        valid_rows.add(query_block_rows)
+    if int(kv_block_indexes.shape[0]) not in valid_rows:
         raise ValueError(
-            "kv_block_indexes total_q dimension mismatch: "
-            f"{int(kv_block_indexes.shape[0])} vs {total_q}"
+            "kv_block_indexes row dimension mismatch: "
+            f"got {int(kv_block_indexes.shape[0])}, expected one of {sorted(valid_rows)}"
         )
     head_dim = int(kv_block_indexes.shape[1])
     if head_dim == num_kv_heads:
@@ -919,8 +923,8 @@ def _run_sparse_fwd_kernel(
         raise ValueError(f"q must have shape [total_q, Hq, 128], got {tuple(q.shape)}")
     if plan.num_kv_heads <= 0 or plan.num_qo_heads % plan.num_kv_heads != 0:
         raise ValueError("MSA SQMMA forward requires Hq to be divisible by Hkv")
-    if plan.num_qo_heads // plan.num_kv_heads not in (8, 16):
-        raise ValueError("MSA SQMMA forward requires local Hq/Hkv ratio 8 or 16")
+    if plan.num_qo_heads // plan.num_kv_heads not in (1, 8, 16):
+        raise ValueError("MSA SQMMA forward requires local Hq/Hkv ratio 1, 8, or 16")
     if int(q.shape[1]) != plan.num_qo_heads:
         raise ValueError(
             f"q head count {int(q.shape[1])} does not match plan.num_qo_heads "
@@ -967,12 +971,19 @@ def _run_sparse_fwd_kernel(
         name="v",
     )
     qhead_per_kv = plan.num_qo_heads // plan.num_kv_heads
+    query_block_rows = None
+    if qhead_per_kv == 1 and not plan.causal and int(q.shape[0]) > 1:
+        query_block_rows = plan.batch_size * _ceil_div(
+            plan.prefill_plan.max_seqlen_q,
+            _SPARSE_BLOCK_SIZE,
+        )
     block_indexes = _normalize_kv_block_indexes(
         kv_block_indexes.to(device=q.device, dtype=torch.int32, non_blocking=True),
         total_q=int(q.shape[0]),
         num_kv_heads=plan.num_kv_heads,
         num_qo_heads=plan.num_qo_heads,
         qhead_per_kv=qhead_per_kv,
+        query_block_rows=query_block_rows,
     )
     cu_seqlens_q = _decode_cu_seqlens_q(
         q,

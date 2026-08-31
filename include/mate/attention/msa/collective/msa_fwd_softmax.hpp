@@ -26,7 +26,7 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
   }
 
   template <bool IsFirst, bool CheckInf, class AccQK, class TiledMmaQK>
-  MUTLASS_DEVICE auto online_softmax(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk) {
+  MUTLASS_DEVICE auto online_softmax(AccQK& acc_qk, TiledMmaQK const& tiled_mma_qk, float block_qk_scale = 1.f) {
     auto          reduction_target_qk = ::mate::attention::fmha::reduction_target_n(tiled_mma_qk);
     constexpr int red_rank            = decltype(rank(reduction_target_qk))::value;
 
@@ -49,7 +49,10 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
       float4 row_max_cur;
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
-        float4 values = make_float4(acc_qk_mn(i, j), acc_qk_mn(i, j + 1), acc_qk_mn(i, j + 2), acc_qk_mn(i, j + 3));
+        float4 values = make_float4(acc_qk_mn(i, j) * block_qk_scale,
+                                    acc_qk_mn(i, j + 1) * block_qk_scale,
+                                    acc_qk_mn(i, j + 2) * block_qk_scale,
+                                    acc_qk_mn(i, j + 3) * block_qk_scale);
         if (j == 0) {
           row_max_cur = values;
         } else {
@@ -76,13 +79,14 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
             this->row_max(i) == -std::numeric_limits<Element>::infinity() ? Element{0} : this->row_max(i);
       }
 
-      Element scale_max = this->row_max(i) * this->sm_scale_log2;
+      Element scale_max        = this->row_max(i) * this->sm_scale_log2;
+      float   block_scale_log2 = this->sm_scale_log2 * block_qk_scale;
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
-        float4 values = make_float4(acc_qk_mn(i, j) * this->sm_scale_log2 - scale_max + MaxOffset,
-                                    acc_qk_mn(i, j + 1) * this->sm_scale_log2 - scale_max + MaxOffset,
-                                    acc_qk_mn(i, j + 2) * this->sm_scale_log2 - scale_max + MaxOffset,
-                                    acc_qk_mn(i, j + 3) * this->sm_scale_log2 - scale_max + MaxOffset);
+        float4 values = make_float4(acc_qk_mn(i, j) * block_scale_log2 - scale_max + MaxOffset,
+                                    acc_qk_mn(i, j + 1) * block_scale_log2 - scale_max + MaxOffset,
+                                    acc_qk_mn(i, j + 2) * block_scale_log2 - scale_max + MaxOffset,
+                                    acc_qk_mn(i, j + 3) * block_scale_log2 - scale_max + MaxOffset);
         mute::fast_exp2(values, values);
         acc_qk_mn(i, j)     = values.x;
         acc_qk_mn(i, j + 1) = values.y;

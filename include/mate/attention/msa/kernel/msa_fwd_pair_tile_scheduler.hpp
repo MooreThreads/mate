@@ -8,12 +8,15 @@
 
 namespace mate::attention::msa {
 
-// Two adjacent query tokens share one physical M16 SQMMA tile.  This
-// scheduler intentionally keeps pairs inside one varlen request; the last
-// tile of an odd-length request carries q_count == 1.
-struct MsaFwdPairTileScheduler {
-  static constexpr int QTokensPerTile = 2;
-  static constexpr int CtasPerMp      = 4;
+// Pack adjacent query tokens into one physical M16 SQMMA tile without crossing
+// varlen request boundaries. The last tile carries the exact active row count.
+template <int QTokensPerTile_>
+struct MsaFwdPackedQueryTileScheduler {
+  static constexpr int QTokensPerTile = QTokensPerTile_;
+  static constexpr int QTilesPerGroup = QTokensPerTile == 16 ? 2 : 1;
+  static constexpr int CtasPerMp      = 5;
+
+  static_assert(QTokensPerTile > 1 && QTokensPerTile <= 16);
 
   struct Arguments {
     int32_t const* ptr_cu_seqlens_q = nullptr;
@@ -24,6 +27,7 @@ struct MsaFwdPairTileScheduler {
   struct Params {
     int                 total_works;
     int                 q_tiles;
+    int                 q_groups;
     int                 num_kv_heads;
     int                 batch_size;
     int32_t const*      ptr_cu_seqlens_q;
@@ -52,11 +56,11 @@ struct MsaFwdPairTileScheduler {
   };
 
   static MUTLASS_DEVICE mute::tuple<int, int, int> decode_work_coord(Params const& params, int work_idx) {
-    int q_tile_idx = 0;
-    int head_kv    = 0;
-    int tile       = params.q_tiles_divmod.divmod(q_tile_idx, work_idx);
-    int batch_idx  = params.head_divmod.divmod(head_kv, tile);
-    return {q_tile_idx, head_kv, batch_idx};
+    int q_group_idx = 0;
+    int head_kv     = 0;
+    int tile        = params.q_tiles_divmod.divmod(q_group_idx, work_idx);
+    int batch_idx   = params.head_divmod.divmod(head_kv, tile);
+    return {q_group_idx * QTilesPerGroup, head_kv, batch_idx};
   }
 
   static MUTLASS_DEVICE void fill_query_meta(Params const& params, WorkTileInfo& work_info) {
@@ -103,6 +107,20 @@ struct MsaFwdPairTileScheduler {
 
   static MUTLASS_DEVICE WorkTileInfo make_next_work_tile(Params const& params, WorkTileInfo const& current_work) {
     WorkTileInfo work_info{};
+    if constexpr (QTilesPerGroup > 1) {
+      int next_q_tile = current_work.q_tile_idx + 1;
+      int group_end   = min(params.q_tiles, (current_work.q_tile_idx / QTilesPerGroup + 1) * QTilesPerGroup);
+      if (next_q_tile < group_end) {
+        work_info.work_idx   = current_work.work_idx;
+        work_info.batch_idx  = current_work.batch_idx;
+        work_info.q_tile_idx = next_q_tile;
+        work_info.head_kv    = current_work.head_kv;
+        fill_query_meta(params, work_info);
+        copy_key_meta(current_work, work_info);
+        return work_info;
+      }
+    }
+
     work_info.work_idx = current_work.work_idx + static_cast<int>(gridDim.x);
     if (!work_info.is_valid(params)) {
       return work_info;
@@ -129,16 +147,18 @@ struct MsaFwdPairTileScheduler {
   template <class ProblemSize>
   static Params to_underlying_arguments(ProblemSize const& problem_size, Arguments const& args) {
     int q_tiles     = (problem_size.max_seqlen_q + QTokensPerTile - 1) / QTokensPerTile;
-    int total_works = q_tiles * problem_size.num_kv_heads * problem_size.batch_size;
+    int q_groups    = (q_tiles + QTilesPerGroup - 1) / QTilesPerGroup;
+    int total_works = q_groups * problem_size.num_kv_heads * problem_size.batch_size;
     return {
         total_works,
         q_tiles,
+        q_groups,
         problem_size.num_kv_heads,
         problem_size.batch_size,
         args.ptr_cu_seqlens_q,
         args.ptr_seqused_k,
         args.ptr_qo_offset,
-        mutlass::FastDivmod(q_tiles),
+        mutlass::FastDivmod(q_groups),
         mutlass::FastDivmod(problem_size.num_kv_heads),
     };
   }
@@ -168,5 +188,8 @@ struct MsaFwdPairTileScheduler {
     return work_info.q_count > 0;
   }
 };
+
+using MsaFwdPairTileScheduler        = MsaFwdPackedQueryTileScheduler<2>;
+using MsaFwdQueryPack16TileScheduler = MsaFwdPackedQueryTileScheduler<16>;
 
 }  // namespace mate::attention::msa

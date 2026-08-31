@@ -26,6 +26,22 @@ if _HAS_FP8_E4M3:
     _FWD_DTYPES.append(torch.float8_e4m3fn)
 
 
+def test_msa_normalizes_ratio1_block_level_lut():
+    block_indexes = torch.zeros((2, 1, 16), dtype=torch.int32)
+
+    normalized = msa._normalize_kv_block_indexes(
+        block_indexes,
+        total_q=256,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        qhead_per_kv=1,
+        query_block_rows=2,
+    )
+
+    assert normalized.data_ptr() == block_indexes.data_ptr()
+    assert normalized.is_contiguous()
+
+
 def test_msa_maxscore_prefill_tile_q_dispatch():
     from mate.jit.msa_ops import _maxscore_tile_q
 
