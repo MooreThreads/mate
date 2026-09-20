@@ -214,6 +214,37 @@ out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
 Prepare a new metadata object after changing `seq_lens`, query shape, or top-k.
 Do not share one metadata object between overlapping decode calls.
 
+## Mamba / SSD APIs
+
+```python
+from flashinfer.mamba import selective_state_update
+from flashinfer.mamba.ssd_combined import ssd_combined_fwd_varlen
+```
+
+| Symbol | Use |
+| --- | --- |
+| `selective_state_update` | One-step SSM state update for Mamba/SSD decode. |
+| `ssd_combined_fwd_varlen`, aliased as `mamba_chunk_scan_combined_varlen` | Packed variable-length SSD prefill. |
+| `checkpointing_ssu`, `allocate_checkpointing_ssu_scratch` | Checkpointed SSU paths. |
+| `replayssm_materialize` | ReplaySSM state materialization. |
+| `CheckpointingSSURunner` | Exported only when the MATE backend provides it. |
+
+Parameter lists here are frozen contracts rather than conveniences. Consumers
+call the packed-varlen entry point by keyword and the state-update entry point by
+keyword using upstream FlashInfer names, so do not rename parameters, reorder
+positional ones, or add MUSA-specific knobs to these names; backend selection
+and tuning belong to MATE or to the environment.
+
+These upstream symbols are intentionally absent: `ssd_combined_fwd` and
+`SSDCombined` (dense CUTLASS/CuTe entry points) and
+`cake_selective_state_update` and `CakeSSDCombined` (Cake/CUDA paths).
+
+Implementations are resolved from the MATE mamba family at call time
+(`mate.mamba` by default). A symbol whose MATE implementation is missing raises
+`NotImplementedError` naming the gap instead of returning a wrong result, and
+capability-shaped symbols such as `CheckpointingSSURunner` are absent rather than
+present-but-broken, so downstream probing stays honest.
+
 ## Example
 
 [`examples/fp8_mla_decode.py`](examples/fp8_mla_decode.py) demonstrates the

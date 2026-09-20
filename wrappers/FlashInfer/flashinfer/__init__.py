@@ -3,6 +3,7 @@ from pathlib import Path
 
 from . import decode as decode
 from . import gemm as gemm
+from . import mamba as mamba
 from . import norm as norm
 from . import rope as rope
 from .gemm import bmm_bf16 as bmm_bf16
