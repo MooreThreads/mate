@@ -217,6 +217,31 @@
       ]
     },
     {
+      "name": "Mamba / SSU",
+      "summary_sources": [
+        {
+          "kind": "lazy_attr_modules",
+          "path": "mate/__init__.py",
+          "module_targets": ["mamba"]
+        },
+        {
+          "kind": "module_mate_api",
+          "path": "mate/mamba.py"
+        }
+      ],
+      "detail_pages": [
+        {
+          "path": "docs/source/api/mamba.rst",
+          "sources": [
+            {
+              "kind": "module_mate_api",
+              "path": "mate/mamba.py"
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "MoE Routing & Gating",
       "summary_sources": [
         {

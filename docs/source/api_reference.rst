@@ -124,6 +124,19 @@ the ``flash_kda`` wrapper is not the right integration surface.
 - ``mate.kda.chunk_kda``
 - ``mate.kda.gated_delta_rule_decode``
 
+Mamba / SSU
+-----------
+
+Direct :doc:`Mamba SSU <api/mamba>` entrypoints for the Mamba2 selective state
+update on a single decode step, exposed both as the native MATE family and as the
+FlashInfer-shaped compatibility surface used by serving frameworks.
+
+- ``mate.selective_state_update``
+- ``mate.mamba.selective_state_update``
+- ``mate.mamba.prewarm_selective_state_update``
+- ``mate.mamba.ssd_combined_fwd_varlen``
+- ``mate.mamba.prewarm_ssd_combined_fwd_varlen``
+
 MSA
 ---
 
