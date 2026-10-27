@@ -2,6 +2,17 @@
   "summary_page": "docs/source/api_reference.rst",
   "groups": [
     {
+      "name": "QSA",
+      "summary_sources": [
+        {"kind": "lazy_attr_modules", "path": "mate/__init__.py", "module_targets": ["qsa_interface"]}
+      ],
+      "detail_pages": [
+        {"path": "docs/source/api/qsa.rst", "sources": [
+          {"kind": "lazy_attr_modules", "path": "mate/__init__.py", "module_targets": ["qsa_interface"]}
+        ]}
+      ]
+    },
+    {
       "name": "Attention",
       "summary_sources": [
         {
@@ -40,6 +51,11 @@
         {
           "kind": "module_mate_api",
           "path": "mate/sparse_mla_interface.py"
+        },
+        {
+          "kind": "lazy_attr_modules",
+          "path": "mate/__init__.py",
+          "module_targets": ["sparse_mla.glm_nope"]
         }
       ],
       "detail_pages": [
@@ -49,6 +65,10 @@
             {
               "kind": "module_mate_api",
               "path": "mate/sparse_mla_interface.py"
+            },
+            {
+              "kind": "module_mate_api",
+              "path": "mate/sparse_mla/glm_nope.py"
             }
           ]
         }

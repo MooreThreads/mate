@@ -49,6 +49,19 @@ quantization, reusable decode scheduler metadata, and FP8 sparse decode.
 
 - ``mate.sparse_mla_interface.mla_rope_quantize_fp8``
 - ``mate.sparse_mla_interface.sparse_mla_fp8_decode``
+- ``mate.sparse_mla_nope_decode``
+
+QSA
+---
+
+Native :doc:`Qwen sparse attention <api/qsa>` score and sparse Core
+operators. Projection, RoPE and serving-framework integration remain external.
+
+- ``mate.qsa_indexer_mqa_score``
+- ``mate.qsa_mqa``
+- ``mate.qsa_mqa_decode``
+- ``mate.qsa_mqa_prefill``
+- ``mate.qsa_sparse_attention``
 
 SageAttention
 -------------
@@ -87,11 +100,13 @@ Mega MoE
 
 Distributed :doc:`Mega MoE <api/mega_moe>` entrypoints for DeepGEMM-style
 expert execution across a process group. Use this path when you need the
-fused distributed FP8 expert runtime rather than a single MoE GEMM operator.
+split-prefill distributed FP8 expert runtime rather than a single MoE GEMM
+operator.
 The same APIs are available through ``mate.deep_gemm`` and ``mate.mega_moe``;
 the ``mate.deep_gemm`` aliases are the usual integration surface.
 
 - ``mate.deep_gemm.get_symm_buffer_for_mega_moe``
+- ``mate.deep_gemm.get_token_alignment_for_mega_moe``
 - ``mate.deep_gemm.transform_weights_for_mega_moe``
 - ``mate.deep_gemm.fp8_fp8_mega_moe``
 
@@ -163,3 +178,6 @@ native router path instead of a wrapper-level integration.
 
 - ``mate.hash_topk``
 - ``mate.moe_fused_gate``
+
+The fused gate path is validated for GLM-5.3-Flash-style routing with ``288``
+experts.

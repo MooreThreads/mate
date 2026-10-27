@@ -26,27 +26,64 @@ if _HAS_FP8_E4M3:
     _FWD_DTYPES.append(torch.float8_e4m3fn)
 
 
+@pytest.mark.parametrize("arch", ["mp31"])
+def test_msa_bf16_prefetch_and_dispatch_module_cache(monkeypatch, arch):
+    from mate.jit import msa_ops
+
+    builds = []
+
+    class FakeSpec:
+        def build_and_load(self):
+            module = object()
+            builds.append(module)
+            return module
+
+    monkeypatch.setattr(msa_ops.jit_env, "resolve_musa_arch_list", lambda: (arch,))
+    monkeypatch.setattr(msa_ops, "_MSA_MAXSCORE_MODULES", {})
+    monkeypatch.setattr(
+        msa_ops, "_gen_msa_maxscore_spec_from_config", lambda config: FakeSpec()
+    )
+    options = dict(
+        is_paged_kv=True, causal=True, head_dim=128, head_ratio=1, is_varlen=False
+    )
+    for q_len, tile_q, prefetch in [(128, 64, False), (513, 128, True)]:
+        config = msa_ops.make_msa_maxscore_config(
+            torch.bfloat16, max_seqlen_q=q_len, **options
+        )
+        assert config["tile_q"] == tile_q
+        assert config["enable_k_prefetch"] is prefetch
+    modules = [
+        msa_ops.get_msa_maxscore_module(torch.bfloat16, max_seqlen_q=q_len, **options)
+        for q_len in (513, 1025, 4096, 128)
+    ]
+    assert modules[0] is modules[1] is modules[2]
+    assert modules[3] is not modules[0]
+    assert len(builds) == 2
+
+
 def test_msa_maxscore_prefill_tile_q_dispatch():
     from mate.jit.msa_ops import _maxscore_tile_q
 
-    assert (
-        _maxscore_tile_q(
-            1,
-            True,
-            dtype=torch.bfloat16,
-            max_seqlen_q=64 * 1024,
+    for max_seqlen_q in (513, 32 * 1024, 64 * 1024):
+        assert (
+            _maxscore_tile_q(
+                1,
+                True,
+                dtype=torch.bfloat16,
+                max_seqlen_q=max_seqlen_q,
+            )
+            == 128
         )
-        == 64
-    )
-    assert (
-        _maxscore_tile_q(
-            1,
-            True,
-            dtype=torch.bfloat16,
-            max_seqlen_q=32 * 1024,
+    for max_seqlen_q in (64, 128, 512):
+        assert (
+            _maxscore_tile_q(
+                1,
+                True,
+                dtype=torch.bfloat16,
+                max_seqlen_q=max_seqlen_q,
+            )
+            == 64
         )
-        == 64
-    )
     assert (
         _maxscore_tile_q(
             1,
@@ -56,12 +93,15 @@ def test_msa_maxscore_prefill_tile_q_dispatch():
         )
         == 16
     )
-    assert _maxscore_tile_q(
-        1,
-        True,
-        dtype=torch.float8_e4m3fn if _HAS_FP8_E4M3 else torch.bfloat16,
-        max_seqlen_q=128 * 1024,
-    ) == (128 if _HAS_FP8_E4M3 else 64)
+    assert (
+        _maxscore_tile_q(
+            1,
+            True,
+            dtype=torch.float8_e4m3fn if _HAS_FP8_E4M3 else torch.bfloat16,
+            max_seqlen_q=128 * 1024,
+        )
+        == 128
+    )
     if _HAS_FP8_E4M3:
         for max_seqlen_q in (1, 16, 17, 64, 128, 512):
             assert (
@@ -789,6 +829,19 @@ _MAXSCORE_WORKLOADS = [
         api=MsaApi.MAXSCORE,
         num_q_heads=1,
         num_kv_heads=1,
+        q_lengths=(513,),
+        kv_lengths=(1537,),
+        kv_layout=MsaKvLayout.PAGED,
+        page_mode="reverse",
+        dtype=torch.bfloat16,
+        causal=True,
+        preallocated_max_score=True,
+        seed=309,
+    ),
+    MsaWorkload(
+        api=MsaApi.MAXSCORE,
+        num_q_heads=1,
+        num_kv_heads=1,
         q_lengths=(2, 4),
         kv_lengths=(128, 16384),
         kv_layout=MsaKvLayout.DENSE,
@@ -848,6 +901,23 @@ if _HAS_FP8_E4M3:
                 causal=True,
                 seed=308,
             ),
+            *[
+                MsaWorkload(
+                    api=MsaApi.MAXSCORE,
+                    num_q_heads=2,
+                    num_kv_heads=2,
+                    q_lengths=(513, 65),
+                    kv_lengths=(8193, 1025),
+                    kv_layout=layout,
+                    page_mode="reverse",
+                    dtype=torch.float8_e4m3fn,
+                    causal=causal,
+                    preallocated_max_score=True,
+                    seed=4217,
+                )
+                for layout in (MsaKvLayout.DENSE, MsaKvLayout.PAGED)
+                for causal in (False, True)
+            ],
         ]
     )
 
@@ -1093,6 +1163,154 @@ def test_msa_output_maxscore_matches_reference(workload: MsaWorkload) -> None:
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.skipif(not _HAS_FP8_E4M3, reason="FP8 E4M3 unavailable")
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("layout", ["dense", "batched2d", "flat"])
+@pytest.mark.parametrize(
+    "q_lens,k_lens,offsets,ratio,dim",
+    [
+        ([1, 73], [0, 129], [-1, 50], 4, 128),
+        ([0, 513], [385, 131], [-10, 18], 1, 128),
+        ([513], [385], [-3], 1, 64),
+        ([513], [385], [-3], 1, 256),
+    ],
+)
+def test_msa_maxscore_ragged_tails_and_empty_sequences(
+    causal, layout, q_lens, k_lens, offsets, ratio, dim
+):
+    from mate.jit import msa_ops
+
+    generator = torch.Generator().manual_seed(4217)
+    dtype = torch.float8_e4m3fn
+    heads = 2
+    q = (
+        torch.randint(
+            -2, 3, (sum(q_lens), heads * ratio, dim), generator=generator
+        ).float()
+        * 0.25
+    ).to(dtype)
+    page_counts = [(length + 127) // 128 for length in k_lens]
+    table = torch.full((len(q_lens), max(page_counts)), -1, dtype=torch.int32)
+    mapping = torch.randperm(sum(page_counts), generator=generator).to(torch.int32)
+    page_cu = torch.tensor([0] + page_counts, dtype=torch.int32).cumsum(0).int()
+    for batch, count in enumerate(page_counts):
+        table[batch, :count] = mapping[page_cu[batch] : page_cu[batch + 1]]
+    shape = (
+        (sum(k_lens), heads, dim)
+        if layout == "dense"
+        else (sum(page_counts), 128, heads, dim)
+    )
+    k = torch.randint(-2, 3, shape, generator=generator).to(dtype)
+    expected = MsaOperator._dense_msa_output_maxscore_reference(
+        q.cpu().float(),
+        k.cpu().float() if layout == "dense" else k.cpu().float().permute(0, 2, 1, 3),
+        torch.tensor(q_lens),
+        torch.tensor(k_lens),
+        heads,
+        msa_ops._maxscore_k_tiles(max(k_lens), 128),
+        causal=causal,
+        qo_offset=torch.tensor(offsets),
+        page_table=None if layout == "dense" else table,
+        page_size=128,
+    )
+    table_arg = None if layout == "dense" else (mapping if layout == "flat" else table)
+    backing = torch.full((expected.numel() + 128,), 1234.5, device="musa")
+    out = backing[64:-64].view(expected.shape)
+    qd, kd = q.to("musa"), k.to("musa")
+    cu_q = torch.tensor([0] + q_lens, dtype=torch.int32).cumsum(0).int().to("musa")
+    cu_k = torch.tensor([0] + k_lens, dtype=torch.int32).cumsum(0).int().to("musa")
+    for _ in range(2):
+        out.fill_(float("nan"))
+        actual = msa_ops._msa_maxscore(
+            qd,
+            kd,
+            cu_q,
+            cu_k,
+            torch.tensor(offsets, dtype=torch.int32, device="musa"),
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            causal=causal,
+            page_table=table_arg.to("musa") if table_arg is not None else None,
+            kv_page_indptr=page_cu.to("musa") if layout == "flat" else None,
+            max_score=out,
+        )
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        assert (backing[:64] == 1234.5).all() and (backing[-64:] == 1234.5).all()
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.skipif(not _HAS_FP8_E4M3, reason="FP8 E4M3 unavailable")
+@pytest.mark.parametrize("causal,heads", [(True, 2), (False, 3)])
+def test_msa_maxscore_metadata_follows_head_then_q_tile_order(causal, heads):
+    from mate.jit import msa_ops
+
+    options = dict(
+        is_paged_kv=False,
+        causal=causal,
+        head_dim=128,
+        head_ratio=1,
+        max_seqlen_q=513,
+        has_metadata=True,
+    )
+    config = msa_ops.make_msa_maxscore_config(torch.float8_e4m3fn, **options)
+    spec = msa_ops.gen_msa_maxscore_spec(torch.float8_e4m3fn, **options)
+    module = spec.build_and_load()
+    q_lens, k_lens, offsets = [513, 65], [8193, 131073], [33, 400]
+    cu_q = torch.tensor([0, 513, 578], dtype=torch.int32, device="musa")
+    cu_k = torch.tensor([0, 8193, 139266], dtype=torch.int32, device="musa")
+    num_mps = min(32, msa_ops.resolve_num_mps(cu_q.device, None))
+    metadata = torch.empty((num_mps, 2), dtype=torch.int32, device="musa")
+    module.get_function(f"{spec.name}_metadata")(
+        cu_q,
+        cu_k,
+        torch.tensor(offsets, dtype=torch.int32, device="musa"),
+        metadata,
+        513,
+        131073,
+        heads,
+    )
+    q_tokens = config["tile_q"] // config["head_ratio"]
+    q_tiles = (513 + q_tokens - 1) // q_tokens
+    costs = []
+    for q_len, k_len, offset in zip(q_lens, k_lens, offsets):
+        for _ in range(heads):
+            for tile in range(q_tiles):
+                begin = tile * q_tokens
+                count = max(0, min(q_tokens, q_len - begin))
+                visible = (
+                    min(k_len, max(0, begin + count + offset)) if causal else k_len
+                )
+                costs.append((visible + 127) // 128 if count else 0)
+    ctas = 3 if config["parallel_k_tiles"] else 1
+    partitions = max(1, min(1025, (num_mps * ctas + len(costs) // 2) // len(costs)))
+    groups = (partitions + ctas - 1) // ctas
+    base_rows, extra = divmod(num_mps, groups)
+    expected = []
+    for group in range(groups):
+        rows = base_rows + (group < extra)
+        if len(costs) <= base_rows:
+            expected.extend(
+                [min(row, len(costs)), int(row < len(costs))] for row in range(rows)
+            )
+            continue
+        begin, prefix = 0, 0
+        for row in range(rows):
+            end = len(costs)
+            if row + 1 < rows and sum(costs) > 0:
+                target = (sum(costs) * (row + 1) + rows - 1) // rows
+                end = begin
+                while end < len(costs) and prefix < target:
+                    prefix += costs[end]
+                    end += 1
+            expected.append([begin, end - begin])
+            begin = end
+    torch.testing.assert_close(
+        metadata.cpu(), torch.tensor(expected, dtype=torch.int32), rtol=0, atol=0
+    )
+
+
+@supported_musa_compute_capability([31])
 @torch.inference_mode()
 def test_msa_maxscore_runtime_offset_kv_tail() -> None:
     from mate.jit.msa_ops import _msa_maxscore
@@ -1239,6 +1457,88 @@ def test_msa_maxscore_flat_page_indices() -> None:
 @torch.inference_mode()
 def test_msa_sparse_topk_select_matches_reference(workload: MsaWorkload) -> None:
     _run_msa_workload(workload)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize(
+    "num_pages,topk",
+    [
+        (64, 4),
+        (255, 8),
+        (256, 16),
+        (257, 16),
+        (511, 8),
+        (512, 16),
+        (513, 4),
+        (1024, 16),
+        (2048, 8),
+        (4096, 16),
+    ],
+)
+@pytest.mark.parametrize("count_in_topk", [False, True])
+def test_msa_sparse_topk_fp32_order_ties_and_rescan(num_pages, topk, count_in_topk):
+    index = torch.arange(num_pages)
+    low_bits = torch.ones(num_pages) + (index % 4).float() * 2**-23
+    rescan = torch.full((num_pages,), -10.0)
+    ordinary_topk = topk - 2 if count_in_topk else topk
+    # Previously selected high scores must not be counted again during rescan.
+    rescan[1:ordinary_topk] = 2.0
+    end = min(ordinary_topk + 129, num_pages - 1)
+    rescan[ordinary_topk:end] = 1.0 + (4 + index[ordinary_topk:end] % 4) * 2**-23
+    rescan[end:-1] = 1.0
+    tiny = torch.tensor([0.0, -0.0, -(2**-26), 2**-26, -(2**-25), 2**-25])
+    patterns = torch.stack(
+        [
+            torch.zeros(num_pages),
+            low_bits,
+            rescan,
+            tiny[index % len(tiny)],
+            torch.full((num_pages,), float("inf")),
+        ]
+    )
+    valid_counts = [0, topk - 1, topk + 1, num_pages]
+    scores = patterns[:, None, :].expand(-1, 2, -1).clone()
+    scores[:, 1] = -scores[:, 1]
+    scores = scores.repeat(len(valid_counts), 1, 1)
+    positions = torch.tensor(
+        [count * 128 - 1 for count in valid_counts for _ in patterns],
+        dtype=torch.int64,
+    )
+    for row, position in enumerate(positions.tolist()):
+        count = max(0, position // 128 + 1)
+        scores[row, :, count:] = float("nan")
+        if count:
+            scores[row, :, [0, count - 1]] = float("nan")
+    options = dict(
+        topk=topk,
+        force_begin_blocks=1,
+        force_end_blocks=1,
+        force_blocks_count_in_topk=count_in_topk,
+    )
+    expected = MsaOperator._sparse_topk_select_reference(
+        scores, query_positions=positions, **options
+    )
+    score_backing = torch.full((scores.numel() + 65,), float("nan"), device="musa")
+    device_scores = score_backing[1:-64].view(scores.shape)
+    device_scores.copy_(scores)
+    backing = torch.full(
+        (expected.numel() + 128,), -7319, dtype=torch.int32, device="musa"
+    )
+    output = backing[64:-64].view(expected.shape)
+    for _ in range(2):
+        output.fill_(-9321)
+        actual = msa.sparse_topk_select(
+            device_scores,
+            query_positions=positions.to("musa"),
+            output=output,
+            **options,
+        )
+        assert actual is output
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        assert (backing[:64] == -7319).all() and (backing[-64:] == -7319).all()
+    torch.testing.assert_close(
+        device_scores.cpu(), scores, rtol=0, atol=0, equal_nan=True
+    )
 
 
 @supported_musa_compute_capability([31])

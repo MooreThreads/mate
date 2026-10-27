@@ -1,0 +1,39 @@
+#include <cstdint>
+
+#include <musa_runtime.h>
+#include <mutlass/mutlass.h>
+#include <tvm/ffi/extra/musa/device_guard.h>
+
+{% if cc == 31 %}
+#include "mate/mega_moe/prefill/mp31_prefill_stage3.hpp"
+{% else %}
+#error "Unsupported MegaMoE prefill Stage 3 compute capability"
+{% endif %}
+#include "op_utils.hpp"
+
+using namespace tvm;
+
+void {{ func_name }}(
+  ffi::TensorView output,
+  ffi::TensorView sym_buffer_ptrs,
+  int rank_idx,
+  int num_tokens
+) {
+  CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
+  CHECK_DIM(2, output);
+  TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(output.size(1), {{ hidden }});
+  ffi::MUSADeviceGuard device_guard(output.device().device_id);
+  auto sym_buffer = mate::mega_moe::make_sym_buffer<{{ num_ranks }}>(sym_buffer_ptrs, rank_idx);
+  auto kernel = ::mega_moe::prefill::mp31_prefill_stage3_impl<
+      {{ num_max_tokens_per_rank }}, {{ hidden }}, {{ intermediate_hidden }},
+      {{ num_experts }}, {{ num_topk }}, {{ num_max_pool_tokens }},
+      {{ num_padded_sf_pool_tokens }}, {{ num_l1_ring_tokens }}, {{ num_mps }}, {{ num_ranks }},
+      {{ num_threads }}>;
+  musaStream_t stream = get_stream(output.device());
+  kernel<<<{{ num_mps }}, {{ num_threads }}, 0, stream>>>(
+      sym_buffer,
+      static_cast<uint32_t>(num_tokens),
+      static_cast<mutlass::bfloat16_t*>(output.data_ptr()));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}

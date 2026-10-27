@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping
 
+import torch
 from jinja2 import Environment, FileSystemLoader
 
 from ... import env as jit_env
@@ -22,6 +23,7 @@ class MqaLogitsJitConfig:
     num_heads: int
     head_dim: int
     compressed_logits: bool
+    logits_dtype: torch.dtype = torch.float32
 
 
 MQA_LOGITS_BLOCK_Q_OPTIONS = (2, 4)
@@ -86,6 +88,8 @@ def _validate_config(cfg: MqaLogitsJitConfig) -> None:
         raise ValueError(f"Unsupported MQA logits num_heads={cfg.num_heads}")
     if cfg.head_dim not in MQA_LOGITS_HEAD_DIM_OPTIONS:
         raise ValueError(f"Unsupported MQA logits head_dim={cfg.head_dim}")
+    if cfg.logits_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"Unsupported MQA logits logits_dtype={cfg.logits_dtype}")
 
 
 @functools.cache
@@ -96,6 +100,7 @@ def select_mqa_logits_config(
     head_dim: int,
     compressed_logits: bool,
     num_mps: int = 1,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> MqaLogitsJitConfig:
     del seq_len, num_mps
 
@@ -122,12 +127,14 @@ def select_mqa_logits_config(
         num_heads=num_heads,
         head_dim=head_dim,
         compressed_logits=compressed_logits,
+        logits_dtype=logits_dtype,
     )
     _validate_config(cfg)
     return cfg
 
 
 def mqa_logits_config_dict(cfg: MqaLogitsJitConfig) -> Dict[str, object]:
+    is_obf16 = cfg.logits_dtype == torch.bfloat16
     return {
         "kind": "fp8_mqa_logits",
         "block_q": cfg.block_q,
@@ -136,6 +143,9 @@ def mqa_logits_config_dict(cfg: MqaLogitsJitConfig) -> Dict[str, object]:
         "head_dim": cfg.head_dim,
         "compressed_logits": cfg.compressed_logits,
         "compressed_logits_literal": "true" if cfg.compressed_logits else "false",
+        "out_element_literal": "mutlass::bfloat16_t" if is_obf16 else "float",
+        "out_input_dtype": "dl_bfloat16" if is_obf16 else "dl_float32",
+        "dtype_suffix": "_obf16" if is_obf16 else "",
     }
 
 
@@ -148,6 +158,7 @@ def mqa_logits_dispatch_name(config: Mapping[str, object]) -> str:
         f"q{config['block_q']}_"
         f"kv{config['block_kv']}_"
         f"{mode}"
+        f"{config['dtype_suffix']}"
     )
 
 
@@ -180,7 +191,9 @@ def gen_mqa_logits_aot() -> list[JitSpec]:
 
 
 @functools.cache
-def _load_mqa_logits_module(frozen_config: tuple[int, int, int, int, bool]):
+def _load_mqa_logits_module(
+    frozen_config: tuple[int, int, int, int, bool, torch.dtype],
+):
     config = MqaLogitsJitConfig(*frozen_config)
     return gen_mqa_logits_spec(config).build_and_load()
 
@@ -193,6 +206,7 @@ def get_mqa_logits_module(
     head_dim: int,
     compressed_logits: bool,
     num_mps: int = 1,
+    logits_dtype: torch.dtype = torch.float32,
 ):
     config = select_mqa_logits_config(
         seq_len,
@@ -201,6 +215,7 @@ def get_mqa_logits_module(
         head_dim,
         compressed_logits,
         num_mps,
+        logits_dtype,
     )
     frozen_config = (
         config.block_q,
@@ -208,6 +223,7 @@ def get_mqa_logits_module(
         config.num_heads,
         config.head_dim,
         config.compressed_logits,
+        config.logits_dtype,
     )
     return _load_mqa_logits_module(frozen_config)
 

@@ -93,6 +93,7 @@ def biased_grouped_topk_impl(
     [
         (128, 4, 2, 4),
         (256, 8, 4, 8),  # deepseek v3
+        (288, 1, 1, 8),  # GLM-5.3-Flash
         (384, 8, 4, 8),
         (160, 4, 2, 4),
         (512, 8, 4, 8),
@@ -194,12 +195,93 @@ def test_moe_fused_gate_combined(
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.parametrize("seq_length", [1, 64, 65])
+@pytest.mark.parametrize("num_experts", [288, 384])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
+@pytest.mark.parametrize("map_policy", [0, 1, 2])
+def test_moe_fused_gate_with_shared_expert(
+    seq_length,
+    num_experts,
+    renormalize,
+    apply_routed_scaling_factor_on_output,
+    map_policy,
+):
+    torch.manual_seed(seq_length + num_experts)
+    tensor = torch.rand((seq_length, num_experts), dtype=torch.float32, device="musa:0")
+    bias = torch.rand(num_experts, dtype=torch.float32, device="musa:0")
+    static_index_map = dynamic_index_map = dynamic_index_map_valid = random_index = None
+    num_physical_experts = 0
+    if map_policy == 1:
+        static_index_map = torch.randperm(
+            num_experts + 1, dtype=torch.int32, device="musa:0"
+        )
+    elif map_policy == 2:
+        num_physical_experts = 4
+        dynamic_index_map = torch.randperm(
+            (num_experts + 1) * num_physical_experts,
+            dtype=torch.int32,
+            device="musa:0",
+        ).reshape(num_experts + 1, num_physical_experts)
+        dynamic_index_map_valid = torch.randint(
+            1,
+            num_physical_experts,
+            (num_experts + 1,),
+            dtype=torch.int32,
+            device="musa:0",
+        )
+        random_index = torch.randint(
+            0, 65536, (seq_length, 9), dtype=torch.int32, device="musa:0"
+        )
+
+    output, indices = moe_fused_gate(
+        tensor,
+        bias,
+        num_expert_group=1,
+        topk_group=1,
+        topk=9,
+        num_fused_shared_experts=1,
+        routed_scaling_factor=2.5,
+        renormalize=renormalize,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        static_index_map=static_index_map,
+        dynamic_index_map=dynamic_index_map,
+        dynamic_index_map_valid=dynamic_index_map_valid,
+        random_index=random_index,
+        num_physical_experts=num_physical_experts,
+        map_policy=map_policy,
+    )
+    ref_output, ref_indices = biased_grouped_topk_impl(
+        tensor,
+        tensor,
+        bias,
+        topk=9,
+        renormalize=renormalize,
+        num_expert_group=1,
+        topk_group=1,
+        num_fused_shared_experts=1,
+        routed_scaling_factor=2.5,
+        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+    )
+
+    if map_policy == 1:
+        ref_indices = static_index_map[ref_indices]
+    elif map_policy == 2:
+        chosen_idx = random_index % dynamic_index_map_valid[ref_indices]
+        ref_indices = dynamic_index_map[ref_indices, chosen_idx]
+
+    torch.testing.assert_close(indices, ref_indices)
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=1e-3)
+
+
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("seq_length", [1, 64, 2904])
 @pytest.mark.parametrize(
     "params",
     [
         (256, 1, 1, 8),
         (256, 8, 4, 8),
+        (288, 1, 1, 8),
         (384, 1, 1, 8),
         (384, 8, 4, 8),
         (160, 1, 1, 8),
@@ -265,14 +347,15 @@ def test_moe_fused_gate_small_scores_large_bias(seq_length, params):
     [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
 )
 @pytest.mark.parametrize(
-    "params",
+    "params, map_policy",
     [
-        (128, 4, 2, 4),
-        (256, 8, 4, 8),  # deepseek v3
-        (384, 8, 4, 8),
+        ((128, 4, 2, 4), 2),
+        ((256, 8, 4, 8), 2),  # deepseek v3
+        ((384, 8, 4, 8), 2),
+        ((288, 1, 1, 8), 1),
+        ((288, 1, 1, 8), 2),
     ],
 )
-@pytest.mark.parametrize("map_policy", [2])
 @pytest.mark.parametrize("num_token_ratio", [0.8, -1])
 def test_moe_fused_gate_with_post_processing(
     seq_length, params, num_token_ratio, map_policy

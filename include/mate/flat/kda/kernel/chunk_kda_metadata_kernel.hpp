@@ -179,20 +179,22 @@ __global__ __launch_bounds__(Threads) void chunk_kda_build_partition_metadata_ke
 }
 
 template <int Chunk, class CuSeqlensElement, class SchedulePolicy>
-inline void launch_chunk_kda_metadata(ChunkKdaPartitionMetadata* metadata,
-                                      CuSeqlensElement const*    cu_seqlens,
-                                      int                        num_seqs,
-                                      int                        num_heads,
-                                      int                        num_partitions,
-                                      musaStream_t               stream) {
+inline musaError_t launch_chunk_kda_metadata(ChunkKdaPartitionMetadata* metadata,
+                                             CuSeqlensElement const*    cu_seqlens,
+                                             int                        num_seqs,
+                                             int                        num_heads,
+                                             int                        num_partitions,
+                                             musaStream_t               stream) {
   constexpr int     threads      = SchedulePolicy::MetadataThreads;
   const std::size_t shared_bytes = detail::metadata_shared_bytes<threads>(num_seqs);
   if (shared_bytes <= SchedulePolicy::MetadataSharedLimit) {
     chunk_kda_build_partition_metadata_kernel<Chunk, CuSeqlensElement, threads>
         <<<1, threads, shared_bytes, stream>>>(metadata, cu_seqlens, num_seqs, num_heads, num_partitions);
+    return musaGetLastError();
   } else {
     chunk_kda_build_partition_metadata_kernel_serial<Chunk>
         <<<1, 32, 0, stream>>>(metadata, cu_seqlens, num_seqs, num_heads, num_partitions);
+    return musaGetLastError();
   }
 }
 

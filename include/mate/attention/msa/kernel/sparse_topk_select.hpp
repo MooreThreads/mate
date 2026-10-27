@@ -22,13 +22,13 @@ static constexpr int64_t  kSparseBlockSize          = 128;
 static constexpr uint32_t kSmallTopkMaxK            = 256;
 static constexpr uint32_t kSparseTopkMaxK           = 64;
 static constexpr size_t   kSmemAlignmentBytes       = 128;
-static constexpr int      kSmallTopkWarpsPerBlock   = 4;
+static constexpr int      kSmallTopkWarpsPerBlock   = 8;
 static constexpr int      kSmallTopkThreadsPerBlock = kSmallTopkWarpsPerBlock * 32;
 static constexpr int      kIndexerThreadsPerBlock   = 64;
 // Match the MSA indexerTopK shape: 10-bit histogram bins and a bounded
 // threshold-bin candidate buffer before the final insertion-sort step.
 static constexpr int kIndexerNumBins       = 1024;
-static constexpr int kIndexerNumFinalItems = 2048;
+static constexpr int kIndexerNumFinalItems = 256;
 
 inline bool is_supported_topk(uint32_t topk) {
   return topk == 4 || topk == 8 || topk == 16;
@@ -38,16 +38,21 @@ constexpr size_t round_up_smem_bytes(size_t bytes) {
   return ((bytes + kSmemAlignmentBytes - 1) / kSmemAlignmentBytes) * kSmemAlignmentBytes;
 }
 
+__device__ __forceinline__ uint32_t ordered_score_bits(float x) {
+  uint32_t bits = __float_as_uint(x);
+  // The strict sign-boundary comparison gives both signed zeros the same key.
+  return bits > 0x80000000u ? bits : ~bits & 0x7fffffffu;
+}
+
 template <int Step>
 __device__ __forceinline__ uint32_t extract_bin_idx(float x) {
   if constexpr (Step == 0) {
     __half   hx   = __float2half(x);
     uint16_t bits = __half_as_ushort(hx);
-    bits          = (bits & 0x8000) ? bits : ~bits & 0x7fff;
+    bits          = bits > 0x8000 ? bits : ~bits & 0x7fff;
     return bits >> 6;
   } else {
-    uint32_t bits = __float_as_uint(x);
-    bits          = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+    uint32_t bits = ordered_score_bits(x);
     if constexpr (Step == 1) {
       return bits >> 22;
     } else if constexpr (Step == 2) {
@@ -63,44 +68,13 @@ __device__ __forceinline__ bool is_partial_match(float x, uint32_t pattern) {
   if constexpr (Shift == 0) {
     return true;
   }
-  uint32_t bits = __float_as_uint(x);
-  bits          = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+  uint32_t bits = ordered_score_bits(x);
   return (bits ^ pattern) >> Shift == 0;
 }
 
-template <bool ForceBlocksCountInTopK>
-__device__ __forceinline__ float score_for_topk(
-    float score, int idx, uint32_t force_begin, uint32_t force_end_start, uint32_t num_valid_pages) {
-  uint32_t uidx      = static_cast<uint32_t>(idx);
-  bool     is_forced = uidx < force_begin || (uidx >= force_end_start && uidx < num_valid_pages);
-  // Forced sink/local blocks participate as the highest-score candidates, then
-  // the final warp sort restores ascending block-index order.
-  if constexpr (ForceBlocksCountInTopK) {
-    return is_forced ? FLT_MAX : score;
-  } else {
-    return score;
-  }
-}
-
-__device__ __forceinline__ bool is_forced_block(uint32_t idx,
-                                                uint32_t force_begin,
-                                                uint32_t force_end_start,
-                                                uint32_t num_valid_pages) {
-  return idx < force_begin || (idx >= force_end_start && idx < num_valid_pages);
-}
-
-template <bool ForceBlocksCountInTopK>
-__device__ __forceinline__ bool is_topk_candidate(uint32_t idx,
-                                                  uint32_t force_begin,
-                                                  uint32_t force_end_start,
-                                                  uint32_t num_valid_pages) {
-  if (idx >= num_valid_pages) {
-    return false;
-  }
-  if constexpr (!ForceBlocksCountInTopK) {
-    return !is_forced_block(idx, force_begin, force_end_start, num_valid_pages);
-  }
-  return true;
+__device__ __forceinline__ bool is_topk_candidate(uint32_t idx, uint32_t force_begin, uint32_t force_end_start) {
+  // The end of the unforced interval never exceeds the row's valid-page count.
+  return idx >= force_begin && idx < force_end_start;
 }
 
 __device__ __forceinline__ int32_t forced_slot_to_block(
@@ -251,20 +225,20 @@ __global__ __launch_bounds__(kSmallTopkThreadsPerBlock) void sparse_topk_small_k
 
 #pragma unroll
   for (uint32_t item = 0; item < kItemsPerLane; ++item) {
-    uint32_t idx   = lane + item * kWarpSize;
-    bool     valid = idx < max_k_tiles &&
-                 is_topk_candidate<ForceBlocksCountInTopK>(idx, force_begin, force_end_start, row_num_valid_pages);
+    uint32_t idx      = lane + item * kWarpSize;
+    bool     valid    = idx < max_k_tiles && is_topk_candidate(idx, force_begin, force_end_start);
     local_idx[item]   = valid ? static_cast<int>(idx) : -1;
-    local_score[item] = valid
-                            ? score_for_topk<ForceBlocksCountInTopK>(
-                                  logits[idx], static_cast<int>(idx), force_begin, force_end_start, row_num_valid_pages)
-                            : -FLT_MAX;
+    local_score[item] = valid ? logits[idx] : -FLT_MAX;
   }
 
-  uint32_t key32     = ~0u;
-  uint32_t keys64[2] = {~0u, ~0u};
+  uint32_t ordinary_topk = ForceBlocksCountInTopK ? TopK - force_begin - force_end : TopK;
+  uint32_t key32         = ~0u;
+  uint32_t keys64[2]     = {~0u, ~0u};
 #pragma unroll
   for (uint32_t rank = 0; rank < TopK; ++rank) {
+    if (rank >= ordinary_topk) {
+      break;
+    }
     int   best_idx   = local_idx[0];
     float best_score = local_score[0];
 
@@ -303,24 +277,22 @@ __global__ __launch_bounds__(kSmallTopkThreadsPerBlock) void sparse_topk_small_k
     }
   }
 
-  if constexpr (!ForceBlocksCountInTopK) {
-    if (lane >= TopK && lane < output_width) {
-      const int32_t idx =
-          forced_slot_to_block(lane - TopK, force_begin, force_end, force_end_start, row_num_valid_pages);
-      key32 = idx >= 0 ? static_cast<uint32_t>(idx) : ~0u;
-    }
+  if (lane >= ordinary_topk && lane < output_width) {
+    const int32_t idx =
+        forced_slot_to_block(lane - ordinary_topk, force_begin, force_end, force_end_start, row_num_valid_pages);
+    key32 = idx >= 0 ? static_cast<uint32_t>(idx) : ~0u;
+  }
 #pragma unroll
-    for (int slot = 0; slot < 2; ++slot) {
-      const uint32_t pos = lane * 2 + slot;
-      if (pos >= TopK && pos < output_width) {
-        const int32_t idx =
-            forced_slot_to_block(pos - TopK, force_begin, force_end, force_end_start, row_num_valid_pages);
-        keys64[slot] = idx >= 0 ? static_cast<uint32_t>(idx) : ~0u;
-      }
+  for (int slot = 0; slot < 2; ++slot) {
+    const uint32_t pos = lane * 2 + slot;
+    if (pos >= ordinary_topk && pos < output_width) {
+      const int32_t idx =
+          forced_slot_to_block(pos - ordinary_topk, force_begin, force_end, force_end_start, row_num_valid_pages);
+      keys64[slot] = idx >= 0 ? static_cast<uint32_t>(idx) : ~0u;
     }
   }
 
-  if (output_width <= 32) {
+  if (ForceBlocksCountInTopK || output_width <= 32) {
     warp_bitonic_sort_asc32(key32, lane);
     if (lane < output_width) {
       row_out[lane] = key32 == ~0u ? static_cast<int32_t>(-1) : static_cast<int32_t>(key32);
@@ -405,11 +377,20 @@ __device__ bool process_histogram_step(float const*   logits,
                                        uint32_t       force_begin,
                                        uint32_t       force_end_start,
                                        uint32_t       num_valid_pages) {
+  if constexpr (Step == 1) {
+    // The FP32 pass rescans the ordinary interval, not only the FP16 threshold bin.
+    // Discard coarse selections while retaining the reserved forced slots.
+    if (threadIdx.x == 0) {
+      smem_found_topk_values[0] = ForceBlocksCountInTopK ? force_begin + num_valid_pages - force_end_start : 0;
+    }
+  }
   // One histogram pass narrows the top-k threshold. Later passes refine the
   // float-bit prefix only when the current threshold bin is still too large.
+  static_assert(NumBins % 4 == 0, "Histogram must contain whole int4 groups.");
+  int4* histogram_vectors = reinterpret_cast<int4*>(smem_final.histo.data);
 #pragma unroll
-  for (int idx = threadIdx.x; idx < NumBins; idx += NumThreads) {
-    smem_final.histo.data[idx] = 0;
+  for (int idx = threadIdx.x; idx < NumBins / 4; idx += NumThreads) {
+    histogram_vectors[idx] = make_int4(0, 0, 0, 0);
   }
   __syncthreads();
 
@@ -420,89 +401,118 @@ __device__ bool process_histogram_step(float const*   logits,
     logit_pattern |= static_cast<uint32_t>(threshold_bin_idx & 0x3ff) << pattern_shift;
   }
 
-  auto distribute_to_bins = [&](float raw_score, int idx) {
-    if (!is_topk_candidate<ForceBlocksCountInTopK>(
-            static_cast<uint32_t>(idx), force_begin, force_end_start, num_valid_pages)) {
-      return;
-    }
-    float score = score_for_topk<ForceBlocksCountInTopK>(raw_score, idx, force_begin, force_end_start, num_valid_pages);
+  int  thread_first_bin   = NumBins;
+  auto distribute_to_bins = [&](float score, int) {
     if (is_partial_match<pattern_shift>(score, logit_pattern)) {
       uint32_t bin_idx = extract_bin_idx<Step>(score);
+      thread_first_bin = min(thread_first_bin, static_cast<int>(bin_idx));
       atomicAdd(&smem_final.histo.data[bin_idx], 1);
     }
   };
   vectorized_process(threadIdx.x, NumThreads, logits + row_start, row_end - row_start, distribute_to_bins);
+  using Reduce  = cub::BlockReduce<int, NumThreads>;
+  int first_bin = Reduce(smem_final.histo.reduce).Reduce(thread_first_bin, [](int a, int b) { return min(a, b); });
+  // Publish the initial scan bound; the same slot later holds the threshold.
+  if (threadIdx.x == 0) {
+    smem_threshold_bin_idx[0] = first_bin;
+  }
   __syncthreads();
 
-  int last_value = smem_found_topk_values[0];
-  for (int round = 0; round < NumBins / NumThreads; ++round) {
+  int last_value  = smem_found_topk_values[0];
+  int first_round = smem_threshold_bin_idx[0] / NumThreads;
+  for (int round = first_round; round < NumBins / NumThreads; ++round) {
     int idx       = threadIdx.x + NumThreads * round;
     int bin_count = smem_final.histo.data[idx];
-    __syncthreads();
 
     int prefix_sum = 0;
     int total_sum  = 0;
-    using Scan     = cub::BlockScan<int, NumThreads>;
+    using Scan     = cub::BlockScan<int, NumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
     Scan(smem_final.histo.scan).ExclusiveSum(bin_count, prefix_sum, total_sum);
 
     prefix_sum += last_value;
     total_sum += last_value;
-    smem_final.histo.data[idx] = prefix_sum;
-    __syncthreads();
-
-    bool found_threshold = false;
-    if (prefix_sum < static_cast<int>(TopK)) {
-      int next_prefix_sum = threadIdx.x == NumThreads - 1 ? total_sum : smem_final.histo.data[idx + 1];
-      if (next_prefix_sum >= static_cast<int>(TopK)) {
-        smem_threshold_bin_idx[0] = idx;
-        smem_final_bin_size[0]    = next_prefix_sum - prefix_sum;
-        found_threshold           = true;
-      }
+    if (prefix_sum < static_cast<int>(TopK) && prefix_sum + bin_count >= static_cast<int>(TopK)) {
+      smem_threshold_bin_idx[0] = idx;
+      smem_final_bin_size[0]    = bin_count;
     }
-
-    // CTA-wide vote: once any thread finds the threshold bin, all threads leave
-    // the scan loop with the same shared threshold metadata.
-    if (__syncthreads_or(found_threshold)) {
+    // Publish the threshold and protect scan storage before a uniform exit.
+    __syncthreads();
+    if (total_sum >= static_cast<int>(TopK)) {
       break;
     }
     last_value = total_sum;
   }
-  __syncthreads();
 
-  threshold_bin_idx = smem_threshold_bin_idx[0];
+  // The final scan-round barrier already publishes the threshold and protects
+  // storage reuse. The block-wide aggregate makes the loop exit uniform.
+  threshold_bin_idx      = smem_threshold_bin_idx[0];
+  const bool bounded_bin = smem_final_bin_size[0] <= NumFinalItems;
 
-  auto process_bins = [&](float raw_score, int idx) {
-    if (!is_topk_candidate<ForceBlocksCountInTopK>(
-            static_cast<uint32_t>(idx), force_begin, force_end_start, num_valid_pages)) {
-      return;
-    }
-    float score = score_for_topk<ForceBlocksCountInTopK>(raw_score, idx, force_begin, force_end_start, num_valid_pages);
+  int  first_terminal_bin = 4;
+  auto process_bins       = [&](float score, int idx) {
+    idx += row_start;
     if (is_partial_match<pattern_shift>(score, logit_pattern)) {
       uint32_t bin_idx = extract_bin_idx<Step>(score);
       if (static_cast<int>(bin_idx) < threshold_bin_idx) {
         int dst_idx          = atomicAdd(&smem_found_topk_values[0], 1);
         smem_output[dst_idx] = idx;
       }
-      if constexpr (Step < 3) {
-        if (static_cast<int>(bin_idx) == threshold_bin_idx && smem_final_bin_size[0] <= NumFinalItems) {
-          int dst_idx                       = atomicAdd(&smem_final_dst_idx[0], 1);
-          smem_final.items.logits[dst_idx]  = score;
-          smem_final.items.indices[dst_idx] = idx;
-        }
-      } else {
-        if (static_cast<int>(bin_idx) == threshold_bin_idx) {
-          int dst_idx = atomicAdd(&smem_final.histo.data[bin_idx], 1);
-          if (dst_idx < static_cast<int>(TopK)) {
-            smem_output[dst_idx] = idx;
-          }
+      if (static_cast<int>(bin_idx) == threshold_bin_idx && bounded_bin) {
+        int dst_idx                       = atomicAdd(&smem_final_dst_idx[0], 1);
+        smem_final.items.logits[dst_idx]  = score;
+        smem_final.items.indices[dst_idx] = idx;
+      }
+      if constexpr (Step == 3) {
+        if (static_cast<int>(bin_idx) == threshold_bin_idx && !bounded_bin) {
+          first_terminal_bin = min(first_terminal_bin, static_cast<int>(ordered_score_bits(score) & 3u));
         }
       }
     }
   };
   vectorized_process(threadIdx.x, NumThreads, logits + row_start, row_end - row_start, process_bins);
+  if constexpr (Step == 3) {
+    if (!bounded_bin) {
+      int first = Reduce(smem_final.histo.reduce).Reduce(first_terminal_bin, [](int a, int b) { return min(a, b); });
+      if (threadIdx.x == 0) {
+        // The threshold is cached; reuse its slot to publish the terminal start.
+        smem_threshold_bin_idx[0] = first;
+      }
+    }
+  }
   __syncthreads();
 
-  return smem_final_bin_size[0] > NumFinalItems;
+  if constexpr (Step == 3) {
+    // A bounded final bin can use the same exact FP32 ranking as earlier passes.
+    if (bounded_bin) {
+      return false;
+    }
+    // The last histogram leaves two score bits unresolved. Refine those bits,
+    // then scan in logical-index order so ties never depend on atomic arrival.
+    int selected = smem_found_topk_values[0];
+    for (uint32_t low_bin = smem_threshold_bin_idx[0]; low_bin < 4 && selected < static_cast<int>(TopK); ++low_bin) {
+      for (int base = row_start; base < row_end && selected < static_cast<int>(TopK); base += NumThreads) {
+        int idx       = base + threadIdx.x;
+        int candidate = 0;
+        if (idx < row_end) {
+          float    score = logits[idx];
+          uint32_t bits  = ordered_score_bits(score);
+          candidate      = is_partial_match<pattern_shift>(score, logit_pattern) &&
+                      static_cast<int>(extract_bin_idx<Step>(score)) == threshold_bin_idx && (bits & 3u) == low_bin;
+        }
+        int prefix = 0;
+        int count  = 0;
+        using Scan = cub::BlockScan<int, NumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+        Scan(smem_final.histo.scan).ExclusiveSum(candidate, prefix, count);
+        if (candidate && selected + prefix < static_cast<int>(TopK)) {
+          smem_output[selected + prefix] = idx;
+        }
+        selected += count;
+        __syncthreads();
+      }
+    }
+  }
+
+  return !bounded_bin;
 }
 
 template <uint32_t TopK, bool ForceBlocksCountInTopK>
@@ -521,14 +531,18 @@ __global__ __launch_bounds__(kIndexerThreadsPerBlock) void sparse_topk_indexer_k
   constexpr int kNumBins       = kIndexerNumBins;
   constexpr int kNumFinalItems = kIndexerNumFinalItems;
 
-  using Scan = cub::BlockScan<int, kNumThreads>;
+  using Scan   = cub::BlockScan<int, kNumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+  using Reduce = cub::BlockReduce<int, kNumThreads>;
   struct FinalItems {
     int   indices[kNumFinalItems];
     float logits[kNumFinalItems];
   };
   struct Histogram {
-    typename Scan::TempStorage scan;
-    int                        data[kNumBins];
+    union {
+      typename Scan::TempStorage   scan;
+      typename Reduce::TempStorage reduce;
+    };
+    alignas(16) int data[kNumBins];
   };
   __shared__ union {
     FinalItems items;
@@ -547,7 +561,6 @@ __global__ __launch_bounds__(kIndexerThreadsPerBlock) void sparse_topk_indexer_k
   // contiguous along K and does not need MSA's transpose workspace.
   size_t       row_offset = (static_cast<size_t>(q_abs) * num_qo_heads + head_idx) * max_k_tiles;
   float const* logits     = in + row_offset;
-  int const    row_start  = 0;
   int32_t*     row_out    = out + (static_cast<size_t>(q_abs) * num_qo_heads + head_idx) * output_width;
 
   uint32_t row_num_valid_pages = get_row_num_valid_pages(q_abs, num_valid_pages, query_positions);
@@ -557,24 +570,26 @@ __global__ __launch_bounds__(kIndexerThreadsPerBlock) void sparse_topk_indexer_k
     }
     return;
   }
-  // With per-query causal positions, do not load and histogram the future
-  // -inf tail.  This also avoids scanning padded max-score columns when the
-  // global valid-page count is smaller than max_k_tiles.
-  int const row_end         = static_cast<int>(row_num_valid_pages);
+  // Nontrivial rows have disjoint forced ranges and a nonempty ordinary interval,
+  // which excludes both forced pages and the future/padded tail.
   uint32_t  force_end_start = force_end <= row_num_valid_pages ? row_num_valid_pages - force_end : 0;
+  int const row_start       = static_cast<int>(force_begin);
+  int const row_end         = static_cast<int>(force_end_start);
+  uint32_t  forced_topk     = ForceBlocksCountInTopK ? force_begin + force_end : 0;
 
   for (uint32_t idx = threadIdx.x; idx < output_width; idx += kNumThreads) {
     smem_output[idx] = -1;
   }
   if (threadIdx.x == 0) {
     smem_final_dst_idx[0]     = 0;
-    smem_found_topk_values[0] = 0;
+    smem_found_topk_values[0] = forced_topk;
   }
   __syncthreads();
 
   int      threshold_bin_idx = -1;
   uint32_t logit_pattern     = 0;
   bool     continue_to_next_step =
+      forced_topk < TopK &&
       process_histogram_step<0, kNumThreads, kNumBins, kNumFinalItems, TopK, ForceBlocksCountInTopK>(
           logits,
           row_end,
@@ -627,21 +642,22 @@ __global__ __launch_bounds__(kIndexerThreadsPerBlock) void sparse_topk_indexer_k
             row_num_valid_pages);
   }
   if (continue_to_next_step) {
-    process_histogram_step<3, kNumThreads, kNumBins, kNumFinalItems, TopK, ForceBlocksCountInTopK>(
-        logits,
-        row_end,
-        logit_pattern,
-        threshold_bin_idx,
-        smem_output,
-        smem_threshold_bin_idx,
-        smem_final_dst_idx,
-        smem_final_bin_size,
-        smem_found_topk_values,
-        smem_final,
-        row_start,
-        force_begin,
-        force_end_start,
-        row_num_valid_pages);
+    continue_to_next_step =
+        process_histogram_step<3, kNumThreads, kNumBins, kNumFinalItems, TopK, ForceBlocksCountInTopK>(
+            logits,
+            row_end,
+            logit_pattern,
+            threshold_bin_idx,
+            smem_output,
+            smem_threshold_bin_idx,
+            smem_final_dst_idx,
+            smem_final_bin_size,
+            smem_found_topk_values,
+            smem_final,
+            row_start,
+            force_begin,
+            force_end_start,
+            row_num_valid_pages);
   }
 
   if (!continue_to_next_step) {
@@ -650,27 +666,26 @@ __global__ __launch_bounds__(kIndexerThreadsPerBlock) void sparse_topk_indexer_k
     // Rank only candidates in the threshold bin; bins above it were already
     // copied directly into smem_output.
     for (int i = threadIdx.x; i < final_count; i += kNumThreads) {
-      int   out_index = 0;
-      float logit     = smem_final.items.logits[i];
+      int   out_index     = 0;
+      float logit         = smem_final.items.logits[i];
+      int   logical_index = smem_final.items.indices[i];
       for (int j = 0; j < final_count; ++j) {
         float other_logit = smem_final.items.logits[j];
-        if (logit < other_logit || (logit == other_logit && i < j)) {
+        if (logit < other_logit || (logit == other_logit && logical_index > smem_final.items.indices[j])) {
           ++out_index;
         }
       }
       if (out_index + base_idx < static_cast<int>(TopK)) {
-        smem_output[out_index + base_idx] = smem_final.items.indices[i];
+        smem_output[out_index + base_idx] = logical_index;
       }
     }
-    __syncthreads();
   }
 
-  if constexpr (!ForceBlocksCountInTopK) {
-    const uint32_t forced_slots = force_begin + force_end;
-    for (uint32_t slot = threadIdx.x; slot < forced_slots; slot += kNumThreads) {
-      smem_output[TopK + slot] =
-          forced_slot_to_block(slot, force_begin, force_end, force_end_start, row_num_valid_pages);
-    }
+  const uint32_t forced_slots  = force_begin + force_end;
+  const uint32_t forced_offset = ForceBlocksCountInTopK ? 0 : TopK;
+  for (uint32_t slot = threadIdx.x; slot < forced_slots; slot += kNumThreads) {
+    smem_output[forced_offset + slot] =
+        forced_slot_to_block(slot, force_begin, force_end, force_end_start, row_num_valid_pages);
   }
   __syncthreads();
   uint32_t warp_id = threadIdx.x >> 5;
@@ -767,6 +782,7 @@ inline musaError_t launch_sparse_topk_select_typed(float const*   max_score,
                                                                                                output_width,
                                                                                                force_begin,
                                                                                                force_end);
+      return musaGetLastError();
     } else if (max_k_tiles <= 128) {
       sparse_topk_small_k_kernel<TopK, 128, ForceBlocksCountInTopK><<<grid, block, 0, stream>>>(max_score,
                                                                                                 output_indices,
@@ -778,6 +794,7 @@ inline musaError_t launch_sparse_topk_select_typed(float const*   max_score,
                                                                                                 output_width,
                                                                                                 force_begin,
                                                                                                 force_end);
+      return musaGetLastError();
     } else {
       sparse_topk_small_k_kernel<TopK, 256, ForceBlocksCountInTopK><<<grid, block, 0, stream>>>(max_score,
                                                                                                 output_indices,
@@ -789,8 +806,8 @@ inline musaError_t launch_sparse_topk_select_typed(float const*   max_score,
                                                                                                 output_width,
                                                                                                 force_begin,
                                                                                                 force_end);
+      return musaGetLastError();
     }
-    return musaGetLastError();
   }
   if (max_k_tiles >= 12288) {
     return musaErrorNotSupported;

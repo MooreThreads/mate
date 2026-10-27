@@ -425,6 +425,7 @@ struct VarlenFlashAttentionParams {
                            &params.tile_size_q,
                            &params.tile_size_k,
                            &params.tile_size_v,
+                           &outmax_ptr,
                            &params.tile_q_dim0,
                            &params.tile_q_dim1,
                            &params.tile_q_dim2,
@@ -435,6 +436,7 @@ struct VarlenFlashAttentionParams {
                            &params.tile_v_dim1,
                            &params.tile_v_dim2};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 {% endmacro %}
 
 {# Build and launch a non-varlen kernel. #}
@@ -596,6 +598,7 @@ struct VarlenFlashAttentionParams {
                            &params.seqq_div,
                            &params.seqq_mul,
                            &params.seqq_sft,
+                           &outmax_ptr,
                            &params.tile_q_dim0,
                            &params.tile_q_dim1,
                            &params.tile_q_dim2,
@@ -613,6 +616,7 @@ struct VarlenFlashAttentionParams {
                            &params.tile_out_dim2,
                            &params.tile_out_dim3};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
   };
   launch_dense(dense_q, dense_k, dense_v, dense_out, dense_out_lse);
 {% endmacro %}
@@ -627,7 +631,8 @@ void run_{{ func_name }}(const std::string&                 object_path,
                                std::optional<ffi::TensorView>     input_cu_seqlen_q,
                                std::optional<ffi::TensorView>     input_cu_seqlen_k,
                                std::optional<int64_t>             max_seqlen_q,
-                               std::optional<int64_t>             max_seqlen_kv) {
+                               std::optional<int64_t>             max_seqlen_kv,
+                               std::optional<ffi::TensorView>     max_logits) {
   CHECK_MUSA(q);
   CHECK_MUSA(k);
   CHECK_MUSA(v);
@@ -637,6 +642,21 @@ void run_{{ func_name }}(const std::string&                 object_path,
   CHECK_DEVICE(q, v);
   CHECK_DEVICE(q, out);
   CHECK_DEVICE(q, out_lse);
+  static constexpr bool HasMaxLogits = {{ 'true' if spec.has_max_logits else 'false' }};
+  void* outmax_ptr = nullptr;
+  if constexpr (HasMaxLogits) {
+    TVM_FFI_ICHECK(max_logits.has_value()) << "max_logits is required by the generated kernel";
+    auto maximum = max_logits.value();
+    CHECK_MUSA(maximum);
+    CHECK_DEVICE(q, maximum);
+    CHECK_CONTIGUOUS(maximum);
+    TVM_FFI_ICHECK(dtype_equal(maximum.dtype(), dl_float32));
+    TVM_FFI_ICHECK_EQ(maximum.ndim(), out_lse.ndim());
+    for (int i = 0; i < out_lse.ndim(); ++i) {
+      TVM_FFI_ICHECK_EQ(maximum.size(i), out_lse.size(i));
+    }
+    outmax_ptr = maximum.data_ptr();
+  }
 
   DLDataType data_type = q.dtype();
   TVM_FFI_ICHECK(dtype_equal(data_type, k.dtype()) && dtype_equal(data_type, v.dtype()) &&
@@ -694,7 +714,6 @@ void run_{{ func_name }}(const std::string&                 object_path,
 {% else %}
 {{ emit_non_varlen_launch() }}
 {% endif %}
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_{{ func_name }}, run_{{ func_name }});

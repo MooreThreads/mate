@@ -5,89 +5,10 @@ from typing import Callable, Optional, Tuple
 import torch
 
 from .tilelang.sparse_mla_decode import sparse_mla_decode_fwd
-from .tilelang.sparse_mla_model1_fwd_pack import (
-    sparse_mla_fwd_interface_model1_pack,
-)
 from .tilelang.sparse_mla_prefill import sparse_mla_prefill_fwd
 
 
 MetadataGetter = Callable[..., Tuple[torch.Tensor, torch.Tensor]]
-
-
-def _try_model1_seq_pack_sparse_prefill(
-    *,
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    sm_scale: float,
-    d_v: int,
-    attn_sink: Optional[torch.Tensor],
-    topk_length: Optional[torch.Tensor],
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Use private MODEL1 seq-pack kernels when the public shape is exact."""
-    if d_v != 512 or topk_length is None:
-        return None
-    if q.ndim != 3 or kv.ndim != 3 or indices.ndim != 3:
-        return None
-    seq_len, heads, head_dim = q.shape
-    seq_len_kv, kv_group, kv_dim = kv.shape
-    if heads == 8:
-        token_pack = 8
-    elif heads == 16:
-        token_pack = 4
-    elif heads == 32:
-        token_pack = 2
-    else:
-        return None
-
-    if (
-        q.dtype != torch.bfloat16
-        or kv.dtype != torch.bfloat16
-        or indices.dtype != torch.int32
-        or topk_length.dtype != torch.int32
-        or not q.is_contiguous()
-        or not kv.is_contiguous()
-        or head_dim != 512
-        or kv_group != 1
-        or kv_dim != 512
-        or seq_len == 0
-        or seq_len % token_pack != 0
-        or indices.shape[0] != seq_len
-        or indices.shape[1] != 1
-        or indices.shape[-1] % 64 != 0
-        or topk_length.shape != (seq_len,)
-    ):
-        return None
-
-    if seq_len_kv == seq_len:
-        compressed_kv_len = 0
-        compress_ratio = 1
-    elif seq_len_kv > seq_len:
-        compressed_kv_len = seq_len_kv - seq_len
-        if compressed_kv_len <= 0 or seq_len % compressed_kv_len != 0:
-            return None
-        compress_ratio = seq_len // compressed_kv_len
-        if compress_ratio != 128:
-            return None
-    else:
-        return None
-
-    packed_indices = indices[token_pack - 1 :: token_pack].contiguous()
-    packed_topk_length = topk_length[token_pack - 1 :: token_pack].contiguous()
-    return sparse_mla_fwd_interface_model1_pack(
-        q=q,
-        kv=kv,
-        indices=packed_indices,
-        topk_length=packed_topk_length,
-        sm_scale=sm_scale,
-        attn_sink=attn_sink,
-        d_v=d_v,
-        return_max_logits=True,
-        causal_window=128,
-        compressed_kv_len=compressed_kv_len,
-        compress_ratio=compress_ratio,
-        token_pack=token_pack,
-    )
 
 
 def flashmla_sparse_prefill(
@@ -101,18 +22,9 @@ def flashmla_sparse_prefill(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single FlashMLA sparse-prefill dispatcher for MODEL1 and V3.2."""
-    pack_out = _try_model1_seq_pack_sparse_prefill(
-        q=q,
-        kv=kv,
-        indices=indices,
-        sm_scale=sm_scale,
-        d_v=d_v,
-        attn_sink=attn_sink,
-        topk_length=topk_length,
-    )
-    if pack_out is not None:
-        return pack_out
-
+    # Public indices are independent per query. Shape alone cannot establish
+    # MODEL1's shared-candidate and causal-window contract; its explicit pack
+    # entry remains available to callers that provide that contract.
     return sparse_mla_prefill_fwd(
         q=q,
         kv=kv,

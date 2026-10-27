@@ -352,7 +352,9 @@ def chunk_cumsum_launch(
         raise RuntimeError("A must be a dense [heads] vector (stride(-1) == 1).")
     if A.dtype != torch.float32:
         raise RuntimeError("A must be fp32.")
-    if dt_bias is not None and (dt_bias.numel() != heads or dt_bias.dtype != torch.float32):
+    if dt_bias is not None and (
+        dt_bias.numel() != heads or dt_bias.dtype != torch.float32
+    ):
         raise RuntimeError("dt_bias must be fp32 [heads].")
     if dt_bias is not None and dt_bias.stride(-1) != 1:
         raise RuntimeError("dt_bias must be a dense [heads] vector (stride(-1) == 1).")

@@ -515,7 +515,7 @@ __device__ void moe_fused_gate_impl_static(void*    input,
       }
       if (num_token_non_padded > 0 && thread_row >= num_token_non_padded) idx = -1;
       indices_ptr[last_idx] = idx;
-      output_ptr[last_idx]  = last_val;
+      output_ptr[last_idx]  = renorm ? last_val : output_sum * last_val;
       ++last_idx;
       ++expert_offset;
     }
@@ -603,6 +603,7 @@ __global__ void moe_fused_gate_kernel_static(void*    input,
                                                dynamic_index_map_valid_ptr,               \
                                                random_index_ptr,                          \
                                                num_physical_experts);                     \
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();                                                      \
     dispatched = true;                                                                    \
   } while (0);
 
@@ -725,6 +726,7 @@ void dispatch_moe_fuse_gate_dynamic(ffi::TensorView output,
                                                random_index_ptr,
                                                num_physical_experts,
                                                map_policy);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
   } else if (input_dtype == float16_code) {
     moe_fused_gate_kernel_dynamic<float16_t>
         <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),
@@ -747,6 +749,7 @@ void dispatch_moe_fuse_gate_dynamic(ffi::TensorView output,
                                                random_index_ptr,
                                                num_physical_experts,
                                                map_policy);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
   } else if (input_dtype == float32_code) {
     moe_fused_gate_kernel_dynamic<float32_t>
         <<<num_blocks, block_dim, 0, stream>>>(input.data_ptr(),
@@ -769,10 +772,10 @@ void dispatch_moe_fuse_gate_dynamic(ffi::TensorView output,
                                                random_index_ptr,
                                                num_physical_experts,
                                                map_policy);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
   } else {
     TVM_FFI_ICHECK(false) << "Unsupported data type for moe_fused_gate";
   }
-  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 bool dispatch_moe_fuse_gate_static(ffi::TensorView output,
@@ -805,6 +808,11 @@ bool dispatch_moe_fuse_gate_static(ffi::TensorView output,
   constexpr int block_size = 256;
 #define DISPATCH_FOR_MAP_POLICY(MAP_POLICY)                        \
   switch (num_experts) {                                           \
+    case 288:                                                      \
+      if (num_expert_group == 1 && input_dtype == float32_code) {  \
+        LAUNCH_MOE_GATE_CONFIG(float32_t, 288, 1, MAP_POLICY);     \
+      }                                                            \
+      break;                                                       \
     case 384:                                                      \
       if (num_expert_group == 8) {                                 \
         if (input_dtype == bfloat16_code) {                        \
@@ -916,9 +924,6 @@ bool dispatch_moe_fuse_gate_static(ffi::TensorView output,
   }
 #undef DISPATCH_FOR_MAP_POLICY
 
-  if (dispatched) {
-    MATE_CHECK_MUSA_KERNEL_LAUNCH();
-  }
   return dispatched;
 }
 

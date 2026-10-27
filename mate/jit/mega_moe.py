@@ -2,30 +2,26 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping, Sequence
-
-from jinja2 import Environment, FileSystemLoader
 
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
-from .gemm.deep_gemm.deep_gemm_utils import DEEP_GEMM_CUDA_FLAGS
-from .utils import EXPORT_FUNC, TVM_HEADER
+from .mega_moe_common import (
+    MEGA_MOE_EXTRA_CFLAGS,
+    MEGA_MOE_EXTRA_MUSA_CFLAGS,
+    MEGA_MOE_LAYOUT_REVISION,
+    _align,
+    _generated_source_path,
+    _render_source,
+    _extra_include_paths,
+    _normalize_activation,
+)
 
-
-MEGA_MOE_EXTRA_CFLAGS = [
-    "-O3",
-    "-Wno-switch-bool",
-]
-
-MEGA_MOE_EXTRA_MUSA_CFLAGS = list(DEEP_GEMM_CUDA_FLAGS) + [
-    "-fno-signed-zeros",
-    "-DMARCH_TYPE=310",
-]
 
 MEGA_MOE_BLOCK_M = 32
 MEGA_MOE_BLOCK_N = 256
 MEGA_MOE_BLOCK_K = 128
+MEGA_MOE_DECODE_MAX_TOKENS_PER_RANK = 128
 MEGA_MOE_STAGE1_NUM_STAGES = 3
 MEGA_MOE_STAGE1_NUM_DISPATCH_THREADS = 128
 MEGA_MOE_STAGE1_NUM_COMPUTE_THREADS = 384
@@ -34,10 +30,22 @@ MEGA_MOE_STAGE2_NUM_SMEM_STAGES = 4
 MEGA_MOE_STAGE2_NUM_CD_STAGES = 1
 MEGA_MOE_STAGE2_CD_DESC_WORDS = 4
 
-MEGA_MOE_TEMPLATE_ENV = Environment(
-    loader=FileSystemLoader((jit_env.MATE_TEMPLATE_DIR / "mega_moe").as_posix()),
-    keep_trailing_newline=True,
-)
+
+def _build_spec(
+    kernel_name: str, template: str, render_config: dict[str, object]
+) -> JitSpec:
+    # Keep the spec declaration local for static test dependency discovery.
+    template_dir = jit_env.MATE_TEMPLATE_DIR / "mega_moe"
+    source_file = _generated_source_path(kernel_name)
+    source = _render_source(kernel_name, template_dir / template, render_config)
+    return gen_jit_spec(
+        name=kernel_name,
+        sources=[source_file],
+        generated_sources={source_file: source},
+        extra_cflags=list(MEGA_MOE_EXTRA_CFLAGS),
+        extra_cuda_cflags=list(MEGA_MOE_EXTRA_MUSA_CFLAGS),
+        extra_include_paths=_extra_include_paths(),
+    )
 
 
 @dataclass(frozen=True)
@@ -50,14 +58,7 @@ class MegaMoEKernelConfig:
     intermediate_hidden: int
     num_mps: int
     fast_math: bool = True
-
-
-def _align(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
+    cc: int = 31
 
 
 def get_block_m_for_mega_moe(
@@ -72,7 +73,7 @@ def get_block_m_for_mega_moe(
 
 def _num_max_pool_tokens(config: MegaMoEKernelConfig, block_m: int) -> int:
     num_experts_per_rank = config.num_experts // config.num_ranks
-    num_max_recv_tokens = config.num_ranks * config.num_max_tokens_per_rank
+    num_max_recv_tokens = config.num_ranks * MEGA_MOE_DECODE_MAX_TOKENS_PER_RANK
     num_max_experts_per_token = min(config.num_topk, num_experts_per_rank)
     return _align(
         num_max_recv_tokens * num_max_experts_per_token
@@ -86,6 +87,8 @@ def _num_padded_sf_pool_tokens(num_max_pool_tokens: int, block_m: int) -> int:
 
 
 def _validate_config(config: MegaMoEKernelConfig) -> None:
+    if config.cc != 31:
+        raise ValueError(f"MegaMoE currently supports MP31 only, got MP{config.cc}")
     if config.num_ranks <= 0:
         raise ValueError("num_ranks must be positive")
     if config.num_experts <= 0 or config.num_experts % config.num_ranks != 0:
@@ -122,6 +125,7 @@ def _normalize_config(
             intermediate_hidden=int(config["intermediate_hidden"]),
             num_mps=int(config["num_mps"]),
             fast_math=bool(config.get("fast_math", True)),
+            cc=int(config.get("cc", 31)),
         )
     _validate_config(result)
     return result
@@ -154,6 +158,7 @@ def _stage1_render_config(config: MegaMoEKernelConfig) -> dict[str, object]:
     return {
         **config.__dict__,
         "num_experts_per_rank": config.num_experts // config.num_ranks,
+        "decode_max_tokens_per_rank": MEGA_MOE_DECODE_MAX_TOKENS_PER_RANK,
         "num_experts_per_wave": 1,
         "block_m": block_m,
         "block_n": block_n,
@@ -194,6 +199,7 @@ def _stage2_render_config(config: MegaMoEKernelConfig) -> dict[str, object]:
     return {
         **config.__dict__,
         "num_experts_per_rank": config.num_experts // config.num_ranks,
+        "decode_max_tokens_per_rank": MEGA_MOE_DECODE_MAX_TOKENS_PER_RANK,
         "num_experts_per_wave": 1,
         "block_m": block_m,
         "block_n": block_n,
@@ -213,114 +219,75 @@ def _dispatch_name(prefix: str, config: MegaMoEKernelConfig) -> str:
         f"_h{config.hidden}_ih{config.intermediate_hidden}"
         f"_mps{config.num_mps}_fm{int(config.fast_math)}"
     )
-    return f"mate_jit_mega_moe_{prefix}_{suffix}"
-
-
-def _generated_source_path(dispatch_name: str) -> Path:
-    return jit_env.MATE_GEN_SRC_DIR / "mega_moe" / f"{dispatch_name}.mu"
-
-
-def _extra_include_paths() -> list[Path]:
-    return [
-        jit_env.MATE_INCLUDE_DIR,
-        jit_env.MATE_CSRC_DIR,
-        jit_env.MUTLASS_INCLUDE_DIR,
-        jit_env.MUTLASS_INCLUDE_DIR.parent / "tools" / "util" / "include",
-        jit_env.MUTLASS_INCLUDE_DIR.parent / "experimental" / "fmha",
-    ]
-
-
-def _render_source(
-    template_name: str,
-    dispatch_name: str,
-    render_config: dict[str, object],
-) -> str:
-    render_config = dict(render_config)
-    render_config["func_name"] = dispatch_name
-    return (
-        TVM_HEADER
-        + MEGA_MOE_TEMPLATE_ENV.get_template(template_name).render(render_config)
-        + EXPORT_FUNC.render(render_config)
-    )
-
-
-def _freeze_config(
-    config: MegaMoEKernelConfig,
-) -> tuple[int, int, int, int, int, int, int, bool]:
-    return (
-        config.num_ranks,
-        config.num_experts,
-        config.num_max_tokens_per_rank,
-        config.num_topk,
-        config.hidden,
-        config.intermediate_hidden,
-        config.num_mps,
-        config.fast_math,
-    )
-
-
-def _spec(
-    dispatch_name: str,
-    source_file: Path,
-    source: str,
-) -> JitSpec:
-    return gen_jit_spec(
-        name=dispatch_name,
-        sources=[source_file],
-        generated_sources={source_file: source},
-        extra_cflags=list(MEGA_MOE_EXTRA_CFLAGS),
-        extra_cuda_cflags=list(MEGA_MOE_EXTRA_MUSA_CFLAGS),
-        extra_include_paths=_extra_include_paths(),
-    )
+    return f"mate_jit_mega_moe_{prefix}_{suffix}_layout{MEGA_MOE_LAYOUT_REVISION}"
 
 
 def gen_fp8_fp8_mega_moe_stage1_spec(
     config: Mapping[str, Any] | MegaMoEKernelConfig,
+    *,
+    activation: str = "swiglu",
+    use_situ_linear: bool = False,
 ) -> JitSpec:
     kernel_config = _normalize_config(config)
-    dispatch_name = _dispatch_name("fp8_fp8_stage1", kernel_config)
-    source_file = _generated_source_path(dispatch_name)
-    source = _render_source(
-        "fp8_fp8_stage1_kern.j2",
-        dispatch_name,
-        _stage1_render_config(kernel_config),
+    activation = _normalize_activation(activation)
+    use_situ_linear = bool(use_situ_linear and activation == "situ")
+    dispatch_name = _dispatch_name(
+        f"mp{kernel_config.cc}_fp8_fp8_stage1_act{activation}_lin{int(use_situ_linear)}_v4",
+        kernel_config,
     )
-    return _spec(dispatch_name, source_file, source)
+    render_config = _stage1_render_config(kernel_config)
+    render_config["use_situ"] = activation == "situ"
+    render_config["use_situ_linear"] = use_situ_linear
+    return _build_spec(dispatch_name, "fp8_fp8_decode_stage1_kern.j2", render_config)
 
 
 def gen_fp8_fp8_mega_moe_stage2_spec(
     config: Mapping[str, Any] | MegaMoEKernelConfig,
 ) -> JitSpec:
     kernel_config = _normalize_config(config)
-    dispatch_name = _dispatch_name("fp8_fp8_stage2", kernel_config)
-    source_file = _generated_source_path(dispatch_name)
-    source = _render_source(
-        "fp8_fp8_stage2_kern.j2",
+    dispatch_name = _dispatch_name(
+        f"mp{kernel_config.cc}_fp8_fp8_stage2", kernel_config
+    )
+    return _build_spec(
         dispatch_name,
+        "fp8_fp8_decode_stage2_kern.j2",
         _stage2_render_config(kernel_config),
     )
-    return _spec(dispatch_name, source_file, source)
 
 
 @functools.cache
-def _load_stage1_module(frozen_config: tuple[int, int, int, int, int, int, int, bool]):
-    config = MegaMoEKernelConfig(*frozen_config)
-    return gen_fp8_fp8_mega_moe_stage1_spec(config).build_and_load()
+def _load_stage1_module(
+    config: MegaMoEKernelConfig,
+    activation: str,
+    use_situ_linear: bool,
+):
+    return gen_fp8_fp8_mega_moe_stage1_spec(
+        config, activation=activation, use_situ_linear=use_situ_linear
+    ).build_and_load()
 
 
 @functools.cache
-def _load_stage2_module(frozen_config: tuple[int, int, int, int, int, int, int, bool]):
-    config = MegaMoEKernelConfig(*frozen_config)
+def _load_stage2_module(
+    config: MegaMoEKernelConfig,
+):
     return gen_fp8_fp8_mega_moe_stage2_spec(config).build_and_load()
 
 
 def get_fp8_fp8_mega_moe_stage1_module(
     config: Mapping[str, Any] | MegaMoEKernelConfig,
+    *,
+    activation: str = "swiglu",
+    use_situ_linear: bool = False,
 ):
     kernel_config = _normalize_config(config)
+    activation = _normalize_activation(activation)
+    use_situ_linear = bool(use_situ_linear and activation == "situ")
     return (
-        _dispatch_name("fp8_fp8_stage1", kernel_config),
-        _load_stage1_module(_freeze_config(kernel_config)),
+        _dispatch_name(
+            f"mp{kernel_config.cc}_fp8_fp8_stage1_act{activation}_lin{int(use_situ_linear)}_v4",
+            kernel_config,
+        ),
+        _load_stage1_module(kernel_config, activation, use_situ_linear),
     )
 
 
@@ -329,13 +296,15 @@ def get_fp8_fp8_mega_moe_stage2_module(
 ):
     kernel_config = _normalize_config(config)
     return (
-        _dispatch_name("fp8_fp8_stage2", kernel_config),
-        _load_stage2_module(_freeze_config(kernel_config)),
+        _dispatch_name(f"mp{kernel_config.cc}_fp8_fp8_stage2", kernel_config),
+        _load_stage2_module(kernel_config),
     )
 
 
 def gen_mega_moe_runtime_utils_spec() -> JitSpec:
-    name = "mate_mega_moe_runtime_utils"
+    # Bump when the unified symmetric-buffer layout ABI changes. Header-only
+    # layout edits are otherwise invisible to an already-built JIT library.
+    name = f"mate_mega_moe_runtime_utils_layout{MEGA_MOE_LAYOUT_REVISION}"
     return gen_jit_spec(
         name=name,
         sources=[jit_env.MATE_CSRC_DIR / "mega_moe_runtime_utils.mu"],

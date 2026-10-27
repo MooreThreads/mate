@@ -151,7 +151,7 @@ JIT/AOT modules that compile MUSA kernels.
 | `MATE_PYTEST_GUARD_ALLOC` | `0` | Enable the guarded allocator by default for MATE repository pytest runs |
 | `MATE_PYTEST_GUARD_MODE` | `tail` | Default MATE repository pytest guard allocator mode: `tail` or `head` |
 | `MATE_PYTEST_GUARD_LOG_ALLOCATIONS` | `0` | Log guarded alloc/free events during MATE repository pytest runs |
-| `MATE_DRY_RUN` | `0` | Internal test/diagnostic mode used by MATE tests; not intended as a normal user runtime setting |
+| `MATE_DRY_RUN` | `0` | Enable dry-run behavior for MATE test and diagnostic workflows |
 | `MATE_PYTEST_SHARD_TOTAL` | `1` | Number of shards to dispatch all the tests to |
 | `MATE_PYTEST_SHARD_INDEX` | `0` | Index of current shard |
 | `MATE_PYTEST_SHARD_MODE` | `file` | Shard dispatch mode. Currently, only `file` mode is supported |

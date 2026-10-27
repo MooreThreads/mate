@@ -103,6 +103,9 @@ Public repository skills live under `skills/<skill-name>/SKILL.md`.
 
 ## Behavior Rules
 
+- For TileLang kernels, follow the
+  [TileLang development rules](docs/tilelang_development_rules.md).
+
 - Always read relevant files before modifying code
 - For non-trivial tasks, create a plan first
 - Validate changes by running tests

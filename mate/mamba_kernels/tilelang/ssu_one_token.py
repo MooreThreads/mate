@@ -222,7 +222,9 @@ def tilelang_ssu_one_token(
                 # dt -> decay, shared by every dstate lane of this row.
                 # dt_dim == 1 is the broadcast form: every d of this head reads
                 # the same value, so the unexpanded buffer can be used as-is.
-                dt_value = T.cast(dt[batch_idx, head, 0 if dt_dim == 1 else d], "float32")
+                dt_value = T.cast(
+                    dt[batch_idx, head, 0 if dt_dim == 1 else d], "float32"
+                )
                 if use_dt_bias == 1:
                     dt_value = dt_value + dt_bias[head, 0 if b_dim == 1 else d]
                 if dt_softplus == 1:
@@ -548,8 +550,12 @@ def ssu_one_token_launch(
         A,
         B,
         C,
-        Dv if Dv is not None else _dummy((heads, _channel_dim(Dv, dim)), torch.float32, x.device),
-        dt_bias if dt_bias is not None else _dummy((heads, _channel_dim(dt_bias, dim)), torch.float32, x.device),
+        Dv
+        if Dv is not None
+        else _dummy((heads, _channel_dim(Dv, dim)), torch.float32, x.device),
+        dt_bias
+        if dt_bias is not None
+        else _dummy((heads, _channel_dim(dt_bias, dim)), torch.float32, x.device),
         z if z is not None else _dummy((batch, heads, dim), x.dtype, x.device),
         src_slots,
         dst_slots if dst_slots is not None else src_slots,

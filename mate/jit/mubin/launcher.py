@@ -5,13 +5,10 @@ from jinja2 import StrictUndefined, Template
 from mate.jit.core import gen_jit_spec
 
 
-def render_mubin_launcher(family: str, **context) -> str:
-    template_path = (
-        mate.jit.env.MATE_TEMPLATE_DIR
-        / "mubin"
-        / family
-        / "launch_kernel_template.jinja"
-    )
+def render_mubin_launcher(
+    family: str, *, template_name: str = "launch_kernel_template.jinja", **context
+) -> str:
+    template_path = mate.jit.env.MATE_TEMPLATE_DIR / "mubin" / family / template_name
     template = Template(
         template_path.read_text(encoding="utf-8"),
         undefined=StrictUndefined,

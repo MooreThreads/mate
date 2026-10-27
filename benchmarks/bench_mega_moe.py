@@ -460,7 +460,7 @@ def _bench_one_token_count(
 
     stage1_seconds = _bench_kineto(
         run_fused,
-        "fp8_fp8_mega_moe_stage1_impl",
+        "mp31_fp8_fp8_mega_moe_stage1_impl",
         num_tests=args.num_tests,
         suppress_kineto_output=not args.show_kineto_output,
         barrier=lambda: dist.barrier(group=group),
@@ -471,7 +471,7 @@ def _bench_one_token_count(
     )
     stage2_seconds = _bench_kineto(
         run_fused,
-        "fp8_fp8_mega_moe_stage2_impl",
+        "mp31_fp8_fp8_mega_moe_stage2_impl",
         num_tests=args.num_tests,
         suppress_kineto_output=not args.show_kineto_output,
         barrier=lambda: dist.barrier(group=group),

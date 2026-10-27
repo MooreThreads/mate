@@ -377,10 +377,18 @@ def tilelang_fused_chunk_gdn_prefill(
                         g_fragment[j_s, j_t] = (
                             g_shared[i_s % 2, j_s] - g_shared[i_s % 2, j_t]
                         )
+                    # Prefix-scan rounding cannot determine causality. Preserve
+                    # tiny positive differences as no decay, but mask padding NaNs.
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         g_fragment[j_s, j_t] = T.if_then_else(
-                            g_fragment[j_s, j_t] <= 0.0,
-                            g_fragment[j_s, j_t],
+                            j_t <= j_s,
+                            T.if_then_else(
+                                g_fragment[j_s, j_t] <= 0.0,
+                                g_fragment[j_s, j_t],
+                                T.if_then_else(
+                                    g_fragment[j_s, j_t] < 1.0, 0.0, -float("inf")
+                                ),
+                            ),
                             -float("inf"),
                         )
                     for j_s, j_t in T.Parallel(block_S, block_S):
@@ -548,11 +556,17 @@ def tilelang_fused_chunk_gdn_prefill(
                                 g_shared[i_s % 2, valid_seqs - 1]
                                 - g_shared[i_s % 2, j_s]
                             )
+                        # Keep valid rounded-positive differences without
+                        # turning padding NaN/+inf into a unit state weight.
                         for j_s in T.Parallel(block_S):
                             g_exp_rev_shared[i_s % 2, j_s] = T.if_then_else(
                                 g_exp_rev_shared[i_s % 2, j_s] <= 0,
                                 g_exp_rev_shared[i_s % 2, j_s],
-                                float("-inf"),
+                                T.if_then_else(
+                                    g_exp_rev_shared[i_s % 2, j_s] < 1.0,
+                                    0.0,
+                                    float("-inf"),
+                                ),
                             )
 
                         for j_s in T.Parallel(block_S):
@@ -663,6 +677,20 @@ def fused_chunk_gdn_prefill(
                 f"Expected output_state device {k.device}, got {output_state.device}."
             )
         final_state = output_state
+
+    if num_tokens == 0:
+        # No chunks means the initial state passes through unchanged.
+        # Decide from the tensor shape without reading cu_seqlens on the host.
+        if output_final_state:
+            if use_initial_state:
+                final_state.copy_(initial_state)
+            else:
+                final_state.zero_()
+        return (
+            o if output_o else None,
+            h if output_h else None,
+            final_state if output_final_state else None,
+        )
 
     tilelang_fused_chunk_gdn_prefill_kernel = tilelang_fused_chunk_gdn_prefill(
         H,

@@ -5,9 +5,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import torch
 
+from mate._jit_dependencies import JitSourceTemplate
+
 from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
-from ...utils import EXPORT_FUNC, TVM_HEADER, dtype_torch2mutlass_map
+from ...utils import EXPORT_FUNC_SOURCE, TVM_HEADER, dtype_torch2mutlass_map
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
 from .fmha_utils import (
     _ELEMENT_NAME_SUFFIX,
@@ -15,7 +17,6 @@ from .fmha_utils import (
     FMHA_EXTRA_CUDA_CFLAGS,
     _get_fwd_kernel_config as _get_metadata_kernel_config,
     fmha_extra_include_paths,
-    get_fmha_template,
     _resolve_mask,
     round_multiple,
 )
@@ -63,16 +64,14 @@ def _fmha_get_metadata_encode(config: Mapping[str, object]) -> str:
     return "_".join(name_list)
 
 
-def _render_fmha_metadata_source(config: Mapping[str, object]) -> str:
+def _fmha_metadata_render_config(
+    config: Mapping[str, object],
+) -> dict[str, object]:
     render_config = dict(config)
     render_config["func_name"] = str(
         render_config.get("func_name") or _fmha_get_metadata_encode(render_config)
     )
-    return (
-        TVM_HEADER
-        + get_fmha_template("metadata_kern.j2").render(render_config)
-        + EXPORT_FUNC.render(render_config)
-    )
+    return render_config
 
 
 def _fmha_metadata_module(config: Mapping[str, object]):
@@ -241,10 +240,23 @@ def get_fmha_metadata_aot_configs(config_level: int) -> list[dict[str, object]]:
 def gen_fmha_metadata_spec(config: Mapping[str, object]) -> JitSpec:
     dispatch_name = _fmha_get_metadata_encode(config)
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    render_config = _fmha_metadata_render_config(config)
     return gen_jit_spec(
         name=dispatch_name,
         sources=[source_file],
-        generated_sources={source_file: _render_fmha_metadata_source(config)},
+        generated_sources={
+            source_file: JitSourceTemplate(
+                template=(
+                    jit_env.MATE_TEMPLATE_DIR
+                    / "attention"
+                    / "fmha"
+                    / "metadata_kern.j2"
+                ),
+                context=render_config,
+                prefix=TVM_HEADER,
+                suffix=EXPORT_FUNC_SOURCE,
+            )
+        },
         extra_cuda_cflags=list(FMHA_EXTRA_CUDA_CFLAGS),
         extra_include_paths=fmha_extra_include_paths(),
     )

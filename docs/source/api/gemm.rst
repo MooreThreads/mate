@@ -7,6 +7,16 @@ For framework integrations that already target DeepGEMM style Python APIs,
 prefer the ``deep-gemm`` wrapper first. Use the MATE APIs below when wrapper
 coverage is not enough.
 
+The 0.2.7 wrapper additions and their MUSA-specific limits are documented in
+the :doc:`DeepGEMM wrapper guide <../wrappers/deep_gemm_wrapper>`. The wrapper
+preserves upstream-style names where practical, but its cuBLASLt-style,
+grouped-GEMM, scale-layout, and UE8M0 behavior is implemented by MATE and is
+not full upstream behavioral parity.
+
+The DeepGEMM compatibility path supports ``disable_ue8m0_cast=True``. UE8M0
+casting is not implemented on MUSA. The S4FP8 masked GroupGEMM path avoids
+hangs in some MUTLASS decode scenarios.
+
 MoE GEMM
 -------------------------
 
@@ -38,10 +48,16 @@ Dense GEMM
 
 .. autofunction:: bmm
 
-DeepGemm Lighting Indexer
--------------------------
+DeepGEMM Lightning Indexer
+--------------------------
 
 .. currentmodule:: mate.deep_gemm
+
+``fp8_mqa_logits`` and ``fp8_paged_mqa_logits`` accept
+``logits_dtype=torch.bfloat16`` in addition to the default
+``torch.float32``. Any other dtype is rejected. On MP31, ``fp8_mqa_logits``
+does not accept packed int32 scales, which are MP32-only.
+
 .. autofunction:: fp8_einsum
 .. autofunction:: tf32_hc_prenorm_gemm
 .. autofunction:: fp8_mqa_logits

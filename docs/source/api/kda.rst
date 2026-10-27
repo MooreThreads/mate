@@ -14,6 +14,8 @@ and KDA decode on MUSA. Use this page when the ``flash_kda`` wrapper is not
 enough, or when you need direct control over ``mate.kda`` entrypoints such as
 ``chunk_kda`` and ``gated_delta_rule_decode``.
 
+KDA improves performance and adds state-pool mode to decode.
+
 ``chunk_kda`` is MATE's fused chunked KDA operator on MUSA, while
 ``gated_delta_rule_decode`` provides the direct KDA decode API.
 
@@ -44,6 +46,10 @@ Chunk KDA at a glance
   - Varlen: ``[S, H, 128]`` or ``[1, S, H, 128]`` with ``cu_seqlens``
 - Optional recurrent state input/output
 - Optional preallocated ``output`` and ``final_state``
+- Optional per-chunk ``chunk_states`` pool sized with
+  ``mate.kda.kda_chunk_state_rows``
+- Optional state checkpoints via ``checkpoint_every_n_tokens=C`` on MP31 and
+  MP32
 
 Chunk KDA toolchain requirements
 --------------------------------
@@ -85,6 +91,39 @@ Chunk KDA state tensors
 - state dtype: same as value dtype or ``torch.float32``
 - if both ``initial_state`` and ``final_state`` are provided, their dtypes must match
 
+Chunk states pool
+-----------------
+
+``chunk_kda`` runs as a chunk-parallel prepare kernel followed by a recurrence
+kernel. ``chunk_states`` is an optional caller-allocated pool that receives the
+recurrent state at every chunk boundary:
+
+- shape ``[chunk_rows, H, Dv, D]`` and contiguous, with the same dtype as the
+  recurrent state
+- size it with ``mate.kda.kda_chunk_state_rows``; over-provisioning is fine
+  because the kernel writes only the rows it needs
+- row ``workspace_slot + chunk_idx`` of a sequence receives the state entering
+  that chunk, so row 0 is the state before the first token
+- the state after the final chunk is reported only through ``final_state`` or
+  the ``initial_state`` pool
+
+``chunk_states`` cannot be combined with ``checkpoint_every_n_tokens`` because
+both write chunk-boundary states with different row mappings.
+
+State-pool mode
+---------------
+
+Both KDA entrypoints support reusable state pools, but they use different
+parameter names:
+
+- ``chunk_kda`` uses ``initial_state`` with
+  ``initial_state_indices``. The index tensor has shape ``[num_seqs]`` and
+  selects the pool row used by each input sequence. Selected rows are updated
+  in place.
+- ``gated_delta_rule_decode`` uses ``state`` with ``state_indices``. The index
+  tensor has shape ``[B]`` or ``[B, T]`` and selects the pool row for each
+  batch entry and decode step.
+
 Chunk KDA gate parameters
 -------------------------
 
@@ -100,6 +139,46 @@ Chunk KDA outputs
 
 - default return: ``output``
 - if ``output_final_state=True``: returns ``(output, final_state)``
+- if ``checkpoint_every_n_tokens > 0``: returns
+  ``(output, final_state, checkpoints)``, where ``final_state`` is a zero-size
+  tensor if it was not requested
+
+Chunk KDA state checkpoints
+---------------------------
+
+``checkpoint_every_n_tokens=C`` makes ``chunk_kda`` return the recurrent state
+every ``C`` tokens instead of only at the end of a sequence, so a serving
+framework can cache prefix states and restore one later. The operator allocates
+the pool itself and returns it as the third element of the result; the layout
+matches the cuDNN frontend GDN ``state_checkpoints`` output.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - Item
+     - Supported scope
+   * - Architecture
+     - MP31 and MP32
+   * - Cadence
+     - ``C`` is ``0`` (disabled) or a positive multiple of the kernel chunk,
+       ``16``
+   * - Checkpoint meaning
+     - Entry ``j`` of sequence ``b`` holds the state entering token ``j * C``.
+       Entry ``0`` is the incoming state; the state after the final token is
+       ``final_state``, never a checkpoint
+   * - Packing
+     - Entries are packed per sequence in ``cu_seqlens`` order, so the valid
+       rows are ``sum_b ((len_b - 1) // C + 1)`` and empty sequences contribute
+       none
+   * - Pool shape
+     - Allocated by the operator as ``[capacity, Hv, 128, 128]`` with
+       ``capacity = max(total_tokens // C + num_seqs, 1)``
+   * - Pool dtype
+     - The activation dtype (``torch.float16`` or ``torch.bfloat16``), even
+       when the recurrent state is ``torch.float32``
+   * - Not combinable with
+     - ``chunk_states`` and ``initial_state_indices``
 
 Decode support
 --------------

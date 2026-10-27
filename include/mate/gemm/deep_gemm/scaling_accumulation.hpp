@@ -246,7 +246,12 @@ struct ScalingAccumulationIterative {
     static_assert(mute::is_rmem<TensorScaleB>::value, "ScaleB tensor must be rmem resident.");
 
     static_assert(LayoutAccum{}.shape() == LayoutScaleA{}.shape(), "Accumulator and scaleA must have same shape.");
-    static_assert(LayoutAccum{}.shape() == LayoutScaleB{}.shape(), "Accumulator and scaleB must have same shape.");
+    // Some epilogues index scales more finely on the physical N axis than the
+    // SQMMA N mode. Interleaved SwiGLU, for example, duplicates each logical
+    // per-128 scale across two physical 64-column chunks. Their nested shapes
+    // differ while their linear C mapping and element count remain identical.
+    static_assert(mute::size(LayoutAccum{}) == mute::size(LayoutScaleB{}),
+                  "Accumulator and scaleB must have the same number of logical elements.");
 
     MUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(accum_); ++i) {

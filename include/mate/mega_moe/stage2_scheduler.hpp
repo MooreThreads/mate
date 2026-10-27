@@ -14,6 +14,7 @@ template <uint32_t kNumExpertsPerRank,
           uint32_t kNumMPs,
           uint32_t kNumRanks,
           uint32_t BLOCK_M,
+          bool     kInterleaveMBlocks = false,
           uint32_t kNumExpertsPerLane =
               math::constexpr_ceil_div(kNumExpertsPerRank, uint32_t(mutlass::NumThreadsPerWarp))>
 struct WorkspaceTileScheduler {
@@ -40,7 +41,8 @@ struct WorkspaceTileScheduler {
     return (a + b - 1) / b;
   }
 
-  __device__ __forceinline__ void fetch_counts(const layout::Workspace& workspace) {
+  template <typename Workspace>
+  __device__ __forceinline__ void fetch_counts(const Workspace& workspace) {
 #pragma unroll
     for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
       const uint32_t expert_idx = i * mutlass::NumThreadsPerWarp + lane_idx();
@@ -106,15 +108,24 @@ struct WorkspaceTileScheduler {
   __device__ __forceinline__ WorkTileInfo get_work_tile_info() {
     while (current_local_expert_idx < kNumExpertsPerRank) {
       const uint32_t num_m_blocks = get_current_num_m_blocks();
-      const uint32_t m_block_idx  = block_idx / kNumNBlocks;
-      if (m_block_idx < num_m_blocks) {
-        const uint32_t n_block_idx = block_idx - m_block_idx * kNumNBlocks;
-        return {current_local_expert_idx,
-                m_block_idx,
-                n_block_idx,
-                current_pool_block_offset + m_block_idx,
-                get_valid_m(m_block_idx),
-                true};
+      if (num_m_blocks != 0) {
+        uint32_t m_block_idx = 0;
+        uint32_t n_block_idx = 0;
+        if constexpr (kInterleaveMBlocks) {
+          n_block_idx = block_idx / num_m_blocks;
+          m_block_idx = block_idx - n_block_idx * num_m_blocks;
+        } else {
+          m_block_idx = block_idx / kNumNBlocks;
+          n_block_idx = block_idx - m_block_idx * kNumNBlocks;
+        }
+        if (n_block_idx < kNumNBlocks && m_block_idx < num_m_blocks) {
+          return {current_local_expert_idx,
+                  m_block_idx,
+                  n_block_idx,
+                  current_pool_block_offset + m_block_idx,
+                  get_valid_m(m_block_idx),
+                  true};
+        }
       }
 
       block_idx -= num_m_blocks * kNumNBlocks;
@@ -123,7 +134,8 @@ struct WorkspaceTileScheduler {
     return {};
   }
 
-  __device__ __forceinline__ WorkTileInfo initial_work_tile_info(const layout::Workspace& workspace) {
+  template <typename Workspace>
+  __device__ __forceinline__ WorkTileInfo initial_work_tile_info(const Workspace& workspace) {
     block_idx                 = blockIdx.x;
     current_pool_block_offset = 0;
     fetch_counts(workspace);

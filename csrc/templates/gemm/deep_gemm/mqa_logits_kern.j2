@@ -22,10 +22,10 @@ void clean_mqa_logits(
   constexpr int kNextN    = 1;
   constexpr int kBlockKV  = 8192;
   constexpr int kNumWarps = 8;
-  constexpr int kSmemSize = kBlockKV * sizeof(float);
+  constexpr int kSmemSize = kBlockKV * sizeof({{ out_element_literal }});
 
   CHECK_MUSA(logits);
-  CHECK_INPUT_TYPE(logits, dl_float32);
+  CHECK_INPUT_TYPE(logits, {{ out_input_dtype }});
   CHECK_INPUT(cu_seq_len_k_start);
   CHECK_INPUT(cu_seq_len_k_end);
   CHECK_INPUT_TYPE(cu_seq_len_k_start, dl_int32);
@@ -39,14 +39,14 @@ void clean_mqa_logits(
   TVM_FFI_ICHECK(num_mps > 0) << "No available MUSA MPs";
 
   musaStream_t stream = get_stream(logits.device());
-  mate::deep_gemm::mpxx_clean_logits<kNextN, kBlockKV, kNumWarps>
+  mate::deep_gemm::mpxx_clean_logits<kNextN, kBlockKV, kNumWarps, {{ out_element_literal }}>
       <<<num_mps, kNumWarps * 32, kSmemSize, stream>>>(
           static_cast<uint32_t>(seq_len),
           static_cast<uint32_t>(seq_len_kv),
           stride_kv,
           static_cast<uint32_t const*>(cu_seq_len_k_start.data_ptr()),
           static_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()),
-          static_cast<float*>(logits.data_ptr()));
+          static_cast<{{ out_element_literal }}*>(logits.data_ptr()));
   MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
@@ -135,7 +135,7 @@ ffi::Tensor {{ func_name }}(
   const int64_t logits_stride   = kIsCompressedLogits ? align_to(logits_cols, int64_t(kBlockKV))
                                                       : align_to(seq_len_kv + int64_t(kBlockKV), int64_t(8));
 
-  ffi::Tensor logits_storage = alloc_tensor(ffi::Shape{aligned_seq_len, logits_stride}, dl_float32, q.device());
+  ffi::Tensor logits_storage = alloc_tensor(ffi::Shape{aligned_seq_len, logits_stride}, {{ out_input_dtype }}, q.device());
   ffi::Shape  logits_shape{seq_len, logits_cols};
   ffi::Shape  logits_strides{logits_stride, 1};
   ffi::Tensor out = logits_storage.as_strided(logits_shape, logits_strides);
@@ -161,7 +161,8 @@ ffi::Tensor {{ func_name }}(
                                                                  StrideK,
                                                                  StrideSFK,
                                                                  StrideW,
-                                                                 StrideLogits>;
+                                                                 StrideLogits,
+                                                                 {{ out_element_literal }}>;
 
   const int64_t q_groups = ceil_div(seq_len, int64_t(kBlockQ));
   const int     num_mps  = device_prop.multiProcessorCount;
@@ -183,7 +184,7 @@ ffi::Tensor {{ func_name }}(
       .stride_weights = stride_w,
       .ptr_ks         = static_cast<int32_t*>(cu_seq_len_k_start.data_ptr()),
       .ptr_ke         = static_cast<int32_t*>(cu_seq_len_k_end.data_ptr()),
-      .ptr_logits     = static_cast<float*>(out.data_ptr()),
+      .ptr_logits     = static_cast<{{ out_element_literal }}*>(out.data_ptr()),
       .stride_logits  = stride_logits,
       .max_seq_kv     = max_seq_kv_param,
   };

@@ -13,7 +13,8 @@ template <class Element_,
           bool IsPackGQA_,
           int  NumEpilogueThreads_,
           bool IsEvenHeadDim_,
-          int  HeadRatio_>
+          int  HeadRatio_,
+          bool HasMaxLogits_ = false>
 struct CollectiveEpilogueFwd {
   using Element        = Element_;
   using ElementPartial = float;
@@ -29,6 +30,7 @@ struct CollectiveEpilogueFwd {
   static constexpr bool IsPackGQA          = IsPackGQA_;
   static constexpr bool IsEvenHeadDim      = IsEvenHeadDim_;
   static constexpr int  HeadRatio          = HeadRatio_;
+  static constexpr bool HasMaxLogits       = HasMaxLogits_;
 
   static_assert(sizeof(Element) <= 2);
 
@@ -68,6 +70,8 @@ struct CollectiveEpilogueFwd {
     StrideLSE const stride_LSE;
     float*          ptr_LSE_partial;
     StrideLSE const stride_LSE_partial;
+    float*          ptr_max_logits         = nullptr;
+    float*          ptr_max_logits_partial = nullptr;
 
     int32_t const   nheads_kv;
     uint32_t const* cu_seqlens = nullptr;
@@ -91,6 +95,8 @@ struct CollectiveEpilogueFwd {
     float*                ptr_LSE_partial;
     StrideLSE const       stride_LSE_partial;
     StrideLSEPacked const stride_LSE_partial_packed;
+    float*                ptr_max_logits         = nullptr;
+    float*                ptr_max_logits_partial = nullptr;
 
     uint32_t const* cu_seqlens = nullptr;
     uint32_t const* seqused    = nullptr;
@@ -156,6 +162,8 @@ struct CollectiveEpilogueFwd {
                   .ptr_LSE_partial           = args.ptr_LSE_partial,
                   .stride_LSE_partial        = args.stride_LSE_partial,
                   .stride_LSE_partial_packed = stride_LSE_partial_packed,
+                  .ptr_max_logits            = args.ptr_max_logits,
+                  .ptr_max_logits_partial    = args.ptr_max_logits_partial,
 
                   .cu_seqlens = args.cu_seqlens,
                   .seqused    = args.seqused};
@@ -165,12 +173,14 @@ struct CollectiveEpilogueFwd {
             bool SplitKV,
             class FrgTensorO,
             class FrgTensorLSE,
+            class FrgTensorMax,
             class TiledMma,
             class SeqlenInfo,
             class BlockCoord>
   MUTLASS_DEVICE void store(Params const&       params,
                             FrgTensorO const&   acc_pv,
                             FrgTensorLSE const& lse,
+                            FrgTensorMax const& max_logits,
                             TiledMma            tiled_mma,
                             int                 thread_idx,
                             SeqlenInfo const&   seqlen_info,
@@ -227,6 +237,32 @@ struct CollectiveEpilogueFwd {
         return src;
       }
     };
+
+    if constexpr (HasMaxLogits) {
+      auto mMax = [&] {
+        if constexpr (!SplitKV) {
+          return make_tensor(make_gmem_ptr(params.ptr_max_logits + offset_o * get<0>(params.stride_LSE)),
+                             params.shape_LSE_packed,
+                             params.stride_LSE_packed)(_, bidh, HasCuseqlensQ ? 0 : bidb, _0{});
+        } else {
+          return make_tensor(
+              make_gmem_ptr(params.ptr_max_logits_partial + offset_o * get<0>(params.stride_LSE_partial)),
+              params.shape_LSE_packed,
+              params.stride_LSE_partial_packed)(_, bidh, HasCuseqlensQ ? 0 : bidb, split_idx);
+        }
+      }();
+      if constexpr (!IsPackGQA) {
+        MUTLASS_PRAGMA_UNROLL
+        for (int mi = 0; mi < size(max_logits); ++mi) {
+          int const row = m_block * TileM + get<0>(tOcO_mn(mi, _0{}));
+          if (get<1>(tOcO_mn(_0{}, _0{})) == 0 && row < seqlen_o) {
+            mMax(row) = assign(max_logits(mi), -std::numeric_limits<float>::infinity());
+          }
+        }
+      } else {
+        PackGQAManager::template store_LSE<StoreZero>(tiled_mma, max_logits, mMax, thread_idx, m_block, seqlen_o);
+      }
+    }
 
     if constexpr (!IsPackGQA) {
       // Write LSE from rmem -> gmem

@@ -3,10 +3,10 @@ Welcome to MATE Documentation
 
 `GitHub <https://github.com/MooreThreads/mate>`_
 
-MATE (**M**\USA **A**\I **T**\ensor **E**\ngine) is a high-performance
-operator library optimized for generative AI workloads on Moore Threads GPUs.
-Built on TVM-FFI, it delivers highly efficient Transformer and large language
-model (LLM) operator implementations, including Attention and GEMM.
+MATE (**M**\USA **A**\I **T**\ensor **E**\ngine) is a high-performance operator library optimized
+for generative AI and large language model (LLM) workloads on Moore Threads
+GPUs. It leverages TVM-FFI for interoperability and provides highly efficient
+implementations of LLM operators, including Attention and GEMM.
 
 MATE is specifically designed for framework developers and integration
 engineers aiming to port existing CUDA-oriented pipelines to Moore Threads
@@ -76,6 +76,7 @@ comprehensive logging, and environment inspection tools.
    FlashInfer FP8 MLA example <examples/fp8_mla_decode.py>
    Attention <api/attention>
    Sparse MLA <api/sparse_mla>
+   QSA <api/qsa>
    GEMM <api/gemm>
    Mega MoE <api/mega_moe>
    HyperConnection <api/hyperconnection>
@@ -88,3 +89,4 @@ comprehensive logging, and environment inspection tools.
    :caption: Appendix
 
    Documentation History <documentation_history>
+   Glossary <glossary>

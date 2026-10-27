@@ -1,5 +1,8 @@
 #pragma once
 
+// M32 decode Stage2.  Its control workspace is isolated from the M256 prefill
+// Prefill stage 1/2/3 workspace in the unified symmetric allocation.
+
 #include <mutlass/mutlass.h>
 
 #include <cstddef>
@@ -12,12 +15,13 @@
 #include <mute/tensor.hpp>
 #include <mutlass/arch/barrier.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
-#include <mutlass/pipeline/mp31_pipeline.hpp>
 
+#include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/gemm/deep_gemm/scaling_accumulation.hpp"
 #include "mate/mega_moe/mega_barrier.hpp"
 #include "mate/mega_moe/mega_moe_layout.hpp"
 #include "mate/mega_moe/mega_moe_sym_buffer.hpp"
+#include "mate/mega_moe/mega_moe_unified_layout.hpp"
 #include "mate/mega_moe/stage2_scheduler.hpp"
 #include "mate/mega_moe/utils.hpp"
 
@@ -81,18 +85,18 @@ template <uint32_t kNumMaxTokensPerRank,
           uint32_t kNumThreads        = 512,
           uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks>
 __global__ __launch_bounds__(kNumThreads,
-                             1) void fp8_fp8_mega_moe_stage2_impl(const layout::SymBuffer<kNumRanks> sym_buffer,
-                                                                  mutlass::bfloat16_t* __restrict__ y,
-                                                                  const uint32_t num_tokens,
-                                                                  const float* __restrict__ l2_acts_sf,
-                                                                  const float* __restrict__ l2_weights_sf,
-                                                                  const uint64_t           l2_acts_sf_row_stride,
-                                                                  const uint64_t           l2_acts_sf_k_stride,
-                                                                  const uint64_t           l2_weights_sf_expert_stride,
-                                                                  const uint64_t           l2_weights_sf_n_stride,
-                                                                  const uint64_t           l2_weights_sf_k_stride,
-                                                                  const MUtensorDescriptor tensor_map_l2_acts,
-                                                                  const MUtensorDescriptor tensor_map_l2_weights) {
+                             1) void mp31_fp8_fp8_mega_moe_stage2_impl(const layout::SymBuffer<kNumRanks> sym_buffer,
+                                                                       mutlass::bfloat16_t* __restrict__ y,
+                                                                       const uint32_t num_tokens,
+                                                                       const float* __restrict__ l2_acts_sf,
+                                                                       const float* __restrict__ l2_weights_sf,
+                                                                       const uint64_t l2_acts_sf_row_stride,
+                                                                       const uint64_t l2_acts_sf_k_stride,
+                                                                       const uint64_t l2_weights_sf_expert_stride,
+                                                                       const uint64_t l2_weights_sf_n_stride,
+                                                                       const uint64_t l2_weights_sf_k_stride,
+                                                                       const MUtensorDescriptor tensor_map_l2_acts,
+                                                                       const MUtensorDescriptor tensor_map_l2_weights) {
   (void)kNumExpertsPerWave;
 
   using namespace mute;
@@ -104,8 +108,9 @@ __global__ __launch_bounds__(kNumThreads,
   constexpr int ScaleGranularityM = 1;
   constexpr int ScaleGranularityN = 128;
 
-  const auto workspace =
-      layout::Workspace(sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, BLOCK_M);
+  const auto buffer_layout = unified::BufferLayout(
+      sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden);
+  const auto workspace = buffer_layout.get_decode_workspace();
 
   static_assert(BLOCK_M == 32, "Stage2 mate-style kernel expects BLOCK_M=32");
   static_assert(BLOCK_N == 256, "Stage2 mate-style kernel expects BLOCK_N=256");
@@ -153,7 +158,7 @@ __global__ __launch_bounds__(kNumThreads,
   constexpr int WarpsPerWarpSquad      = NumThreadsPerWarpSquad / NumThreadsPerWarp;
   constexpr int TotalWarpSquads        = NumLoadWarpSquads + NumMmaWarpSquads + NumStoreWarpSquads;
 
-  using PipelineAB        = mutlass::Mp31PipelineTmeAsync<kNumStages>;
+  using PipelineAB        = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kNumStages, 2>;
   using PipelineABParams  = typename PipelineAB::Params;
   using PipelineABState   = typename PipelineAB::PipelineState;
   using PipelineSeq       = mutlass::OrderedSequenceBarrier<1, NumMmaWarpSquads>;
@@ -183,7 +188,7 @@ __global__ __launch_bounds__(kNumThreads,
   extern __shared__ __align__(256) uint8_t smem_buffer[];
   auto&                                    shared = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
-  using PipelineCD       = mutlass::Mp31PipelineAsync<kNumCDStages>;
+  using PipelineCD       = mutlass::Mp31PipelineAsyncWarpSpecialized<kNumCDStages, 2>;
   using PipelineCDParams = typename PipelineCD::Params;
   using PipelineCDState  = typename PipelineCD::PipelineState;
 
@@ -216,7 +221,7 @@ __global__ __launch_bounds__(kNumThreads,
   Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data()), SmemLayoutA{});
   Tensor sB = make_tensor(make_smem_ptr(shared.smem_b.data()), SmemLayoutB{});
 
-  PipelineABState pipe_write = mutlass::make_producer_start_state<PipelineAB>();
+  PipelineABState pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineAB>();
   PipelineABState pipe_read;
 
   PipelineSeqParams seq_params{};
@@ -228,7 +233,7 @@ __global__ __launch_bounds__(kNumThreads,
   cd_pipe_params.producer_arv_count = NumMmaWarps;
   cd_pipe_params.consumer_arv_count = NumStoreWarps;
   PipelineCD      cd_pipeline(cd_pipe_params, reinterpret_cast<uint64_t>(&barrier_storage->PipelineCD));
-  PipelineCDState cd_pipe_write = mutlass::make_producer_start_state<PipelineCD>();
+  PipelineCDState cd_pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineCD>();
   PipelineCDState cd_pipe_read;
 
   __syncthreads();
@@ -258,32 +263,10 @@ __global__ __launch_bounds__(kNumThreads,
                                           mute::TME::CacheHint::CACHE_NONE,
                                           mute::PrefetchSize::B128>;
 
-  constexpr auto fp8_token_layout              = layout::Data(kHidden);
-  constexpr auto bf16_token_layout             = layout::Data(kHidden * sizeof(mutlass::bfloat16_t));
-  constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-  constexpr auto fp8_sf_layout                 = layout::Data(kHidden / 32, false);
-  constexpr auto fp8_intermediate_sf_layout    = layout::Data((kIntermediateHidden / BLOCK_K) * sizeof(float));
-  constexpr auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
-  constexpr auto input_topk_weights_layout     = layout::Data(kNumTopk * sizeof(float), false);
-  constexpr auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
-
-  const auto input_token_buffer = layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
-  const auto input_sf_buffer = layout::Buffer(fp8_sf_layout, 1, kNumMaxTokensPerRank, input_token_buffer.get_end_ptr());
-  const auto input_topk_idx_buffer =
-      layout::Buffer(input_topk_idx_layout, 1, kNumMaxTokensPerRank, input_sf_buffer.get_end_ptr());
-  const auto input_topk_weights_buffer =
-      layout::Buffer(input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
-  const auto l1_token_buffer =
-      layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, input_topk_weights_buffer.get_end_ptr());
-  const auto l1_sf_buffer = layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
-  const auto l1_topk_weights_buffer =
-      layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
-  const auto l2_token_buffer =
-      layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens, l1_topk_weights_buffer.get_end_ptr());
-  const auto l2_sf_buffer =
-      layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens, l2_token_buffer.get_end_ptr());
-  const auto combine_token_buffer =
-      layout::Buffer(bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+  const auto input_topk_idx_buffer     = buffer_layout.get_input_topk_idx_buffer();
+  const auto input_topk_weights_buffer = buffer_layout.get_input_topk_weights_buffer();
+  const auto l1_topk_weights_buffer    = buffer_layout.get_decode_l1_topk_weights_buffer();
+  const auto combine_token_buffer      = buffer_layout.get_decode_combine_token_buffer();
 
   const uint32_t lane_idx = mutlass::canonical_lane_idx();
   const uint32_t warp_idx = mutlass::canonical_warp_idx_sync();
@@ -336,9 +319,10 @@ __global__ __launch_bounds__(kNumThreads,
       work = scheduler.get_work_tile_info();
     }
   } else if (is_consumer_squad) {
-    Scheduler scheduler;
-    auto      work                = scheduler.initial_work_tile_info(workspace);
-    const int consumer_thread_idx = int(threadIdx.x) - int(NumLoadWarpSquads * NumThreadsPerWarpSquad);
+    Scheduler  scheduler;
+    auto       work                = scheduler.initial_work_tile_info(workspace);
+    const bool has_work            = work.valid;
+    const int  consumer_thread_idx = int(threadIdx.x) - int(NumLoadWarpSquads * NumThreadsPerWarpSquad);
 
     MUTLASS_PRAGMA_NO_UNROLL
     for (; work.valid;) {
@@ -472,7 +456,7 @@ __global__ __launch_bounds__(kNumThreads,
       work = next_work;
     }
 
-    if (cd_pipe_write.count() == 0) {
+    if (!has_work) {
       cd_pipeline.producer_acquire(cd_pipe_write);
       const uint32_t slot = uint32_t(cd_pipe_write.index());
       if (consumer_thread_idx == 0) {

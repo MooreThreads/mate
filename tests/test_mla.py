@@ -422,6 +422,127 @@ def test_mla_decode_varlen(
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_len", [64, 129])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("layout", ["contiguous", "head_gap", "row_gap", "lse_gap"])
+@pytest.mark.parametrize(
+    "backend,heads", [("mubin", 128), ("native", 20), ("native", 128)]
+)
+def test_mla_output_strides(dtype, causal, kv_len, varlen, layout, backend, heads):
+    from mate.jit.mubin.flash_mla import flash_mla_asm_mubin
+
+    batch, dim, page = 3, 512, 64
+    q_lengths = [1, 3, 2] if varlen else [3] * batch
+    max_q, total_q = max(q_lengths), sum(q_lengths)
+    q_shape = (total_q, heads, 576) if varlen else (batch, max_q, heads, 576)
+    q = torch.zeros(q_shape, device="musa", dtype=dtype)
+    pages = math.ceil(kv_len / page)
+    kv = torch.zeros((batch * pages, page, 1, 576), device="musa", dtype=dtype)
+    for b in range(batch):
+        kv[b * pages : (b + 1) * pages].reshape(-1, 576)[:kv_len, :dim] = 2.0**b
+    lens = torch.full((batch,), kv_len, device="musa", dtype=torch.int32)
+    table = torch.arange(batch * pages, device="musa", dtype=torch.int32).reshape(
+        batch, pages
+    )
+    metadata, splits = mate.get_mla_metadata(lens, max_q * heads, 1)
+    if kv_len == page:
+        assert bool(((splits[1:] - splits[:-1]) == 1).all())
+    elif not bool(((splits[1:] - splits[:-1]) > 1).all()):
+        pytest.skip("scheduler does not provide multiple splits for this case")
+
+    shape = (*q.shape[:-1], dim)
+    lshape = (heads, total_q) if varlen else (batch, max_q, heads)
+    head_stride = dim + 16 if layout == "head_gap" else dim
+    ostride = (
+        (heads * head_stride, head_stride, 1)
+        if varlen
+        else (max_q * heads * head_stride, heads * head_stride, head_stride, 1)
+    )
+    lstride = (total_q, 1) if varlen else (max_q * heads, heads, 1)
+    if layout == "row_gap":
+        ostride = (
+            ((heads + 1) * dim, dim, 1)
+            if varlen
+            else ((max_q + 1) * heads * dim, heads * dim, dim, 1)
+        )
+    if layout == "lse_gap":
+        lstride = (total_q + 8, 1) if varlen else ((max_q + 1) * heads, heads, 1)
+
+    def guarded(shape, strides, dtype):
+        size = 1 + sum((n - 1) * s for n, s in zip(shape, strides))
+        base = torch.full((size + 128,), -123.0, device="musa", dtype=dtype)
+        view = base.as_strided(shape, strides, 64)
+        mask = torch.zeros_like(base, dtype=torch.bool)
+        mask.as_strided(shape, strides, 64).fill_(True)
+        return view, base, mask
+
+    out, out_base, out_mask = guarded(shape, ostride, dtype)
+    lse, lse_base, lse_mask = guarded(lshape, lstride, torch.float32)
+    cu_q = None
+    if varlen:
+        cu_q = torch.tensor([0, 1, 4, 6], device="musa", dtype=torch.int32)
+    if backend == "mubin":
+        flash_mla_asm_mubin(
+            q[..., :dim],
+            q[..., dim:],
+            kv[..., :dim],
+            kv[..., dim:],
+            lens,
+            table,
+            metadata,
+            splits,
+            out,
+            lse,
+            576**-0.5,
+            causal,
+            cu_q,
+            max_q if varlen else None,
+        )
+    else:
+        from mate.jit.mla_ops import get_mla_ops_module
+
+        get_mla_ops_module().get_function("mla_with_kvcache")(
+            q[..., :dim],
+            q[..., dim:],
+            kv[..., :dim],
+            kv[..., dim:],
+            lens,
+            cu_q,
+            max_q if varlen else None,
+            table,
+            metadata,
+            splits,
+            out,
+            lse,
+            576**-0.5,
+            causal,
+        )
+    torch.musa.synchronize()
+    expected_out = torch.cat(
+        [
+            torch.full((n, heads, dim), 2.0**b, dtype=dtype)
+            for b, n in enumerate(q_lengths)
+        ]
+    ).reshape(shape)
+    expected_lse = torch.cat(
+        [
+            torch.tensor(
+                [math.log(kv_len - n + i + 1 if causal else kv_len) for i in range(n)],
+                dtype=torch.float32,
+            )[:, None].expand(n, heads)
+            for n in q_lengths
+        ]
+    )
+    expected_lse = expected_lse.T if varlen else expected_lse.reshape(lshape)
+    torch.testing.assert_close(out.cpu(), expected_out, atol=0.004, rtol=0)
+    torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.004, rtol=0)
+    assert bool((out_base[~out_mask] == -123.0).all())
+    assert bool((lse_base[~lse_mask] == -123.0).all())
+
+
+@supported_musa_compute_capability([31])
 @pytest.mark.parametrize("num_heads_q", [32, 128])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])

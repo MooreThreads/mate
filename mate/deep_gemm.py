@@ -31,6 +31,7 @@ from mate.mega_moe import (
     SymmBuffer as SymmBuffer,
     fp8_fp8_mega_moe as fp8_fp8_mega_moe,
     get_symm_buffer_for_mega_moe as get_symm_buffer_for_mega_moe,
+    get_token_alignment_for_mega_moe as get_token_alignment_for_mega_moe,
     transform_weights_for_mega_moe as transform_weights_for_mega_moe,
 )
 
@@ -497,6 +498,7 @@ def fp8_paged_mqa_logits(
     schedule_meta: torch.Tensor,
     max_context_len: int,
     clean_logits: bool,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     r"""FP8 Paged MQA logits
 
@@ -530,17 +532,23 @@ def fp8_paged_mqa_logits(
         Maximum context length
     clean_logits: bool
         Whether to zero-fill logit positions that are out of the valid KV range
+    logits_dtype: torch.dtype, default=torch.float32
+        Output dtype; ``torch.float32`` or ``torch.bfloat16``.
 
     Returns
     -------
     Tensor
-        FP32 logits, shape ``(batch_size * next_n, max_context_len)``
+        Logits with dtype ``logits_dtype``, shape
+        ``(batch_size * next_n, max_context_len)``
     """
     next_n = q.shape[1]
     num_heads = q.shape[2]
     head_dim = q.shape[3]
     block_kv = fused_kv_cache.shape[1]
     is_context_lens_2d = context_lens.dim() == 2
+
+    if logits_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("logits_dtype must be torch.float32 or torch.bfloat16")
 
     return ffi_to_torch(
         get_paged_mqa_logits_module(
@@ -549,6 +557,7 @@ def fp8_paged_mqa_logits(
             head_dim,
             block_kv,
             is_context_lens_2d,
+            logits_dtype,
         ).get_function("fp8_paged_mqa_logits")(
             q,
             fused_kv_cache,
@@ -571,6 +580,7 @@ def fp8_mqa_logits(
     cu_seq_len_k_end: torch.Tensor,
     clean_logits: bool = False,
     max_seqlen_k: int = 0,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     r"""FP8 MQA logits.
 
@@ -604,18 +614,24 @@ def fp8_mqa_logits(
     max_seqlen_k : int, default=0
         If > 0, enables compressed logits mode. The output width becomes ``max_seqlen_k``
         (a windowed logits range per row). In this mode, ``clean_logits`` must be ``False``.
+    logits_dtype : torch.dtype, default=torch.float32
+        Output dtype; ``torch.float32`` or ``torch.bfloat16``.
 
     Returns
     -------
     torch.Tensor
-        FP32 logits tensor with dtype ``torch.float32`` and shape:
+        Logits tensor with dtype ``logits_dtype`` and shape:
 
         - ``(seq_len, seq_len_kv)`` if ``max_seqlen_k == 0``
         - ``(seq_len, max_seqlen_k)`` if ``max_seqlen_k > 0``
     """
     kv_fp8, kv_scale = kv
+    if kv_scale.dtype == torch.int32:
+        raise ValueError("int32 packed scales are MP32-only")
     if max_seqlen_k > 0 and clean_logits:
         raise ValueError("max_seqlen_k is not supported with clean_logits")
+    if logits_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("logits_dtype must be torch.float32 or torch.bfloat16")
 
     seq_len = q.shape[0]
     seq_len_kv = kv_fp8.shape[0]
@@ -632,6 +648,7 @@ def fp8_mqa_logits(
             head_dim,
             compressed_logits,
             num_mps,
+            logits_dtype,
         ).get_function("fp8_mqa_logits")(
             q,
             kv_fp8,

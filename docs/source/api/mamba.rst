@@ -5,13 +5,18 @@ Mamba / SSU
 
 .. currentmodule:: mate.mamba
 
-Mamba2 selective state update (SSU) on MUSA. ``selective_state_update`` applies
-decode steps of the SSM recurrence, and is the MUSA-native implementation behind
-the FlashInfer-shaped ``flashinfer.mamba.selective_state_update`` compatibility
-surface. Two TileLang kernels share the entry point: a one-token kernel for the
-plain decode step (one token per sequence, no slot table) and a packed kernel for
-everything else -- packed variable-length rows, multi-token (MTP) decoding with
+MATE implements Mamba2 selective state update (SSU) on MUSA. Mamba2 is the
+multi-head successor to Mamba: it keeps one decay per head (``A[h]``) instead of
+a per-channel decay, which enables the chunked SSD formulation and makes the
+recurrence matmul-friendly. Two TileLang kernels share the
+``selective_state_update`` entry point: a one-token kernel for the plain decode
+step (one token per sequence, no slot table) and a packed kernel for everything
+else -- packed variable-length rows, multi-token (MTP) decoding with
 ``num_accepted_tokens``, and the dense 4-D multi-token form.
+``selective_state_update`` applies decode steps of the SSM recurrence, and is
+the MUSA-native implementation behind the FlashInfer-shaped
+``flashinfer.mamba.selective_state_update`` compatibility surface. The packed
+variable-length SSD prefill path is covered in `SSD packed prefill`_.
 
 Minimal SSU example:
 
@@ -173,6 +178,10 @@ allocates nothing beyond the returned state tensor. ``cu_chunk_seqlens`` is the
 only authority for the chunk-to-token mapping, and ``seq_idx`` -- not the
 ``last_chunk_indices`` arithmetic -- decides which chunks open a sequence and
 therefore where their entering state comes from.
+
+``dt_limit`` is a ``(min, max)`` tuple that clamps the processed timestep after
+``softplus(dt + dt_bias)``. The default is ``(0.0, float("inf"))``, which leaves
+the result unclamped above and floors it at zero.
 
 Everything outside the supported contract raises ``NotImplementedError`` or
 ``ValueError`` naming the missing capability rather than silently narrowing

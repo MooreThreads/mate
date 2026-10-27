@@ -5,7 +5,7 @@ the operations on MUSA through MATE.
 
 ## Overview
 
-The wrapper currently covers four integration areas:
+The wrapper currently covers the following integration areas:
 
 | Area | Public surface |
 | --- | --- |
@@ -13,6 +13,7 @@ The wrapper currently covers four integration areas:
 | Norm | RMSNorm, LayerNorm, fused add RMSNorm, quantized outputs, and diffusion-model fused norms |
 | MLA RoPE | Fused RoPE and FP8 quantization for 512-value NoPE and 64-value RoPE components |
 | Sparse MLA decode | FP8 sparse decode with optional reusable scheduler metadata |
+| GLM NoPE sparse MLA | Native `mla.SparseMLASm120Wrapper` with compact 528-byte or padded 656-byte KV rows |
 
 The GEMM APIs align with official FlashInfer v0.6.17. This is a compatibility
 wrapper rather than a complete FlashInfer distribution; only the APIs listed
@@ -34,6 +35,7 @@ import flashinfer.decode
 import flashinfer.gemm
 import flashinfer.norm
 import flashinfer.rope
+import flashinfer.mla
 ```
 
 ## Requirements
@@ -257,3 +259,41 @@ python examples/fp8_mla_decode.py
 
 For the native MATE API and its complete parameter documentation, see
 [`mate.sparse_mla_interface`](../../docs/source/api/sparse_mla.rst).
+
+### GLM-5.3-Flash NoPE
+
+`flashinfer.mla.SparseMLASm120Wrapper` accepts BF16 absorbed Q512 and byte caches
+with 512 E4M3 latent values followed by four arbitrary FP32 group-128 scales.
+Compact rows use 528 bytes; legacy rows may retain 128 trailing padding bytes.
+`supported_sparse_mla_sm120_configs()["glm53_nope"].bytes_per_token` reports 528
+so compatible framework allocators can reserve the compact size.
+
+```python
+from flashinfer.mla import SparseMLASm120Wrapper
+from mate.sparse_mla.glm_nope import write_glm_nope_cache
+import torch
+
+# latent: [new_tokens, 512] BF16; slots: int64 physical token slots.
+cache = torch.empty((num_pages, page_size, 1, 528), dtype=torch.uint8, device="musa")
+write_glm_nope_cache(latent, cache, slots)
+runner = SparseMLASm120Wrapper(
+    max_num_tokens=max_tokens, max_num_heads=heads,
+    kv_scale_format="arbitrary_fp32", device="musa",
+)
+# q: [tokens, heads, 512]; indices: [tokens, candidates] int32.
+output = torch.empty_like(q)
+runner.run(q, cache.squeeze(2), indices, output, model_softmax_scale,
+           topk_length=candidate_prefix_end)
+```
+
+Pass the model's softmax scale after weight absorption (GLM commonly uses
+0.0625); it must not be inferred from the absorbed dimension. Candidate prefix
+ends include holes: the three KPool tail candidates at columns 2048–2050 remain
+valid even when earlier columns contain `-1`. Nonaligned candidate arrays are
+padded internally; empty candidate rows yield zero output and positive-infinite
+LSE. `run` writes the supplied output and returns LSE only with `return_lse=True`.
+Caller scratch arguments are accepted; MATE manages its own scheduled workspace.
+
+This entry explicitly supports the GLM inline-scale format. The distinct
+V4.1 528-byte page-footer format uses the FlashMLA wrapper. Whole-model GLM
+serving also requires the framework's other model operators.

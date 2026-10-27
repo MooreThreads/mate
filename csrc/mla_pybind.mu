@@ -159,6 +159,7 @@ void dispatch_mla_kernel(ffi::TensorView q_nope,
                 static_cast<uint32_t>(get<5>(problem_shape))};
   mutlass::device_kernel<MlaKernel>
       <<<grid_dim, MlaKernel::MaxThreadsPerBlock, MlaKernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 void mla(ffi::TensorView q_nope,
@@ -287,8 +288,6 @@ void mla(ffi::TensorView q_nope,
   } else {
     TVM_FFI_ICHECK(false) << "Unsupported MLA input dtype";
   }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 void mla_with_kvcache(ffi::TensorView                q_latent,
@@ -560,7 +559,9 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
          stride_lse,
          static_cast<float*>(out_accum.data_ptr()),
          static_cast<float*>(softmax_lse_accum.data_ptr()),
-         q_seq_per_hk},
+         q_seq_per_hk,
+         VarlenQ ? out_work.stride(0) : 0,
+         VarlenQ ? softmax_lse_work.stride(1) : 0},
         {static_cast<int>(tile_scheduler_metadata.size(0)),
          static_cast<int32_t*>(tile_scheduler_metadata.data_ptr()),
          static_cast<int32_t*>(num_splits.data_ptr())}};
@@ -571,6 +572,7 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
 
     mutlass::device_kernel<MlaKernel>
         <<<grid_dim, MlaKernel::MaxThreadsPerBlock, MlaKernel::SharedStorageSize, stream>>>(params);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
 
     if constexpr (!UseTrivalScheduler) {
       mate::flash_mla::MlaCombineParams combine_params{};
@@ -587,8 +589,11 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
       combine_params.h_r                  = heads_ratio;
       combine_params.h_k                  = 1;
       combine_params.o_batch_stride       = static_cast<int>(out_work.stride(0));
-      combine_params.o_row_stride         = static_cast<int>(out_work.stride(1));
-      combine_params.o_head_stride        = static_cast<int>(out_work.stride(2));
+      combine_params.o_row_stride         = VarlenQ ? out_work.stride(0) : out_work.stride(1);
+      combine_params.o_head_stride        = VarlenQ ? out_work.stride(1) : out_work.stride(2);
+      combine_params.lse_batch_stride     = softmax_lse_work.stride(0);
+      combine_params.lse_row_stride       = softmax_lse_work.stride(2);
+      combine_params.lse_head_stride      = softmax_lse_work.stride(1);
 
       run_mla_combine_kernel<Element, VarlenQ>(combine_params, stream);
     }
@@ -672,8 +677,6 @@ void mla_with_kvcache(ffi::TensorView                q_latent,
       }
     }
   }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 MetadataResult get_mla_decoding_metadata_impl(ffi::Optional<ffi::TensorView> seqlens_k,

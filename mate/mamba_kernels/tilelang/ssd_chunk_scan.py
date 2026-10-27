@@ -155,7 +155,6 @@ def tilelang_ssd_chunk_scan(
             x_shared = T.alloc_shared((block_S, dim), dtype=io_dtype)
             z_shared = T.alloc_shared((block_M, dim), dtype=io_dtype)
             acc = T.alloc_fragment((block_M, dim), dtype=accum_dtype)
-            acc_shared = T.alloc_shared((block_M, dim), dtype=accum_dtype)
 
             # --- load the two operands of the past-state dot
             # Statement-level guards, not `T.if_then_else`: the select form only
@@ -231,9 +230,10 @@ def tilelang_ssd_chunk_scan(
             # --- epilogue: D skip, then the z gate, then a masked store
             if has_d != 0:
                 for i, d in T.Parallel(block_M, dim):
-                    acc[i, d] = acc[i, d] + T.cast(
-                        x_shared[row0 + i, d], accum_dtype
-                    ) * D_param[bh, d]
+                    acc[i, d] = (
+                        acc[i, d]
+                        + T.cast(x_shared[row0 + i, d], accum_dtype) * D_param[bh, d]
+                    )
 
             if has_z != 0:
                 for i, d in T.Parallel(block_M, dim):
@@ -321,7 +321,9 @@ def chunk_scan_launch(
     if heads % groups:
         raise RuntimeError("heads must be divisible by groups.")
     if dt_out.shape != dA_cumsum.shape or dt_out.dim() != 3:
-        raise RuntimeError("dt_out and dA_cumsum must share [heads, nchunks, chunk_size].")
+        raise RuntimeError(
+            "dt_out and dA_cumsum must share [heads, nchunks, chunk_size]."
+        )
     if dt_out.shape[0] != heads:
         raise RuntimeError("dt_out's head axis must match x.")
     nchunks, chunk_size = dt_out.shape[1], dt_out.shape[2]
@@ -403,7 +405,9 @@ def chunk_scan_launch(
         else _dummy((1, heads, dim, dstate), states.dtype, x.device),
         seq_idx,
         cu_chunk_seqlens,
-        D_param if D_param is not None else _dummy((heads, dim), torch.float32, x.device),
+        D_param
+        if D_param is not None
+        else _dummy((heads, dim), torch.float32, x.device),
         z if z is not None else _dummy(x.shape, x.dtype, x.device),
         out,
         1 if initial_states is not None else 0,

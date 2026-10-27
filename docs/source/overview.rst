@@ -1,9 +1,9 @@
 Overview
 ========
 
-MUSA AI Tensor Engine (MATE) accelerates generative AI workloads on Moore
-Threads GPUs by providing high-performance operator implementations,
-especially Attention and GEMM, along with compatibility wrappers for selected
+MUSA AI Tensor Engine (MATE) accelerates generative AI and large language
+model (LLM) workloads on Moore Threads GPUs with high-performance Attention
+and GEMM operators, along with compatibility wrappers for selected
 CUDA-oriented Python operator interfaces.
 
 For a deeper explanation of how MATE is structured, see

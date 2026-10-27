@@ -1,7 +1,9 @@
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from flash_mla.flash_mla_interface import (
+from . import fused_norm_rope_attn_rope_cast as fused_norm_rope_attn_rope_cast
+
+from .flash_mla_interface import (
     FlashMLASchedMeta,
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -47,4 +49,5 @@ __all__ = [
     "get_mla_metadata",
     "flash_mla_with_kvcache",
     "flash_mla_sparse_fwd",
+    "fused_norm_rope_attn_rope_cast",
 ]

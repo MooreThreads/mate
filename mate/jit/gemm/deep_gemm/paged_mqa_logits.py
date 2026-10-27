@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping
 
+import torch
 from jinja2 import Environment, FileSystemLoader
 
 from ... import env as jit_env
@@ -31,6 +32,7 @@ class PagedMqaLogitsJitConfig:
     head_dim: int
     block_kv: int
     is_context_lens_2d: bool
+    logits_dtype: torch.dtype = torch.float32
 
 
 PAGED_MQA_LOGITS_NEXT_N_OPTIONS = (1, 2, 4)
@@ -85,6 +87,10 @@ def _validate_config(cfg: PagedMqaLogitsJitConfig) -> None:
         raise ValueError(f"Unsupported paged MQA logits head_dim={cfg.head_dim}")
     if cfg.block_kv not in PAGED_MQA_LOGITS_BLOCK_KV_OPTIONS:
         raise ValueError(f"Unsupported paged MQA logits block_kv={cfg.block_kv}")
+    if cfg.logits_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"Unsupported paged MQA logits logits_dtype={cfg.logits_dtype}"
+        )
 
 
 @functools.cache
@@ -94,6 +100,7 @@ def select_paged_mqa_logits_config(
     head_dim: int,
     block_kv: int,
     is_context_lens_2d: bool,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> PagedMqaLogitsJitConfig:
     cfg = PagedMqaLogitsJitConfig(
         next_n=next_n,
@@ -101,12 +108,14 @@ def select_paged_mqa_logits_config(
         head_dim=head_dim,
         block_kv=block_kv,
         is_context_lens_2d=is_context_lens_2d,
+        logits_dtype=logits_dtype,
     )
     _validate_config(cfg)
     return cfg
 
 
 def paged_mqa_logits_config_dict(cfg: PagedMqaLogitsJitConfig) -> Dict[str, object]:
+    is_obf16 = cfg.logits_dtype == torch.bfloat16
     return {
         "kind": "fp8_paged_mqa_logits",
         "next_n": cfg.next_n,
@@ -115,6 +124,9 @@ def paged_mqa_logits_config_dict(cfg: PagedMqaLogitsJitConfig) -> Dict[str, obje
         "block_kv": cfg.block_kv,
         "is_context_lens_2d": cfg.is_context_lens_2d,
         "is_context_lens_2d_literal": "true" if cfg.is_context_lens_2d else "false",
+        "out_element_literal": "mutlass::bfloat16_t" if is_obf16 else "float",
+        "out_input_dtype": "dl_bfloat16" if is_obf16 else "dl_float32",
+        "dtype_suffix": "_obf16" if is_obf16 else "",
     }
 
 
@@ -127,6 +139,7 @@ def paged_mqa_logits_dispatch_name(config: Mapping[str, object]) -> str:
         f"d{config['head_dim']}_"
         f"kv{config['block_kv']}_"
         f"{lens}"
+        f"{config['dtype_suffix']}"
     )
 
 
@@ -205,7 +218,9 @@ def get_paged_mqa_logits_metadata_module(batch_size: int):
 
 
 @functools.cache
-def _load_paged_mqa_logits_module(frozen_config: tuple[int, int, int, int, bool]):
+def _load_paged_mqa_logits_module(
+    frozen_config: tuple[int, int, int, int, bool, torch.dtype],
+):
     config = PagedMqaLogitsJitConfig(*frozen_config)
     return gen_paged_mqa_logits_spec(config).build_and_load()
 
@@ -217,6 +232,7 @@ def get_paged_mqa_logits_module(
     head_dim: int,
     block_kv: int,
     is_context_lens_2d: bool,
+    logits_dtype: torch.dtype = torch.float32,
 ):
     config = select_paged_mqa_logits_config(
         next_n,
@@ -224,6 +240,7 @@ def get_paged_mqa_logits_module(
         head_dim,
         block_kv,
         is_context_lens_2d,
+        logits_dtype,
     )
     frozen_config = (
         config.next_n,
@@ -231,6 +248,7 @@ def get_paged_mqa_logits_module(
         config.head_dim,
         config.block_kv,
         config.is_context_lens_2d,
+        config.logits_dtype,
     )
     return _load_paged_mqa_logits_module(frozen_config)
 

@@ -59,6 +59,7 @@ void get_paged_mqa_logits_metadata(
     mate::deep_gemm::mpxx_paged_mqa_logits_metadata<kAlignedBatch, kIs2D, kNextN>
         <<<1, num_threads, smem_size, stream>>>(
             batch_size, ctx_ptr, meta_ptr, split_kv, num_mps);
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
   };
 
   auto dispatch_next_n = [&](auto IsContextLens2DTag) {
@@ -72,6 +73,4 @@ void get_paged_mqa_logits_metadata(
   } else {
     dispatch_next_n(std::false_type{});
   }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }

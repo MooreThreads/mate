@@ -263,6 +263,7 @@ def compute_delta_ws(
     block_D=32,
     threads=256,
     use_strided_tensors=True,
+    head_major=False,
 ):
     total_seq_q = T.dynamic("total_seq_q")
     heads = T.dynamic("heads")
@@ -295,6 +296,12 @@ def compute_delta_ws(
     )
     o_type = T.StridedTensor(q_shape, o_strides, dtype)
     do_type = T.StridedTensor(q_shape, do_strides, dtype)
+    delta_shape = (
+        ((heads, total_seq_q) if is_varlen else (batch, heads, seqlen_q))
+        if head_major
+        else (total_seq_q, heads)
+    )
+    delta_type = T.Tensor(delta_shape, "float")
 
     def q_elem(tensor, q_idx, head, dim_idx):
         if is_varlen:
@@ -309,7 +316,7 @@ def compute_delta_ws(
         dO: do_type,  # type: ignore
         cu_seq_q: T.Tensor([batch + 1], T.int32),  # type: ignore
         seqused_q: T.Tensor([batch], T.int32),  # type: ignore
-        Delta: T.Tensor([total_seq_q, heads], "float"),  # type: ignore
+        Delta: delta_type,  # type: ignore
         max_seq_q_arg: T.int32,  # type: ignore
     ):
         with T.Kernel(
@@ -370,7 +377,13 @@ def compute_delta_ws(
             delta_local[0] += T.shfl_xor(delta_local[0], 2)
             delta_local[0] += T.shfl_xor(delta_local[0], 1)
             if valid_q and lane_idx == 0:
-                Delta[q_idx, by] = delta_local[0]
+                if head_major:
+                    if is_varlen:
+                        Delta[by, q_idx] = delta_local[0]
+                    else:
+                        Delta[q_idx // seqlen_q, by, q_idx % seqlen_q] = delta_local[0]
+                else:
+                    Delta[q_idx, by] = delta_local[0]
 
     return compute_delta_kernel
 
@@ -391,6 +404,7 @@ def reduce_kv_grads_ws(
     threads=256,
     use_strided_tensors=True,
     use_static_dims=False,
+    output_dtype="float",
 ):
     batch = T.dynamic("batch")
     total_seq_kv = T.dynamic("total_seq_kv")
@@ -430,17 +444,10 @@ def reduce_kv_grads_ws(
         if is_varlen
         else (dv_stride_b, dv_stride_s, dv_stride_h, 1)
     )
-    dk_type = T.StridedTensor(dk_shape, dk_strides, "float")
-    dv_type = T.StridedTensor(dv_shape, dv_strides, "float")
+    dk_type = T.StridedTensor(dk_shape, dk_strides, output_dtype)
+    dv_type = T.StridedTensor(dv_shape, dv_strides, output_dtype)
 
     def kv_accum_elem(tensor, kv_idx, head, dim_idx):
-        if is_varlen:
-            return tensor[kv_idx, head, dim_idx]
-        batch_idx = kv_idx // seqlen_k
-        local_kv_idx = kv_idx - batch_idx * seqlen_k
-        return tensor[batch_idx, local_kv_idx, head, dim_idx]
-
-    def kv_grad_elem(tensor, kv_idx, head, dim_idx):
         if is_varlen:
             return tensor[kv_idx, head, dim_idx]
         batch_idx = kv_idx // seqlen_k
@@ -512,8 +519,18 @@ def reduce_kv_grads_ws(
                 dK_local[i, j] += dK_local_odd[i, j]
                 dV_local[i, j] += dV_local_odd[i, j]
                 if kv_idx < num_kv and d_idx < dk_dim:
-                    T.copy(dK_local[i, j], kv_grad_elem(dK, kv_idx, by, d_idx))
+                    if is_varlen:
+                        dK[kv_idx, by, d_idx] = dK_local[i, j].astype(output_dtype)
+                    else:
+                        dK[kv_idx // seqlen_k, kv_idx % seqlen_k, by, d_idx] = dK_local[
+                            i, j
+                        ].astype(output_dtype)
                 if kv_idx < num_kv and d_idx < dv_dim:
-                    T.copy(dV_local[i, j], kv_grad_elem(dV, kv_idx, by, d_idx))
+                    if is_varlen:
+                        dV[kv_idx, by, d_idx] = dV_local[i, j].astype(output_dtype)
+                    else:
+                        dV[kv_idx // seqlen_k, kv_idx % seqlen_k, by, d_idx] = dV_local[
+                            i, j
+                        ].astype(output_dtype)
 
     return reduce_kv_grads_kernel

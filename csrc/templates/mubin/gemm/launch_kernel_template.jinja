@@ -825,6 +825,7 @@ void run_{{ func_name }}(const std::string& object_path,
                            &params.tile_x1_dim2};
 
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_{{ func_name }}, run_{{ func_name }});

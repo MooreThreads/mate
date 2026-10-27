@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <musa/atomic>
 #include <type_traits>
 
 namespace mega_moe::math {
@@ -83,6 +84,18 @@ __device__ __forceinline__ uint32_t atomic_add_shared_u32(uint32_t* ptr, uint32_
 
 __device__ __forceinline__ uint32_t atomic_add_global_u32(uint32_t* ptr, uint32_t val) {
   return atomicAdd(reinterpret_cast<uint32_t*>(__musa_ptr_gen_to_global(ptr)), val);
+}
+
+__device__ __forceinline__ uint32_t atomic_add_release_global_u32(uint32_t* ptr, uint32_t val) {
+  auto* global_ptr = reinterpret_cast<uint32_t*>(__musa_ptr_gen_to_global(ptr));
+  musa::atomic_ref<uint32_t, musa::thread_scope_system> ref(*global_ptr);
+  return ref.fetch_add(val, musa::memory_order_release);
+}
+
+__device__ __forceinline__ uint32_t load_acquire_global_u32(const uint32_t* ptr) {
+  auto* global_ptr = reinterpret_cast<uint32_t*>(__musa_ptr_gen_to_global(const_cast<uint32_t*>(ptr)));
+  musa::atomic_ref<uint32_t, musa::thread_scope_system> ref(*global_ptr);
+  return ref.load(musa::memory_order_acquire);
 }
 
 __device__ __forceinline__ unsigned long long atomic_add_global_u64(unsigned long long* ptr, unsigned long long val) {

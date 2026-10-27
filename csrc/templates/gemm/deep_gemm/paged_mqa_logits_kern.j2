@@ -26,10 +26,10 @@ void clean_paged_mqa_logits(
 ) {
   constexpr int kBlockKV  = 8192;
   constexpr int kNumWarps = 8;
-  constexpr int kSmemSize = kBlockKV * sizeof(float);
+  constexpr int kSmemSize = kBlockKV * sizeof({{ out_element_literal }});
 
   CHECK_MUSA(logits);
-  CHECK_INPUT_TYPE(logits, dl_float32);
+  CHECK_INPUT_TYPE(logits, {{ out_input_dtype }});
   CHECK_MUSA(cu_seq_len_k_end);
   CHECK_CONTIGUOUS(cu_seq_len_k_end);
   CHECK_INPUT_TYPE(cu_seq_len_k_end, dl_int32);
@@ -54,14 +54,15 @@ void clean_paged_mqa_logits(
 
   auto launch = [&](auto NextNTag) {
     constexpr int kNextN = decltype(NextNTag)::value;
-    mate::deep_gemm::mpxx_clean_logits<kNextN, kBlockKV, kNumWarps>
+    mate::deep_gemm::mpxx_clean_logits<kNextN, kBlockKV, kNumWarps, {{ out_element_literal }}>
         <<<num_mps, kNumWarps * 32, kSmemSize, stream>>>(
             static_cast<uint32_t>(seq_len),
             static_cast<uint32_t>(seq_len_kv),
             stride_kv,
             reinterpret_cast<uint32_t const*>(optional_int32_data_ptr(cu_seq_len_k_start)),
             static_cast<uint32_t*>(cu_seq_len_k_end.data_ptr()),
-            static_cast<float*>(logits.data_ptr()));
+            static_cast<{{ out_element_literal }}*>(logits.data_ptr()));
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
   };
 
   if (next_n == 1) {
@@ -71,8 +72,6 @@ void clean_paged_mqa_logits(
   } else {
     launch(mute::_4{});
   }
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 }  // namespace
@@ -169,7 +168,7 @@ ffi::Tensor {{ func_name }}(
   const int64_t aligned_max_context_len = align_to(max_context_len, int64_t(kNumMathWarpGroups * kBlockKV));
 
   ffi::Tensor logits_pad =
-      alloc_tensor(ffi::Shape{batch_size * next_n, aligned_max_context_len}, dl_float32, q.device());
+      alloc_tensor(ffi::Shape{batch_size * next_n, aligned_max_context_len}, {{ out_input_dtype }}, q.device());
   ffi::Shape  logits_shape{batch_size * next_n, max_context_len};
   ffi::Shape  logits_strides{aligned_max_context_len, 1};
   ffi::Tensor logits = logits_pad.as_strided(logits_shape, logits_strides);
@@ -197,7 +196,8 @@ ffi::Tensor {{ func_name }}(
                                                         decltype(stride_sfk),
                                                         decltype(stride_w),
                                                         decltype(stride_block_table),
-                                                        decltype(stride_logits)>;
+                                                        decltype(stride_logits),
+                                                        {{ out_element_literal }}>;
 
   typename Kernel::Arguments arguments = {
       .ptr_q              = static_cast<Element const*>(q.data_ptr()),
@@ -212,7 +212,7 @@ ffi::Tensor {{ func_name }}(
       .ptr_schedule_meta  = static_cast<uint32_t*>(schedule_meta.data_ptr()),
       .ptr_block_table    = static_cast<int32_t*>(block_table.data_ptr()),
       .stride_block_table = stride_block_table,
-      .ptr_logits         = static_cast<float*>(logits.data_ptr()),
+      .ptr_logits         = static_cast<{{ out_element_literal }}*>(logits.data_ptr()),
       .stride_logits      = stride_logits,
       .batch_size         = static_cast<int32_t>(batch_size),
       .num_kv_blocks      = static_cast<int32_t>(num_kv_blocks),
@@ -222,7 +222,7 @@ ffi::Tensor {{ func_name }}(
   auto         params = Kernel::to_underlying_arguments(arguments);
   mutlass::device_kernel<Kernel>
       <<<num_mps, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 
   if (clean_logits) {
     if constexpr (kIsContextLens2D) {

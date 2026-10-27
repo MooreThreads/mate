@@ -22,7 +22,8 @@ template <class TileShape_MK_,
           bool HasCuseqlensQ,
           bool HasSequsedQ,
           class Element,
-          class ElementPartial>
+          class ElementPartial,
+          bool HasMaxLogits = false>
 struct FmhaFwdCombine {
   template <typename T>
   struct MaxOp {
@@ -100,10 +101,14 @@ struct FmhaFwdCombine {
   static_assert(kBlockK % kGmemElemsPerLoad == 0, "kBlockK must be a multiple of kGmemElemsPerLoad");
   static constexpr int kBlockKGmem        = kBlockK % 128 == 0 ? 128 : (kBlockK % 64 == 0 ? 64 : 32);
   static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
+  static constexpr int kOutputThreads     = std::min(int(MaxThreadsPerBlock), TileM* kGmemThreadsPerRow);
+  static constexpr int kSplitGroups       = MaxThreadsPerBlock / kOutputThreads;
+  static_assert(MaxThreadsPerBlock % kOutputThreads == 0);
+  static_assert(mutlass::NumThreadsPerWarp % kSplitGroups == 0);
   static_assert(MaxThreadsPerBlock % kGmemThreadsPerRow == 0,
                 "MaxThreadsPerBlock must be a multiple of kGmemThreadsPerRow");
   using GmemCopyAtom   = mute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementPartial>;
-  using GmemLayoutAtom = Layout<Shape<Int<MaxThreadsPerBlock / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
+  using GmemLayoutAtom = Layout<Shape<Int<kOutputThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                 Stride<Int<kGmemThreadsPerRow>, _1>>;
   static_assert(TileM % MUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0);
   using GmemTiledCopyAccum = decltype(make_tiled_copy(
@@ -153,6 +158,8 @@ struct FmhaFwdCombine {
   using S2RLayoutAtomLSE = Layout<Shape<Int<kSmemThreadsPerColLSEt>, Int<MaxThreadsPerBlock / kSmemThreadsPerColLSEt>>>;
   using S2RTiledCopyLSE =
       decltype(make_tiled_copy(mute::Copy_Atom<mute::DefaultCopy, float>{}, S2RLayoutAtomLSE{}, Layout<_1>{}));
+  static constexpr bool kWarpLocalLSE = TileM == TileMSmem && kOutputThreads == TileM * kGmemThreadsPerRow;
+  static constexpr bool kRegisterLSE  = kWarpLocalLSE;
 
   using ShapeOPartial    = Shape<int32_t, int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, num_splits, head, batch)
   using StrideOPartial   = Stride<int64_t, _1, int64_t, int64_t, int64_t>;
@@ -164,8 +171,9 @@ struct FmhaFwdCombine {
   using StrideLSE        = Stride<_1, int64_t, int64_t>;      // (seqlen, head, batch)
 
   struct SharedStorage : mute::aligned_struct<128> {
-    mute::array_aligned<float, cosize_v<SmemLayoutLSE>> smem_lse_partial;
-    mute::array_aligned<int, TileM>                     smem_max_valid_split;
+    // LSE and logits share the layout, but occupy separate planes.
+    mute::array_aligned<float, (1 + HasMaxLogits) * cosize_v<SmemLayoutLSE>> smem_lse_partial;
+    mute::array_aligned<int, TileM>                                          smem_max_valid_split;
   };
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -182,6 +190,8 @@ struct FmhaFwdCombine {
     StrideO const               stride_O;
     float* const                ptr_LSE;
     StrideLSE const             stride_LSE;
+    float* const                ptr_max_logits         = nullptr;
+    float const* const          ptr_max_logits_partial = nullptr;
     uint32_t const* const       cu_seqlens             = nullptr;
     uint32_t const* const       seqused                = nullptr;
     int const* const            num_splits_dynamic_ptr = nullptr;
@@ -200,6 +210,8 @@ struct FmhaFwdCombine {
     StrideO const               stride_O;
     float* const                ptr_LSE;
     StrideLSE const             stride_LSE;
+    float* const                ptr_max_logits         = nullptr;
+    float const* const          ptr_max_logits_partial = nullptr;
     mutlass::FastDivmod         seqlen_divmod, head_divmod;
     uint32_t const* const       cu_seqlens             = nullptr;
     uint32_t const* const       seqused                = nullptr;
@@ -221,6 +233,8 @@ struct FmhaFwdCombine {
         args.stride_O,
         args.ptr_LSE,
         args.stride_LSE,
+        args.ptr_max_logits,
+        args.ptr_max_logits_partial,
         mutlass::FastDivmod(get<0>(args.shape_LSE_partial)),
         mutlass::FastDivmod(get<2>(args.shape_LSE_partial)),
         args.cu_seqlens,
@@ -237,6 +251,9 @@ struct FmhaFwdCombine {
 
     Tensor sLSE           = make_tensor(make_smem_ptr(shared_storage.smem_lse_partial.data()), SmemLayoutLSE{});
     Tensor sMaxValidSplit = make_tensor(make_smem_ptr(shared_storage.smem_max_valid_split.data()), Shape<Int<TileM>>{});
+    Tensor sMax =
+        make_tensor(make_smem_ptr(shared_storage.smem_lse_partial.data() + HasMaxLogits * cosize_v<SmemLayoutLSE>),
+                    SmemLayoutLSE{});
 
     int const thread_idx          = threadIdx.x;
     int const m_block             = blockIdx.x;
@@ -274,10 +291,18 @@ struct FmhaFwdCombine {
                     select<1, 0, 2, 3>(params.shape_LSE_partial),  // (num_splits, seqlen, head, batch)
                     select<1, 0, 2, 3>(params.stride_LSE_partial))(_, _, _, !HasCuseqlensQ ? batch : 0);
 
-    Tensor           mLSEpartial_copy = tiled_divide(mLSEpartial, Shape<_1, Int<kGmemElemsPerLoadLSE>>{});
+    Tensor mLSEpartial_copy = tiled_divide(mLSEpartial, Shape<_1, Int<kGmemElemsPerLoadLSE>>{});
+    Tensor mMaxPartial =
+        make_tensor(make_gmem_ptr((HasMaxLogits ? params.ptr_max_logits_partial : params.ptr_LSE_partial) +
+                                  offset * get<0>(params.stride_LSE_partial)),
+                    select<1, 0, 2, 3>(params.shape_LSE_partial),
+                    select<1, 0, 2, 3>(params.stride_LSE_partial))(_, _, _, !HasCuseqlensQ ? batch : 0);
+    Tensor mMaxPartial_copy = tiled_divide(mMaxPartial, Shape<_1, Int<kGmemElemsPerLoadLSE>>{});
+
     GmemTiledCopyLSE gmem_tiled_copy_LSE;
     auto             gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_thread_slice(thread_idx);
     Tensor           tLSEsLSE          = gmem_thr_copy_LSE.partition_D(sLSE);
+    Tensor           tMaxsMax          = gmem_thr_copy_LSE.partition_D(sMax);
 
     // Construct identity layout for sLSE
     Tensor cLSE =
@@ -310,11 +335,22 @@ struct FmhaFwdCombine {
           // m))), reinterpret_cast<int>(&(tLSEsLSE(_0{}, s, m))) / 4 % 32);}
           if (si < num_splits) {
             copy(gmem_tiled_copy_LSE, mLSEpartial_cur_copy(_, si), tLSEsLSE(_, s, m));
+            if constexpr (HasMaxLogits) {
+              if (k_block == 0) {
+                copy(gmem_tiled_copy_LSE, mMaxPartial_copy(_, si, m_idx, bidh), tMaxsMax(_, s, m));
+              }
+            }
           } else {
             fill(tLSEsLSE(_, s, m), -INFINITY);
+            if constexpr (HasMaxLogits) {
+              if (k_block == 0) fill(tMaxsMax(_, s, m), -INFINITY);
+            }
           }
         }
       } else {
+        if constexpr (HasMaxLogits) {
+          if (k_block == 0) fill(tMaxsMax(_, _, m), -INFINITY);
+        }
         // We don't need to zero out the rest of the LSEs, as we will not write the output to gmem
         // fill(tLSEsLSE(_, _, m), -INFINITY);
       }
@@ -322,7 +358,7 @@ struct FmhaFwdCombine {
 
     // Step 2: Load O_partial - compute address.
     GmemTiledCopyAccum gmem_tiled_copy_O_partial;
-    auto               gmem_thr_copy_O_partial = gmem_tiled_copy_O_partial.get_thread_slice(thread_idx);
+    auto               gmem_thr_copy_O_partial = gmem_tiled_copy_O_partial.get_thread_slice(thread_idx / kSplitGroups);
     // Construct identity layout for gO
     Tensor cO = make_identity_tensor(TileShape_MK{});  // (BLK_M,BLK_K) -> (blk_m,blk_k)
     // Repeat the partitioning with identity layouts
@@ -365,10 +401,16 @@ struct FmhaFwdCombine {
     Tensor          ts2rsLSE         = s2r_thr_copy_LSE.partition_S(sLSE);
     Tensor          ts2rrLSE         = make_fragment_like(ts2rsLSE);
     copy(s2r_tiled_copy_LSE, ts2rsLSE, ts2rrLSE);
+    Tensor ts2rsMax = s2r_thr_copy_LSE.partition_S(sMax);
+    Tensor ts2rrMax = make_fragment_like(ts2rsMax);
+    if constexpr (HasMaxLogits) {
+      if (k_block == 0) copy(s2r_tiled_copy_LSE, ts2rsMax, ts2rrMax);
+    }
 
     // Step 4: compute the final LSE along the split dimension
-    Tensor lse_sum  = make_tensor<float>(make_shape(size<2>(ts2rrLSE)));
-    Tensor ts2rcLSE = s2r_thr_copy_LSE.partition_D(cLSE);
+    Tensor lse_sum    = make_tensor<float>(make_shape(size<2>(ts2rrLSE)));
+    Tensor ts2rcLSE   = s2r_thr_copy_LSE.partition_D(cLSE);
+    Tensor logits_max = make_fragment_like(lse_sum);
     // We compute the max valid split for each row to short-circuit the computation later
     Tensor max_valid_split = make_tensor<int>(make_shape(size<2>(ts2rrLSE)));
     static_assert(MUTE_STATIC_V(size<0>(ts2rrLSE)) == 1);
@@ -376,12 +418,22 @@ struct FmhaFwdCombine {
     MUTLASS_PRAGMA_UNROLL
     for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
       float lse_max = ts2rrLSE(_0{}, _0{}, m);
+      float maximum = -INFINITY;
+      if constexpr (HasMaxLogits) {
+        if (k_block == 0) maximum = ts2rrMax(_0{}, _0{}, m);
+      }
       MUTLASS_PRAGMA_UNROLL
       for (int s = 1; s < size<1>(ts2rrLSE); ++s) {
         lse_max = max(lse_max, ts2rrLSE(_0{}, s, m));
+        if constexpr (HasMaxLogits) {
+          if (k_block == 0) maximum = max(maximum, ts2rrMax(_0{}, s, m));
+        }
       }
       MaxOp<float> max_op;
-      lse_max           = Allreduce<kSmemThreadsPerColLSEt>::run(lse_max, max_op);
+      lse_max = Allreduce<kSmemThreadsPerColLSEt>::run(lse_max, max_op);
+      if constexpr (HasMaxLogits) {
+        if (k_block == 0) logits_max(m) = Allreduce<kSmemThreadsPerColLSEt>::run(maximum, max_op);
+      }
       int max_valid_idx = -1;
       MUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < size<1>(ts2rrLSE); ++s) {
@@ -412,12 +464,12 @@ struct FmhaFwdCombine {
       }
     }
     // Store the scales exp(lse - lse_logsum) back to smem
-    copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE);
+    if constexpr (!kRegisterLSE) copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE);
 
     // Store max_valid_split to smem
     MUTLASS_PRAGMA_UNROLL
     for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
-      if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to smem
+      if (!kRegisterLSE && get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {
         int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
         if (mi < TileM) {
           sMaxValidSplit[mi] = max_valid_split[m];
@@ -446,15 +498,29 @@ struct FmhaFwdCombine {
             // printf("thread_idx = %d, m = %d, mi = %d, idx = %d, m_idx = %d, bidh = %d, bidb = %d, lse_sum = %f\n",
             // thread_idx, m, mi, idx, m_idx, bidh, bidb, lse_sum(m));
             mLSE(m_idx, bidh) = lse_sum(m);
+            if constexpr (HasMaxLogits) {
+              Tensor mMax       = make_tensor(make_gmem_ptr(params.ptr_max_logits + offset * get<0>(params.stride_LSE)),
+                                        shape_LSE,
+                                        params.stride_LSE)(_, _, !HasCuseqlensQ ? batch : 0);
+              mMax(m_idx, bidh) = logits_max(m);
+            }
           }
         }
       }
     }
 
     // Step 6: read O_partial from gmem -> smem -> rmem and accumulate the final O
-    __syncthreads();
+    if constexpr (kRegisterLSE) {
+      static_assert(MUTE_STATIC_V(size<2>(ts2rrLSE)) == 1);
+    } else if constexpr (kWarpLocalLSE) {
+      // Each output warp consumes exactly the LSE rows normalized by that warp.
+      static_assert(TileMSmem == TileM && kOutputThreads == TileM * kGmemThreadsPerRow);
+      __syncwarp();
+    } else {
+      __syncthreads();
+    }
     // Compute max split idx
-    int thr_max_valid_split = sMaxValidSplit[get<0>(tOcO(_0{}, _0{}, _0{}))];
+    int thr_max_valid_split = kRegisterLSE ? max_valid_split[0] : sMaxValidSplit[get<0>(tOcO(_0{}, _0{}, _0{}))];
     MUTLASS_PRAGMA_UNROLL
     for (int m = 1; m < size<1>(tOcO); ++m) {
       thr_max_valid_split = max(thr_max_valid_split, sMaxValidSplit[get<0>(tOcO(_0{}, m, _0{}))]);
@@ -464,14 +530,29 @@ struct FmhaFwdCombine {
     Tensor tOrOpartial = make_fragment_like<ElementPartial>(tOrOpartial_layout);
     Tensor tOrO        = make_fragment_like<float>(tOrOpartial);
     clear(tOrO);
+    // Same row and split residue: every named lane executes the same loop iterations,
+    // including weight providers whose output column is masked out.
+    constexpr uint32_t kRowMask     = uint32_t((uint64_t{1} << kSmemThreadsPerColLSEt) - 1);
+    constexpr uint32_t kResidueMask = uint32_t(uint64_t{0xffffffffu} / ((uint64_t{1} << kSplitGroups) - 1));
+    int                row_lane     = (thread_idx % 32) / kSmemThreadsPerColLSEt * kSmemThreadsPerColLSEt;
+    uint32_t           weight_mask  = (kRowMask << row_lane) & (kResidueMask << (thread_idx % kSplitGroups));
 #pragma unroll 4  // Already tuned for speed
-    for (int s = 0; s <= thr_max_valid_split; ++s) {
+    for (int s = thread_idx % kSplitGroups; s <= thr_max_valid_split; s += kSplitGroups) {
       // Row-wise scale for current split.
       Tensor scale = make_tensor<float>(make_shape(size<1>(tOrOpartial)));
       MUTLASS_PRAGMA_UNROLL
       for (int m = 0; m < size<1>(tOrOpartial); ++m) {
-        int mi   = get<0>(tOcO(_0{}, m, _0{}));  // row inside TileM
-        scale(m) = sLSE(s, mi);
+        int mi = get<0>(tOcO(_0{}, m, _0{}));  // row inside TileM
+        if constexpr (kRegisterLSE) {
+          static_assert(MUTE_STATIC_V(size<1>(tOrOpartial)) == 1);
+          float weight = ts2rrLSE(_0{}, _0{}, _0{});
+          MUTLASS_PRAGMA_UNROLL
+          for (int i = 1; i < size<1>(ts2rrLSE); ++i)
+            if (s >= i * kSmemThreadsPerColLSEt) weight = ts2rrLSE(_0{}, i, _0{});
+          scale(m) = __shfl_sync(weight_mask, weight, row_lane + s % kSmemThreadsPerColLSEt);
+        } else {
+          scale(m) = sLSE(s, mi);
+        }
       }
 
       MUTLASS_PRAGMA_UNROLL
@@ -503,6 +584,15 @@ struct FmhaFwdCombine {
       }
     }
 
+    if constexpr (kSplitGroups > 1) {
+      SumOp<float> sum_op;
+      MUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tOrO); ++i) {
+        tOrO(i) = Allreduce<kSplitGroups>::run(tOrO(i), sum_op);
+      }
+      if (thread_idx % kSplitGroups != 0) return;
+    }
+
     // Step 7: Write the final O to gmem
     Tensor rO = make_tensor_like<Element>(tOrO);
     convert_type_out(tOrO, rO);
@@ -518,7 +608,7 @@ struct FmhaFwdCombine {
     Tensor mO_copy = tiled_divide(
         mO, Shape<_1, Int<kGmemElemsPerLoad>>{});  // mO_copy: (seqlen, d / kGmemElemsPerLoad, kGmemElemsPerLoad, head)
     GmemTiledCopy gmem_tiled_copy_O;
-    auto          gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+    auto          gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx / kSplitGroups);
 
     MUTLASS_PRAGMA_UNROLL
     for (int m = 0; m < size<1>(tOcO); ++m) {

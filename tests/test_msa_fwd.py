@@ -3,11 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mate import msa_interface as msa
 from mate.jit.msa_ops import (
     _msa_fwd,
     gen_msa_ops_aot,
     make_msa_fwd_config,
 )
+from mate.testing.operators.msa import MsaOperator
 
 
 _HAS_MUSA = hasattr(torch, "musa") and torch.musa.is_available()
@@ -118,6 +120,51 @@ def test_msa_fwd_rejects_unsupported_output_dtype():
             causal=True,
             out=out,
         )
+
+
+@pytest.mark.parametrize("dtype", [dtype for dtype, _ in _DTYPES])
+@pytest.mark.skipif(not _HAS_MUSA, reason="MUSA is required for MSA forward")
+def test_msa_fwd_query_group_preserves_duplicate_selections(dtype):
+    rows = [[0, 0, 1], [1, 0, 1], [], [2, 0, 2], [0] * 15 + [1]]
+    q = torch.zeros((5, 16, 128), dtype=dtype, device="musa")
+    k = torch.zeros((3, 128, 2, 128), dtype=dtype, device="musa")
+    v = torch.arange(3, dtype=torch.float32, device="cpu").view(3, 1, 1, 1)
+    v = v.expand(3, 128, 2, 128).contiguous().to(dtype=dtype, device="musa")
+    blocks = torch.full((5, 2, 16), -1, dtype=torch.int32, device="cpu")
+    expected = torch.zeros((5, 16, 128), dtype=torch.float32, device="cpu")
+    expected_lse = torch.full((5, 16), -torch.inf, dtype=torch.float32, device="cpu")
+    for query, row in enumerate(rows):
+        for head in range(2):
+            selected = [(index + head) % 3 for index in row]
+            if selected:
+                blocks[query, head, : len(selected)] = torch.tensor(
+                    selected, dtype=torch.int32
+                )
+                expected[query, head * 8 : (head + 1) * 8] = sum(selected) / len(
+                    selected
+                )
+                expected_lse[query, head * 8 : (head + 1) * 8] = torch.log(
+                    torch.tensor(128 * len(selected), dtype=torch.float32)
+                )
+    vector = lambda values: torch.tensor(values, dtype=torch.int32, device="musa")
+    out, lse = _msa_fwd(
+        q,
+        k,
+        v,
+        blocks.to("musa"),
+        vector([0, 5]),
+        vector([384]),
+        vector([0]),
+        vector([0, 1, 2]).reshape(1, 3),
+        max_seqlen_q=5,
+        max_seqlen_k=384,
+        causal=False,
+    )
+    torch.musa.synchronize()
+    torch.testing.assert_close(
+        out.float().cpu(), expected.to(dtype).float(), rtol=0, atol=0.01
+    )
+    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.005)
 
 
 def _online_same_dtype_p_reference(
@@ -354,6 +401,43 @@ def test_msa_fwd_fp8_probability_swizzle_preserves_one_hot_rows(output_dtype):
 
     assert actual_float.argmax(dim=-1).flatten().tolist() == target_columns
     torch.testing.assert_close(actual_float, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("dtype", [dtype for dtype, _ in _DTYPES])
+@pytest.mark.parametrize("head_ratio", [8, 16])
+@pytest.mark.skipif(not _HAS_MUSA, reason="MUSA is required for MSA forward")
+def test_msa_fwd_masked_prefix_preserves_negative_logits(dtype, head_ratio):
+    device = torch.device("musa")
+    q = torch.ones((3, head_ratio, 128), dtype=torch.float32, device=device).to(dtype)
+    k = torch.full((4, 128, 1, 128), -1.0, dtype=torch.float32, device=device).to(dtype)
+    v = torch.full(k.shape, 0.5, dtype=torch.float32, device=device).to(dtype)
+    blocks = torch.full((3, 1, 16), -1, dtype=torch.int32, device=device)
+    blocks[0, 0, 2] = 2
+    blocks[2, 0, :2] = 2
+    out = torch.full(q.shape, float("nan"), dtype=torch.bfloat16, device=device)
+    actual, lse = _msa_fwd(
+        q,
+        k,
+        v,
+        blocks,
+        torch.tensor([0, 3], dtype=torch.int32, device=device),
+        torch.tensor([512], dtype=torch.int32, device=device),
+        torch.tensor([511], dtype=torch.int32, device=device),
+        torch.arange(4, dtype=torch.int32).reshape(1, 4).to(device),
+        max_seqlen_q=3,
+        max_seqlen_k=512,
+        causal=True,
+        out=out,
+    )
+    expected = torch.full(q.shape, 0.5, dtype=torch.float32)
+    expected[1] = 0
+    torch.testing.assert_close(actual.float().cpu(), expected, atol=2e-3, rtol=0)
+    lse_cpu = lse.cpu()
+    expected_lse = -128 * 128**-0.5 + torch.log(torch.tensor([128.0, 256.0]))
+    torch.testing.assert_close(
+        lse_cpu[[0, 2]], expected_lse[:, None].expand(2, head_ratio), atol=5e-3, rtol=0
+    )
+    assert torch.isneginf(lse_cpu[1]).all()
 
 
 @pytest.mark.parametrize("q_len,num_q_heads", [(1, 16), (4, 8)])
@@ -669,3 +753,176 @@ def test_msa_fwd_k_scale_is_folded_into_softmax(dtype: torch.dtype):
     torch.testing.assert_close(
         lse[0].float().cpu(), expected_lse.expand(8), atol=0.02, rtol=0.02
     )
+
+
+@pytest.mark.skipif(not _HAS_MUSA or _FP8 is None, reason="MUSA FP8 is required")
+@pytest.mark.parametrize("ratio,flat_table", [(8, False), (16, True)])
+def test_msa_fwd_ragged_empty_masked_and_partial_rows(ratio, flat_table):
+    generator = torch.Generator().manual_seed(2907)
+    q = (torch.randn((5, ratio, 128), generator=generator) * 0.25).to(_FP8)
+    k = (torch.randn((7, 128, 1, 128), generator=generator) * 0.25).to(_FP8)
+    v = (torch.randn(k.shape, generator=generator) * 0.25).to(_FP8)
+    table = torch.tensor([[3, 1, 6, 0], [5, 2, 4, -1]], dtype=torch.int32)
+    blocks = torch.full((5, 1, 16), -1, dtype=torch.int32)
+    blocks[0, 0, 0] = 3
+    blocks[2, 0, :2] = torch.tensor([0, 3])
+    blocks[3:, 0, :2] = torch.tensor([0, 2])
+    q_cpu, k_cpu, v_cpu = [tensor.cpu().float() for tensor in (q, k, v)]
+    expected = [
+        _online_same_dtype_p_reference(
+            q_cpu[start:stop],
+            k_cpu[table[batch, :pages].long()],
+            v_cpu[table[batch, :pages].long()],
+            blocks[start:stop],
+            causal=True,
+            qo_offset=offset,
+            kv_len=kv_len,
+            softmax_scale=128**-0.5,
+            dtype=_FP8,
+            output_dtype=torch.bfloat16,
+        )
+        for start, stop, batch, pages, kv_len, offset in [
+            (0, 3, 0, 4, 387, 0),
+            (3, 5, 1, 3, 257, 255),
+        ]
+    ]
+    table_arg = torch.cat([table[0], table[1, :3]]) if flat_table else table
+    out = torch.full(q.shape, float("nan"), dtype=torch.bfloat16, device="musa")
+    lse = torch.full((5, ratio), float("nan"), device="musa")
+    actual, actual_lse = _msa_fwd(
+        q.to("musa"),
+        k.to("musa"),
+        v.to("musa"),
+        blocks.to("musa"),
+        torch.tensor([0, 3, 5], dtype=torch.int32, device="musa"),
+        torch.tensor([387, 257], dtype=torch.int32, device="musa"),
+        torch.tensor([0, 255], dtype=torch.int32, device="musa"),
+        table_arg.to("musa"),
+        kv_page_indptr=torch.tensor([0, 4, 7], dtype=torch.int32, device="musa")
+        if flat_table
+        else None,
+        max_seqlen_q=3,
+        max_seqlen_k=387,
+        causal=True,
+        out=out,
+        lse=lse,
+    )
+    assert actual is out and actual_lse is lse
+    torch.testing.assert_close(
+        actual.float().cpu(),
+        torch.cat([o for o, _ in expected]).float(),
+        rtol=0.01,
+        atol=0.0005,
+    )
+    torch.testing.assert_close(
+        actual_lse.cpu(), torch.cat([s for _, s in expected]), rtol=0, atol=0.005
+    )
+
+
+@pytest.mark.skipif(not _HAS_MUSA or _FP8 is None, reason="MUSA FP8 is required")
+def test_msa_public_maxscore_topk_forward_pipeline():
+    total_q, num_pages, ratio = 7, 20, 8
+    kv_len = num_pages * 128 - 37
+    offset = kv_len - total_q
+    generator = torch.Generator().manual_seed(119)
+    q_index = torch.randint(-2, 3, (total_q, 1, 128), generator=generator).to(_FP8)
+    k = torch.randint(-2, 3, (num_pages, 128, 1, 128), generator=generator).to(_FP8)
+    q = (
+        torch.randint(-2, 3, (total_q, ratio, 128), generator=generator).float() * 0.125
+    ).to(_FP8)
+    v = (torch.randint(-2, 3, k.shape, generator=generator).float() * 0.125).to(_FP8)
+    table = torch.randperm(num_pages, generator=generator).to(torch.int32).unsqueeze(0)
+    lengths_q = torch.tensor([total_q], dtype=torch.int32)
+    lengths_k = torch.tensor([kv_len], dtype=torch.int32)
+    q_cpu, k_cpu, v_cpu, q_index_cpu = [
+        tensor.cpu().float() for tensor in (q, k, v, q_index)
+    ]
+    expected_scores = MsaOperator._dense_msa_output_maxscore_reference(
+        q_index_cpu,
+        k_cpu.permute(0, 2, 1, 3),
+        lengths_q,
+        lengths_k,
+        1,
+        MsaOperator._maxscore_k_tiles(kv_len),
+        causal=True,
+        page_table=table,
+        page_size=128,
+    )
+    positions = torch.arange(total_q, dtype=torch.int64) + offset
+    expected_blocks = MsaOperator._sparse_topk_select_reference(
+        expected_scores, topk=16, num_valid_pages=num_pages, query_positions=positions
+    )
+    expected_out, expected_lse = _online_same_dtype_p_reference(
+        q_cpu,
+        k_cpu[table[0].long()],
+        v_cpu[table[0].long()],
+        expected_blocks,
+        causal=True,
+        qo_offset=offset,
+        kv_len=kv_len,
+        softmax_scale=128**-0.5,
+        dtype=_FP8,
+        output_dtype=torch.bfloat16,
+    )
+    runtime = msa.MsaRuntimeMetadata(
+        qo_lens=lengths_q.to("musa"),
+        kv_lens=lengths_k.to("musa"),
+        qo_offset=torch.tensor([offset], dtype=torch.int32, device="musa"),
+        cu_seqlens_q=torch.tensor([0, total_q], dtype=torch.int32, device="musa"),
+        cu_seqlens_k=torch.tensor([0, kv_len], dtype=torch.int32, device="musa"),
+        seqused_k=lengths_k.to("musa"),
+        page_table=table.to("musa"),
+    )
+    common = dict(
+        batch_size=1,
+        max_seqlen_q=total_q,
+        max_seqlen_k=kv_len,
+        total_seqlen_k=kv_len,
+        num_kv_heads=1,
+        page_size=128,
+        causal=True,
+        use_fp8_kvcache=True,
+    )
+    score_plan = msa.msa_plan(num_qo_heads=1, output_maxscore=True, **common)
+    fwd_plan = msa.msa_plan(
+        num_qo_heads=ratio, kv_block_num=16, sparse_kernel_mode="prefill", **common
+    )
+    qd, kd, vd, qid = [tensor.to("musa") for tensor in (q, k, v, q_index)]
+    scores = torch.full(expected_scores.shape, float("nan"), device="musa")
+    blocks = torch.full(expected_blocks.shape, -2, dtype=torch.int32, device="musa")
+    out = torch.full(q.shape, float("nan"), dtype=torch.bfloat16, device="musa")
+    lse = torch.full((total_q, ratio), float("nan"), device="musa")
+    _, actual_scores = msa.msa(
+        qid,
+        kd,
+        vd,
+        score_plan,
+        output_o=False,
+        output_maxscore=True,
+        max_score=scores,
+        runtime_metadata=runtime,
+    )
+    selected = msa.sparse_topk_select(
+        actual_scores,
+        topk=16,
+        num_valid_pages=num_pages,
+        query_positions=positions.to("musa"),
+        output=blocks,
+    )
+    actual, _ = msa.sparse_msa(
+        qd,
+        kd,
+        vd,
+        fwd_plan,
+        kv_block_indexes=selected,
+        runtime_metadata=runtime,
+        out=out,
+        lse=lse,
+    )
+    assert actual_scores is scores and selected is blocks and actual is out
+    torch.testing.assert_close(actual_scores.cpu(), expected_scores, rtol=0, atol=0)
+    torch.testing.assert_close(selected.cpu(), expected_blocks, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual.float().cpu(), expected_out.float(), rtol=0.01, atol=0.0005
+    )
+    torch.testing.assert_close(lse.cpu(), expected_lse, rtol=0, atol=0.005)

@@ -78,6 +78,15 @@ from .mega_moe import (
     get_fp8_fp8_mega_moe_stage2_module as get_fp8_fp8_mega_moe_stage2_module,
     get_mega_moe_runtime_utils_module as get_mega_moe_runtime_utils_module,
 )
+from .mega_moe_prefill import (
+    PrefillMegaMoEKernelConfig as PrefillMegaMoEKernelConfig,
+    gen_prefill_stage1_spec as gen_prefill_stage1_spec,
+    gen_prefill_stage2_spec as gen_prefill_stage2_spec,
+    gen_prefill_stage3_spec as gen_prefill_stage3_spec,
+    get_prefill_stage1_module as get_prefill_stage1_module,
+    get_prefill_stage2_module as get_prefill_stage2_module,
+    get_prefill_stage3_module as get_prefill_stage3_module,
+)
 from .msa_ops import gen_msa_ops_aot as gen_msa_ops_aot
 from .msa_ops import gen_msa_ops_spec as gen_msa_ops_spec
 from .msa_ops import get_msa_ops_module as get_msa_ops_module
@@ -134,6 +143,13 @@ __all__ = [
     "get_fp8_fp8_mega_moe_stage1_module",
     "get_fp8_fp8_mega_moe_stage2_module",
     "get_mega_moe_runtime_utils_module",
+    "PrefillMegaMoEKernelConfig",
+    "gen_prefill_stage1_spec",
+    "gen_prefill_stage2_spec",
+    "gen_prefill_stage3_spec",
+    "get_prefill_stage1_module",
+    "get_prefill_stage2_module",
+    "get_prefill_stage3_module",
     "gen_msa_ops_aot",
     "gen_msa_ops_spec",
     "get_msa_ops_module",

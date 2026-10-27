@@ -18,6 +18,8 @@ import torch
 import tilelang
 from tilelang import language as T
 
+from .fused_rope_cast import output_scale_exponent
+
 SCHEDULED_DECODE_PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False,
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -91,6 +93,7 @@ def make_scheduled_decode_combine(
     max_lse_init,
     launch_by_scheduler=False,
     lse_layout="BHN",
+    fused_groups=0,
 ):
     """Build the shared scheduled sparse decode combine macro.
 
@@ -122,8 +125,11 @@ def make_scheduled_decode_combine(
             [batch + num_mp_parts, seq_len, num_heads, dim], accum_dtype
         ),  # type: ignore
         attn_sink: T.Tensor([num_heads], accum_dtype),  # type: ignore
-        output: T.Tensor([batch, seq_len, num_heads, dim], dtype),  # type: ignore
+        output,
         lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
+        output_sf=None,
+        positions=None,
+        cos_sin=None,
     ):
         with T.Kernel(
             combine_grid_size,
@@ -172,11 +178,19 @@ def make_scheduled_decode_combine(
                     seq_idx = loop % block_m
                     if seq_idx < num_cur_valid_q_seqs:
                         flat_idx = seq_idx + m_block_idx * block_m
-                        lse_scale_shared[seq_idx, split_idx] = glse[
-                            split_start + split_idx,
-                            flat_idx // num_heads,
-                            flat_idx % num_heads,
-                        ]
+                        T.copy(
+                            glse[
+                                split_start + split_idx,
+                                flat_idx // num_heads,
+                                flat_idx % num_heads,
+                            ],
+                            lse_scale_shared[seq_idx, split_idx],
+                            force_async_copy=True,
+                        )
+                        # Group 0 owns this valid split's LSE. Drain it inside
+                        # the branch before the collective shared-memory read.
+                        T.async_copy_commit_group(0)
+                        T.async_copy_wait_group(0)
                     else:
                         lse_scale_shared[seq_idx, split_idx] = -T.infinity(accum_dtype)
                 T.sync_threads()
@@ -285,12 +299,51 @@ def make_scheduled_decode_combine(
                                     )
                                 ),
                             )
-                        output[
-                            batch_idx,
-                            flat_idx // num_heads,
-                            flat_idx % num_heads,
-                            lane_idx + i * 32,
-                        ] = T.Cast(dtype, result[i] * sink_scale)
+                        if fused_groups:
+                            value = T.alloc_var(accum_dtype)
+                            value = result[i] * sink_scale
+                            if i >= 14:
+                                partner = T.shfl_xor(value, 1)
+                                cosine = cos_sin[
+                                    positions[batch_idx],
+                                    ((i - 14) * 32 + lane_idx) // 2,
+                                ]
+                                sine = cos_sin[
+                                    positions[batch_idx],
+                                    32 + ((i - 14) * 32 + lane_idx) // 2,
+                                ]
+                                value = value * cosine + partner * T.if_then_else(
+                                    lane_idx % 2 == 0, sine, -sine
+                                )
+                            amax = T.alloc_var(accum_dtype)
+                            amax = T.abs(value)
+                            for delta in T.unroll(5):
+                                amax = T.max(amax, T.shfl_xor(amax, 1 << delta))
+                            exponent = output_scale_exponent(amax)
+                            inv_scale = T.reinterpret("float32", (254 - exponent) << 23)
+                            head = flat_idx % num_heads
+                            group_heads = num_heads // fused_groups
+                            chunk = i * group_heads + head % group_heads
+                            output[
+                                batch_idx * num_heads * 512
+                                + head // group_heads * group_heads * 512
+                                + chunk * 32
+                                + lane_idx
+                            ] = T.Cast("float8_e4m3", value * inv_scale)
+                            if lane_idx == 0:
+                                byte = (
+                                    (head // group_heads * group_heads * 4 + chunk // 4)
+                                    * (T.ceildiv(batch, 4) * 4)
+                                    + batch_idx
+                                ) * 4 + chunk % 4
+                                output_sf[byte] = T.Cast("uint8", exponent)
+                        else:
+                            output[
+                                batch_idx,
+                                flat_idx // num_heads,
+                                flat_idx % num_heads,
+                                lane_idx + i * 32,
+                            ] = T.Cast(dtype, result[i] * sink_scale)
 
     return dsa_combine
 
@@ -399,7 +452,8 @@ def make_scheduled_decode_indices_loader(*, block_i, store_kv_indices=True):
         seq_len_kv,
         ldg_ty,
         ldg_tx,
-        phase,
+        prev_stage,
+        prev_phase,
         kperm_indices_local,
         kperm_mask_local,
         is_kv_valid,
@@ -425,7 +479,7 @@ def make_scheduled_decode_indices_loader(*, block_i, store_kv_indices=True):
                 seq_len_kv,
             )
 
-        T.barrier_wait(bar_kv_mask_free, (phase & 1) ^ 1)
+        T.barrier_wait(bar_kv_mask_free[prev_stage], prev_phase)
         if ldg_tx == 0:
             for r in T.unroll(4):
                 row = ((r * 16 + ldg_ty) % 8) * score_swizzle + (r * 16 + ldg_ty) // 8
@@ -454,8 +508,9 @@ def make_scheduled_decode_finalize_left(
     guard_invalid_heads=False,
     support_split=True,
     lse_layout="BHN",
+    store_final=None,
 ):
-    """Build the shared left-half split writeback macro."""
+    """Build left-half writeback using sink_local indexed by the CTA-local head."""
 
     assert lse_layout in ("BHN", "BNH")
 
@@ -479,9 +534,13 @@ def make_scheduled_decode_finalize_left(
         glse,
         n_split_idx,
         num_splits,
-        attn_sink,
+        sink_local,
         bar_final,
+        final_stage,
         sm_scale,
+        output_sf=None,
+        positions=None,
+        cos_sin=None,
     ):
         for h_i in T.Parallel(h_per_block):
             if use_strict_valid:
@@ -526,7 +585,7 @@ def make_scheduled_decode_finalize_left(
                                 / (
                                     1
                                     + T.exp2(
-                                        attn_sink[h0 + h_i] * 1.4426950408889634
+                                        sink_local[h_i] * 1.4426950408889634
                                         - sumexp[h_i]
                                     )
                                 ),
@@ -540,7 +599,7 @@ def make_scheduled_decode_finalize_left(
                                 / (
                                     1.0
                                     + T.exp2(
-                                        attn_sink[h0 + h_i] * 1.4426950408889634
+                                        sink_local[h_i] * 1.4426950408889634
                                         - sumexp[h_i]
                                     )
                                 ),
@@ -557,26 +616,37 @@ def make_scheduled_decode_finalize_left(
                             / (
                                 1.0
                                 + T.exp2(
-                                    attn_sink[h0 + h_i] * 1.4426950408889634
-                                    - sumexp[h_i]
+                                    sink_local[h_i] * 1.4426950408889634 - sumexp[h_i]
                                 )
                             ),
                         )
 
         if wait_before_final:
             T.lma_wait()
-        T.barrier_arrive(bar_final)
+        T.barrier_arrive(bar_final[final_stage])
 
         for h_i, d_i in T.Parallel(h_per_block, out_width):
             acc_o_l_0[h_i, d_i] *= sumexp_inv[h_i]
             acc_o_l_1[h_i, d_i] *= sumexp_inv[h_i]
 
+        # Keep LSE stores inside this branch: sinking the final store into
+        # the split path carries its base pointer across the persistent loop.
         if is_unsplit:
             if has_attn_sink:
                 for h_i, d_i in T.Parallel(h_per_block, out_width):
                     acc_o_l_0[h_i, d_i] *= sink_scale_shared[h_i]
                     acc_o_l_1[h_i, d_i] *= sink_scale_shared[h_i]
-            if guard_invalid_heads:
+            if store_final is not None:
+                store_final(
+                    acc_o_l_0, b_i, h0, l0_start, output, output_sf, positions, cos_sin
+                )
+                store_final(
+                    acc_o_l_1, b_i, h0, l1_start, output, output_sf, positions, cos_sin
+                )
+                for h_i in T.Parallel(h_per_block):
+                    if h0 + h_i < num_heads:
+                        lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+            elif guard_invalid_heads:
                 for h_i, d_i in T.Parallel(h_per_block, out_width):
                     if h0 + h_i < num_heads:
                         output[b_i, s_i, h0 + h_i, l0_start + d_i] = T.Cast(
@@ -589,8 +659,10 @@ def make_scheduled_decode_finalize_left(
                     if h0 + h_i < num_heads:
                         if lse_layout == "BNH":
                             lse[b_i, s_i, h0 + h_i] = sumexp[h_i] * 0.6931471805599453
+                            T.sched_boundary()
                         else:
                             lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+                            T.sched_boundary()
             else:
                 T.copy(
                     acc_o_l_0,
@@ -603,8 +675,10 @@ def make_scheduled_decode_finalize_left(
                 for h_i in T.Parallel(h_per_block):
                     if lse_layout == "BNH":
                         lse[b_i, s_i, h0 + h_i] = sumexp[h_i] * 0.6931471805599453
+                        T.sched_boundary()
                     else:
                         lse[b_i, h0 + h_i, s_i] = sumexp[h_i] * 0.6931471805599453
+                        T.sched_boundary()
         else:
             if support_split:
                 if guard_invalid_heads:
@@ -663,6 +737,7 @@ def make_scheduled_decode_finalize_right(
     out_dtype="bfloat16",
     guard_invalid_heads=False,
     support_split=True,
+    store_final=None,
 ):
     """Build the shared right-half split writeback macro."""
 
@@ -682,9 +757,13 @@ def make_scheduled_decode_finalize_right(
         n_split_idx,
         num_splits,
         bar_final,
+        final_stage,
         final_phase,
+        output_sf=None,
+        positions=None,
+        cos_sin=None,
     ):
-        T.barrier_wait(bar_final, final_phase)
+        T.barrier_wait(bar_final[final_stage], final_phase)
         for h_i, d_i in T.Parallel(h_per_block, out_width):
             acc_o_r_0[h_i, d_i] *= sum_exp_inv_shared[h_i]
             acc_o_r_1[h_i, d_i] *= sum_exp_inv_shared[h_i]
@@ -696,7 +775,14 @@ def make_scheduled_decode_finalize_right(
                 for h_i, d_i in T.Parallel(h_per_block, out_width):
                     acc_o_r_0[h_i, d_i] *= sink_scale_shared[h_i]
                     acc_o_r_1[h_i, d_i] *= sink_scale_shared[h_i]
-            if guard_invalid_heads:
+            if store_final is not None:
+                store_final(
+                    acc_o_r_0, b_i, h0, r0_start, output, output_sf, positions, cos_sin
+                )
+                store_final(
+                    acc_o_r_1, b_i, h0, r1_start, output, output_sf, positions, cos_sin
+                )
+            elif guard_invalid_heads:
                 for h_i, d_i in T.Parallel(h_per_block, out_width):
                     if h0 + h_i < num_heads:
                         output[b_i, s_i, h0 + h_i, r0_start + d_i] = T.Cast(

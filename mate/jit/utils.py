@@ -11,10 +11,12 @@ TVM_HEADER = """
 
 """
 
-EXPORT_FUNC = Template("""
+EXPORT_FUNC_SOURCE = """
 \n
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{func_name}}, {{func_name}});
-""")
+"""
+
+EXPORT_FUNC = Template(EXPORT_FUNC_SOURCE)
 
 
 dtype_torch2mutlass_map = {

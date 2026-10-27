@@ -1015,8 +1015,6 @@ class FmhaOperator(Operator):
         if workload.dtype in _FP8_DTYPES and workload.qv is not None:
             if dimensions not in ((64, 256), (64, 512)):
                 return "float8 QV only supports d64x256 and d64x512"
-            if workload.appends_kv or workload.rotary_fraction > 0:
-                return "float8 QV does not support append KV or rotary"
         return None
 
     def _generate_attention(self, workload: FmhaWorkload) -> FmhaInputs:

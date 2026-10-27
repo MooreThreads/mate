@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import dataclasses
 from functools import cache
 import warnings
@@ -24,7 +25,19 @@ _ENV_ENABLE = "MATE_PYTEST_GUARD_ALLOC"
 _ENV_MODE = "MATE_PYTEST_GUARD_MODE"
 _ENV_LOG_ALLOCATIONS = "MATE_PYTEST_GUARD_LOG_ALLOCATIONS"
 _SKIP_REASON = "guard allocator debug mode does not support MUSA graph capture"
-_DRY_RUN_SKIP_REASON = "test is not adapted to MATE dry-run"
+_DRY_RUN_MARKER = "mate_dry_run"
+_DRY_RUN_UNMARKED_REASON = "test is not marked with pytest.mark.mate_dry_run"
+_DRY_RUN_MARKED_PROPERTY = "mate_dry_run_marked_file"
+_DRY_RUN_UNMARKED_PROPERTY = "mate_dry_run_unmarked_file"
+
+
+@dataclasses.dataclass
+class _DryRunCompatibilitySummary:
+    marked_tests: int = 0
+    unmarked_tests_by_file: Counter[str] = dataclasses.field(default_factory=Counter)
+
+
+_DRY_RUN_COMPATIBILITY = _DryRunCompatibilitySummary()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,6 +45,14 @@ class _PytestGuardConfig:
     enabled: bool
     mode: str
     log_allocations: bool
+
+
+@pytest.fixture
+def musa():
+    pytest.importorskip("torch_musa")
+    if not torch.musa.is_available():
+        pytest.skip("MUSA required")
+    return torch.device("musa")
 
 
 @pytest.fixture
@@ -202,6 +223,15 @@ def _is_musa_oom(excinfo) -> bool:
     return False
 
 
+def _item_path(item: pytest.Item, config: pytest.Config) -> str:
+    path = Path(item.path)
+    try:
+        path = path.relative_to(config.rootpath)
+    except ValueError:
+        pass
+    return path.as_posix()
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     dry_run_group = parser.getgroup("mate-dry-run")
     dry_run_group.addoption(
@@ -325,6 +355,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    _DRY_RUN_COMPATIBILITY.marked_tests = 0
+    _DRY_RUN_COMPATIBILITY.unmarked_tests_by_file.clear()
+
     bitwise_checks = config.getoption("bitwise_checks")
     if bitwise_checks is None:
         value = os.environ.get(MATE_BITWISE_CHECKS_ENV)
@@ -349,6 +382,10 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "guard_incompatible: skip this test when pytest guard allocator mode is active",
+    )
+    config.addinivalue_line(
+        "markers",
+        "mate_dry_run: test is safe and required to complete in MATE dry-run mode",
     )
 
     guard_config = _resolve_guard_config(config)
@@ -375,12 +412,22 @@ def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],
 ) -> None:
+    dry_run_enabled = is_dry_run_enabled()
     current_cc, detail = _current_musa_compute_capability()
     guard_config = getattr(config, "_mate_guard_config", None)
     guard_enabled = guard_config is not None and guard_config.enabled
     skip_graph = pytest.mark.skip(reason=_SKIP_REASON)
+    skip_unmarked_dry_run = pytest.mark.skip(reason=_DRY_RUN_UNMARKED_REASON)
 
     for item in items:
+        if dry_run_enabled:
+            path = _item_path(item, config)
+            if item.get_closest_marker(_DRY_RUN_MARKER) is None:
+                item.user_properties.append((_DRY_RUN_UNMARKED_PROPERTY, path))
+                item.add_marker(skip_unmarked_dry_run)
+            else:
+                item.user_properties.append((_DRY_RUN_MARKED_PROPERTY, path))
+
         test_func = getattr(item, "obj", None)
         requirement = getattr(test_func, MUSA_ARCH_REQUIREMENT_ATTR, None)
         if requirement is not None:
@@ -403,6 +450,20 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_graph)
 
 
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if report.when != "setup":
+        return
+
+    properties = dict(report.user_properties)
+    marked_file = properties.get(_DRY_RUN_MARKED_PROPERTY)
+    if marked_file is not None:
+        _DRY_RUN_COMPATIBILITY.marked_tests += 1
+
+    unmarked_file = properties.get(_DRY_RUN_UNMARKED_PROPERTY)
+    if unmarked_file is not None:
+        _DRY_RUN_COMPATIBILITY.unmarked_tests_by_file[unmarked_file] += 1
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     """Keep the complete dry-run lifecycle inside fake tensor mode."""
@@ -418,18 +479,20 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
     """Normalize dry-run and MUSA OOM outcomes for the test call phase."""
     report = yield
 
-    if call.when == "call" and is_dry_run_enabled():
+    if (
+        call.when == "call"
+        and is_dry_run_enabled()
+        and item.get_closest_marker(_DRY_RUN_MARKER) is not None
+    ):
         if _is_dry_run_complete(call.excinfo):
             report.outcome = "passed"
             report.longrepr = None
-        elif report.outcome != "skipped":
-            warnings.warn(
-                f"{item.nodeid}: {_DRY_RUN_SKIP_REASON}",
-                pytest.PytestWarning,
-                stacklevel=1,
+        elif report.outcome == "passed":
+            report.outcome = "failed"
+            report.longrepr = (
+                f"{item.nodeid}: test is marked with pytest.mark.{_DRY_RUN_MARKER} "
+                f"but did not raise {MateDryRunComplete.__name__}"
             )
-            report.outcome = "skipped"
-            report.longrepr = ("", 0, f"Skipped: {_DRY_RUN_SKIP_REASON}")
     elif call.when == "call" and _is_musa_oom(call.excinfo):
         warnings.warn(
             # f"MUSA out of memory; skipping test: {call.excinfo.value}",
@@ -440,6 +503,42 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]):
         report.longrepr = ("", 0, "Skipped: MUSA out of memory")
 
     return report
+
+
+def pytest_terminal_summary(
+    terminalreporter: pytest.TerminalReporter,
+    exitstatus: int,
+    config: pytest.Config,
+) -> None:
+    if not is_dry_run_enabled():
+        return
+
+    terminalreporter.write_sep("=", "MATE dry-run compatibility")
+    unmarked = _DRY_RUN_COMPATIBILITY.unmarked_tests_by_file
+    if unmarked:
+        skipped_tests = sum(unmarked.values())
+        test_label = "test" if skipped_tests == 1 else "tests"
+        file_label = "file" if len(unmarked) == 1 else "files"
+        terminalreporter.write_line(
+            "WARNING: skipped "
+            f"{skipped_tests} unmarked {test_label} "
+            f"from {len(unmarked)} {file_label}:",
+            yellow=True,
+        )
+        for path, count in sorted(unmarked.items()):
+            item_label = "test" if count == 1 else "tests"
+            terminalreporter.write_line(f"  {path}: {count} {item_label}", yellow=True)
+        terminalreporter.write_line(
+            f"Add pytestmark = pytest.mark.{_DRY_RUN_MARKER} only after a test "
+            f"file supports MATE dry-run.",
+            yellow=True,
+        )
+    else:
+        terminalreporter.write_line("No unmarked tests were skipped.")
+
+    marked = _DRY_RUN_COMPATIBILITY.marked_tests
+    marked_label = "test" if marked == 1 else "tests"
+    terminalreporter.write_line(f"Marked for MATE dry-run: {marked} {marked_label}")
 
 
 def _get_shard_config():

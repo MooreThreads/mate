@@ -127,25 +127,28 @@ def _ssu_case(
     state = torch.randn(
         SSU_SLOTS, SSU_HEADS, SSU_DIM, SSU_DSTATE, dtype=torch.float32, device=device
     ).to(torch.float16)
-    x = torch.randn(SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.float32, device=device).to(
-        torch.bfloat16
+    x = torch.randn(
+        SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.float32, device=device
+    ).to(torch.bfloat16)
+    dt = (
+        torch.rand(SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.float32, device=device)
+        * 0.1
     )
-    dt = torch.rand(SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.float32, device=device) * 0.1
     A = -torch.rand(SSU_HEADS, dtype=torch.float32, device=device)
-    B = torch.randn(SSU_BATCH, SSU_GROUPS, SSU_DSTATE, dtype=torch.float32, device=device).to(
-        torch.bfloat16
-    )
-    C = torch.randn(SSU_BATCH, SSU_GROUPS, SSU_DSTATE, dtype=torch.float32, device=device).to(
-        torch.bfloat16
-    )
+    B = torch.randn(
+        SSU_BATCH, SSU_GROUPS, SSU_DSTATE, dtype=torch.float32, device=device
+    ).to(torch.bfloat16)
+    C = torch.randn(
+        SSU_BATCH, SSU_GROUPS, SSU_DSTATE, dtype=torch.float32, device=device
+    ).to(torch.bfloat16)
     D = torch.rand(SSU_HEADS, dtype=torch.float32, device=device) if with_D else None
     dt_bias = (
         torch.rand(SSU_HEADS, dtype=torch.float32, device=device) if with_bias else None
     )
     z = (
-        torch.randn(SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.float32, device=device).to(
-            torch.bfloat16
-        )
+        torch.randn(
+            SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.float32, device=device
+        ).to(torch.bfloat16)
         if with_z
         else None
     )
@@ -220,7 +223,9 @@ def _ssu_run_reference(case):
 @pytest.mark.parametrize("softplus", [True, False])
 @torch.inference_mode
 def test_one_token_matches_reference(with_D, with_z, with_bias, softplus):
-    case = _ssu_case(with_D=with_D, with_z=with_z, with_bias=with_bias, softplus=softplus)
+    case = _ssu_case(
+        with_D=with_D, with_z=with_z, with_bias=with_bias, softplus=softplus
+    )
     expected_state = case["state"].clone()
     expected = _ssu_run_reference({**case, "state": expected_state})
     actual_state = case["state"].clone()
@@ -285,7 +290,9 @@ def test_prewarm_then_run_uses_the_compiled_kernel():
 @torch.inference_mode
 def test_out_buffer_is_written_in_place():
     case = _ssu_case()
-    out = torch.empty(SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.bfloat16, device=_ssu_device())
+    out = torch.empty(
+        SSU_BATCH, SSU_HEADS, SSU_DIM, dtype=torch.bfloat16, device=_ssu_device()
+    )
     returned = _ssu_run_kernel(case, out=out)
     assert returned is out
     assert torch.isfinite(out).all()
@@ -297,7 +304,10 @@ def test_out_buffer_is_written_in_place():
     "overrides, message",
     [
         ({"rand_seed": torch.zeros(1, dtype=torch.int32)}, "stochastic rounding"),
-        ({"state_scale": torch.ones(SSU_SLOTS, dtype=torch.float32)}, "quantized state"),
+        (
+            {"state_scale": torch.ones(SSU_SLOTS, dtype=torch.float32)},
+            "quantized state",
+        ),
         ({"cache_steps": 4}, "intermediate"),
         # A packed call is no longer refused: one sequence of two tokens, which the
         # packed kernel handles (the numeric check lives in the packed MTP
@@ -305,7 +315,11 @@ def test_out_buffer_is_written_in_place():
         # The metadata tensors live on the device like every other input; a CPU
         # `cu_seqlens` in an otherwise device-side case fails for the wrong reason.
         (
-            {"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32, device=_ssu_device())},
+            {
+                "cu_seqlens": torch.tensor(
+                    [0, 2], dtype=torch.int32, device=_ssu_device()
+                )
+            },
             None,
         ),
         # vLLM's SSU dispatch forwards the slot-table width as `cache_steps` whenever
@@ -1047,7 +1061,9 @@ def _mtp_run_triton(case: dict[str, object]):
     return out, state
 
 
-def _mtp_assert_parity(actual: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float):
+def _mtp_assert_parity(
+    actual: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float
+):
     """Fail with the size of the disagreement, not just its existence."""
     delta = (actual.to(torch.float32) - expected.to(torch.float32)).abs()
     limit = atol + rtol * expected.to(torch.float32).abs()
@@ -1097,7 +1113,9 @@ MTP_TRITON_SHAPES = [
 
 
 @supported_musa_compute_capability([31])
-@pytest.mark.skipif(MTP_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable")
+@pytest.mark.skipif(
+    MTP_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable"
+)
 @torch.inference_mode
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("steps, accepted", MTP_TRITON_SHAPES)
@@ -1109,7 +1127,9 @@ def test_packed_call_agrees_with_triton(batch, steps, accepted):
 
 
 @supported_musa_compute_capability([31])
-@pytest.mark.skipif(MTP_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable")
+@pytest.mark.skipif(
+    MTP_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable"
+)
 @torch.inference_mode
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("steps, accepted", [(1, 1), (2, 2), (4, 4), (7, 3), (7, 7)])
@@ -1119,7 +1139,9 @@ def test_distinct_slot_tables_agree_with_triton(batch, steps, accepted):
 
 
 @supported_musa_compute_capability([31])
-@pytest.mark.skipif(MTP_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable")
+@pytest.mark.skipif(
+    MTP_TRITON_SSU is None, reason="vLLM-MUSA's Triton SSU is unavailable"
+)
 @torch.inference_mode
 def test_variable_length_call_agrees_with_triton():
     """Rows of different lengths: what the serving path builds from cu_seqlens."""
@@ -1142,7 +1164,14 @@ def test_variable_length_call_agrees_with_triton():
 # and importing no TileLang kernel module, is what lets them run anywhere.
 # ---------------------------------------------------------------------------
 
-MTP_ORACLE_HEADS, MTP_ORACLE_DIM, MTP_ORACLE_DSTATE, MTP_ORACLE_GROUPS, MTP_ORACLE_SLOTS, MTP_ORACLE_PAD = 4, 3, 8, 2, 8, -1
+(
+    MTP_ORACLE_HEADS,
+    MTP_ORACLE_DIM,
+    MTP_ORACLE_DSTATE,
+    MTP_ORACLE_GROUPS,
+    MTP_ORACLE_SLOTS,
+    MTP_ORACLE_PAD,
+) = 4, 3, 8, 2, 8, -1
 # An fp32 state pool keeps the token-by-token chain exact: the recurrence carries the
 # state in registers between tokens, so rounding the pool between steps would differ
 # by rounding only (covered by the last test in this module).
@@ -1153,17 +1182,27 @@ MTP_ORACLE_IO_DTYPE = torch.bfloat16
 def _mtp_oracle_inputs(rows: int, device: str = "cpu") -> dict[str, torch.Tensor]:
     generator = torch.Generator(device="cpu").manual_seed(0)
     return {
-        "x": torch.randn(rows, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, generator=generator).to(MTP_ORACLE_IO_DTYPE).to(device),
-        "dt": (torch.rand(rows, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, generator=generator) * 0.3 + 0.01).to(
-            device
-        ),
-        "B": torch.randn(rows, MTP_ORACLE_GROUPS, MTP_ORACLE_DSTATE, generator=generator)
+        "x": torch.randn(rows, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, generator=generator)
         .to(MTP_ORACLE_IO_DTYPE)
         .to(device),
-        "C": torch.randn(rows, MTP_ORACLE_GROUPS, MTP_ORACLE_DSTATE, generator=generator)
+        "dt": (
+            torch.rand(rows, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, generator=generator)
+            * 0.3
+            + 0.01
+        ).to(device),
+        "B": torch.randn(
+            rows, MTP_ORACLE_GROUPS, MTP_ORACLE_DSTATE, generator=generator
+        )
         .to(MTP_ORACLE_IO_DTYPE)
         .to(device),
-        "z": torch.randn(rows, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, generator=generator).to(MTP_ORACLE_IO_DTYPE).to(device),
+        "C": torch.randn(
+            rows, MTP_ORACLE_GROUPS, MTP_ORACLE_DSTATE, generator=generator
+        )
+        .to(MTP_ORACLE_IO_DTYPE)
+        .to(device),
+        "z": torch.randn(rows, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, generator=generator)
+        .to(MTP_ORACLE_IO_DTYPE)
+        .to(device),
         "A": (-torch.rand(MTP_ORACLE_HEADS, generator=generator) - 0.1).to(device),
         "D": torch.randn(MTP_ORACLE_HEADS, generator=generator).to(device),
         "bias": (torch.randn(MTP_ORACLE_HEADS, generator=generator) * 0.1).to(device),
@@ -1172,7 +1211,16 @@ def _mtp_oracle_inputs(rows: int, device: str = "cpu") -> dict[str, torch.Tensor
 
 def _mtp_oracle_pool(dtype: torch.dtype = MTP_ORACLE_POOL_DTYPE) -> torch.Tensor:
     generator = torch.Generator().manual_seed(1)
-    return (torch.randn(MTP_ORACLE_SLOTS, MTP_ORACLE_HEADS, MTP_ORACLE_DIM, MTP_ORACLE_DSTATE, generator=generator) * 0.5).to(dtype)
+    return (
+        torch.randn(
+            MTP_ORACLE_SLOTS,
+            MTP_ORACLE_HEADS,
+            MTP_ORACLE_DIM,
+            MTP_ORACLE_DSTATE,
+            generator=generator,
+        )
+        * 0.5
+    ).to(dtype)
 
 
 def _mtp_oracle_one_token(
@@ -1217,7 +1265,9 @@ def _mtp_oracle_sequential(
     state = pool.clone()
     for chain in chains:
         for row, src, dst in chain:
-            y, state = _mtp_oracle_one_token(state, inp, row, src, dst, softplus, disable)
+            y, state = _mtp_oracle_one_token(
+                state, inp, row, src, dst, softplus, disable
+            )
             outputs[row] = y
     return outputs, state
 
@@ -1258,7 +1308,9 @@ def _mtp_oracle_multi(
 
 def test_single_step_matches_one_token_oracle() -> None:
     inp, pool = _mtp_oracle_inputs(3), _mtp_oracle_pool()
-    y, state = _mtp_oracle_multi(pool, inp, [1, 1, 1], [0, 1, 2], torch.tensor([1, 3, 5]), None)
+    y, state = _mtp_oracle_multi(
+        pool, inp, [1, 1, 1], [0, 1, 2], torch.tensor([1, 3, 5]), None
+    )
     expected_y, expected_state = _mtp_oracle_sequential(
         pool, inp, [[(0, 1, None)], [(1, 3, None)], [(2, 5, None)]]
     )
@@ -1270,7 +1322,9 @@ def test_single_step_matches_one_token_oracle() -> None:
 def test_mtp_plain_writes_the_read_slot_once() -> None:
     inp, pool = _mtp_oracle_inputs(2), _mtp_oracle_pool()
     y, state = _mtp_oracle_multi(pool, inp, [2], [0], torch.tensor([2]), None)
-    expected_y, expected_state = _mtp_oracle_sequential(pool, inp, [[(0, 2, None), (1, 2, None)]])
+    expected_y, expected_state = _mtp_oracle_sequential(
+        pool, inp, [[(0, 2, None), (1, 2, None)]]
+    )
     assert torch.equal(y[0], expected_y[0])
     assert torch.equal(y[1], expected_y[1])
     assert torch.equal(state, expected_state)
@@ -1300,7 +1354,9 @@ def test_speculative_decoding_chains_the_destination_slots() -> None:
         torch.tensor([[4, 5]]),
         accepted=torch.tensor([1]),
     )
-    expected_y, expected_state = _mtp_oracle_sequential(pool, inp, [[(0, 1, 4), (1, 4, 5)]])
+    expected_y, expected_state = _mtp_oracle_sequential(
+        pool, inp, [[(0, 1, 4), (1, 4, 5)]]
+    )
     assert torch.equal(y[0], expected_y[0])
     assert torch.equal(y[1], expected_y[1])
     assert torch.equal(state, expected_state)
@@ -1334,7 +1390,9 @@ def test_flat_slot_tables_are_addressed_by_position() -> None:
     # unsqueezing to [rows, 1], so both strides are 1 and sequence 0's position t is
     # entry t -- which is why the accepted position is also the entry read.
     slots = torch.tensor([2, 5, 6])
-    y, state = _mtp_oracle_multi(pool, inp, [3], [0], slots, None, accepted=torch.tensor([1]))
+    y, state = _mtp_oracle_multi(
+        pool, inp, [3], [0], slots, None, accepted=torch.tensor([1])
+    )
     expected_y, expected_state = _mtp_oracle_sequential(
         pool, inp, [[(0, 2, 2), (1, 2, 5), (2, 5, 6)]]
     )
@@ -1385,7 +1443,12 @@ def test_pad_slots_disable_state_update_and_empty_sequences() -> None:
     zero_pool = pool.clone()
     zero_pool[0] = 0.0
     y_pad, state_pad = _mtp_oracle_multi(
-        pool, inp, [2], [0], torch.tensor([MTP_ORACLE_PAD]), torch.tensor([MTP_ORACLE_PAD])
+        pool,
+        inp,
+        [2],
+        [0],
+        torch.tensor([MTP_ORACLE_PAD]),
+        torch.tensor([MTP_ORACLE_PAD]),
     )
     expected_y, _ = _mtp_oracle_sequential(zero_pool, inp, [[(0, 0, 0), (1, 0, 0)]])
     assert torch.equal(state_pad, pool)
@@ -1400,7 +1463,9 @@ def test_pad_slots_disable_state_update_and_empty_sequences() -> None:
         pool, inp, [[(0, 1, 1), (1, 1, 1)]], disable=True
     )
     assert torch.equal(state_disabled, expected_disabled)
-    _, state_empty = _mtp_oracle_multi(pool, inp, [0], [0], torch.tensor([1]), torch.tensor([1]))
+    _, state_empty = _mtp_oracle_multi(
+        pool, inp, [0], [0], torch.tensor([1]), torch.tensor([1])
+    )
     assert torch.equal(state_empty, pool)
 
 
@@ -1423,7 +1488,9 @@ def test_rounding_state_pool_differs_by_rounding_only() -> None:
     inp = _mtp_oracle_inputs(2)
     pool = _mtp_oracle_pool(torch.float16)
     y, state = _mtp_oracle_multi(pool, inp, [2], [0], torch.tensor([2]), None)
-    expected_y, expected_state = _mtp_oracle_sequential(pool, inp, [[(0, 2, None), (1, 2, None)]])
+    expected_y, expected_state = _mtp_oracle_sequential(
+        pool, inp, [[(0, 2, None), (1, 2, None)]]
+    )
     scale = float(expected_state[2].abs().max())
     assert torch.allclose(
         state[2].to(torch.float32),
@@ -1542,9 +1609,7 @@ def test_dt_softplus_disabled_adds_bias_then_clamps():
     softplus is on, which is the model's configuration)."""
     dt, A, bias, cu, chunk = _ssd_inputs([0, 8])
     _, dt_out = ssd_chunk_cumsum_reference(dt, A, bias, cu, chunk, False)
-    assert torch.allclose(
-        dt_out[:, 0, 0], (dt[0] + bias).clamp(min=0.0), atol=1e-6
-    )
+    assert torch.allclose(dt_out[:, 0, 0], (dt[0] + bias).clamp(min=0.0), atol=1e-6)
     # With an open limit the bias is the only change.
     _, unbounded = ssd_chunk_cumsum_reference(
         dt, A, bias, cu, chunk, False, dt_limit=(-float("inf"), float("inf"))
@@ -1559,7 +1624,9 @@ def test_dt_limit_clamps_before_the_scan():
     )
     assert float(dt_out.min()) >= 0.5 - 1e-6
     assert float(dt_out.max()) <= 1.5 + 1e-6
-    dA, _ = ssd_chunk_cumsum_reference(dt, A, bias, cu, chunk, True, dt_limit=(0.5, 1.5))
+    dA, _ = ssd_chunk_cumsum_reference(
+        dt, A, bias, cu, chunk, True, dt_limit=(0.5, 1.5)
+    )
     expected = torch.cumsum(dt_out[:, 0, :8] * A.view(-1, 1), dim=1)
     assert torch.allclose(dA[:, 0, :8], expected, atol=1e-6)
 
@@ -1567,9 +1634,7 @@ def test_dt_limit_clamps_before_the_scan():
 def test_missing_dt_bias_is_allowed():
     dt, A, _, cu, chunk = _ssd_inputs([0, 8])
     dA, dt_out = ssd_chunk_cumsum_reference(dt, A, None, cu, chunk, True)
-    assert torch.allclose(
-        dt_out[:, 0, 0], torch.log1p(torch.exp(dt[0])), atol=1e-5
-    )
+    assert torch.allclose(dt_out[:, 0, 0], torch.log1p(torch.exp(dt[0])), atol=1e-5)
     assert torch.allclose(dA[:, 0, 0], dt_out[:, 0, 0] * A, atol=1e-6)
 
 
@@ -2221,7 +2286,9 @@ SCAN_CHUNK = 8
 SCAN_HEAD_RATIO = SCAN_HEADS // SCAN_GROUPS
 
 
-def _naive_scan(x, C, B, dt_out, dA_cumsum, states, initial_states, seq_idx, offsets, out):
+def _naive_scan(
+    x, C, B, dt_out, dA_cumsum, states, initial_states, seq_idx, offsets, out
+):
     """The spec's formula as a plain per-token, per-j triple loop."""
     tokens, heads, dim = x.shape
     _, nchunks, block = dA_cumsum.shape
@@ -2273,7 +2340,9 @@ def _naive_scan(x, C, B, dt_out, dA_cumsum, states, initial_states, seq_idx, off
                         )
                         cb = cb * float(dt[head, chunk, j])
                         cb = float(
-                            torch.tensor(cb, dtype=torch.float32).to(x.dtype).to(torch.float32)
+                            torch.tensor(cb, dtype=torch.float32)
+                            .to(x.dtype)
+                            .to(torch.float32)
                         )
                         acc += cb * float(x32[start + j, head, d])
                     out[start + t, head, d] = acc
@@ -2283,17 +2352,23 @@ def _naive_scan(x, C, B, dt_out, dA_cumsum, states, initial_states, seq_idx, off
 def _scan_case(offsets, seed=0, heads=SCAN_HEADS, chunk=SCAN_CHUNK, with_initial=True):
     generator = torch.Generator().manual_seed(seed)
     total = offsets[-1]
-    x = torch.randn(total, heads, SCAN_DIM, generator=generator, dtype=torch.float32).to(
+    x = torch.randn(
+        total, heads, SCAN_DIM, generator=generator, dtype=torch.float32
+    ).to(torch.bfloat16)
+    C = torch.randn(total, SCAN_GROUPS, SCAN_DSTATE, generator=generator).to(
         torch.bfloat16
     )
-    C = torch.randn(total, SCAN_GROUPS, SCAN_DSTATE, generator=generator).to(torch.bfloat16)
-    B = torch.randn(total, SCAN_GROUPS, SCAN_DSTATE, generator=generator).to(torch.bfloat16)
+    B = torch.randn(total, SCAN_GROUPS, SCAN_DSTATE, generator=generator).to(
+        torch.bfloat16
+    )
     nchunks = len(offsets) - 1
     dt_out = torch.zeros(heads, nchunks, chunk)
     dA_cumsum = torch.zeros(heads, nchunks, chunk)
     for c in range(nchunks):
         length = offsets[c + 1] - offsets[c]
-        dt_out[:, c, :length] = torch.rand(heads, length, generator=generator) * 0.5 + 0.1
+        dt_out[:, c, :length] = (
+            torch.rand(heads, length, generator=generator) * 0.5 + 0.1
+        )
         dA_cumsum[:, c, :length] = torch.cumsum(
             -torch.rand(heads, length, generator=generator), dim=1
         )
@@ -2319,7 +2394,16 @@ def test_reference_matches_the_naive_per_token_formula():
         x, C, B, dt_out, dA_cumsum, states, initial, seq_idx, cu, SCAN_CHUNK
     )
     slow = _naive_scan(
-        x, C, B, dt_out, dA_cumsum, states, initial, seq_idx, offsets, torch.zeros_like(x)
+        x,
+        C,
+        B,
+        dt_out,
+        dA_cumsum,
+        states,
+        initial,
+        seq_idx,
+        offsets,
+        torch.zeros_like(x),
     )
     assert torch.allclose(fast.float(), slow.float(), rtol=1e-4, atol=1e-4)
 
@@ -2426,8 +2510,10 @@ def test_epilogue_applies_d_before_the_z_gate():
     # Reconstruct: skip, then SiLU gate, both in fp32.
     z32 = z.to(torch.float32)
     expected = (
-        trace.float() + x.float() * D_param.view(1, SCAN_HEADS, SCAN_DIM)
-    ) * z32 * torch.sigmoid(z32)
+        (trace.float() + x.float() * D_param.view(1, SCAN_HEADS, SCAN_DIM))
+        * z32
+        * torch.sigmoid(z32)
+    )
     assert torch.allclose(both.float(), expected, rtol=1e-5, atol=1e-5)
     # And the order matters: applying the gate first would not match.
     wrong_order = trace.float() * z32 * torch.sigmoid(z32) + x.float() * D_param.view(
@@ -2503,9 +2589,18 @@ def combined_reference_stage_table(round_operands=True):
     ``round_operands=False`` drops the pre-dot rounding to the activation dtype,
     turning the chain into a pure fp32 transcription of the same arithmetic.
     """
+
     def cumsum(
-        dt, A, dt_bias, cu_chunk_seqlens, chunk_size, *, dt_softplus, dt_limit,
-        dA_cumsum, dt_out,
+        dt,
+        A,
+        dt_bias,
+        cu_chunk_seqlens,
+        chunk_size,
+        *,
+        dt_softplus,
+        dt_limit,
+        dA_cumsum,
+        dt_out,
     ):
         dA, processed = ssd_chunk_cumsum_reference(
             dt, A, dt_bias, cu_chunk_seqlens, chunk_size, dt_softplus, dt_limit
@@ -2527,7 +2622,9 @@ def combined_reference_stage_table(round_operands=True):
         nchunks, heads, dim, dstate = states.shape
         block = dA_cumsum.shape[2]
         for chunk in range(nchunks):
-            opens_sequence = chunk == 0 or int(seq_idx[chunk]) != int(seq_idx[chunk - 1])
+            opens_sequence = chunk == 0 or int(seq_idx[chunk]) != int(
+                seq_idx[chunk - 1]
+            )
             if opens_sequence:
                 if initial_states is None:
                     running = torch.zeros(
@@ -2538,9 +2635,8 @@ def combined_reference_stage_table(round_operands=True):
             # decay the entering state across the chunk, then add the chunk's
             # own contribution; rounded at every boundary, as the fast path does
             decay = torch.exp(dA_cumsum[:, chunk, block - 1]).to(torch.float32)
-            running = (
-                decay.unsqueeze(1).unsqueeze(2) * running
-                + states[chunk].to(torch.float32)
+            running = decay.unsqueeze(1).unsqueeze(2) * running + states[chunk].to(
+                torch.float32
             )
             states[chunk].copy_(running.to(state_dtype))
         return states
@@ -2558,8 +2654,19 @@ def combined_reference_stage_table(round_operands=True):
         return cb
 
     def chunk_scan(
-        x, C, CB, dt_out, dA_cumsum, states, initial_states, seq_idx,
-        cu_chunk_seqlens, out, *, D_param, z,
+        x,
+        C,
+        CB,
+        dt_out,
+        dA_cumsum,
+        states,
+        initial_states,
+        seq_idx,
+        cu_chunk_seqlens,
+        out,
+        *,
+        D_param,
+        z,
     ):
         return ssd_chunk_scan_reference(
             x,
@@ -2608,12 +2715,29 @@ def combined_reference_stages(monkeypatch):
 def _combined_tensors(case, device="cpu", seed=0):
     generator = torch.Generator().manual_seed(seed)
     tokens = case["cu_chunk_seqlens"][-1]
-    heads, dim, groups, dstate = case["heads"], case["dim"], case["groups"], case["dstate"]
-    x = torch.randn(tokens, heads, dim, generator=generator).to(torch.bfloat16).to(device)
+    heads, dim, groups, dstate = (
+        case["heads"],
+        case["dim"],
+        case["groups"],
+        case["dstate"],
+    )
+    x = (
+        torch.randn(tokens, heads, dim, generator=generator)
+        .to(torch.bfloat16)
+        .to(device)
+    )
     dt = torch.randn(tokens, heads, generator=generator).abs().to(device) + 0.1
     A = (-torch.rand(heads, generator=generator) - 0.5).to(device)
-    B = torch.randn(tokens, groups, dstate, generator=generator).to(torch.bfloat16).to(device)
-    C = torch.randn(tokens, groups, dstate, generator=generator).to(torch.bfloat16).to(device)
+    B = (
+        torch.randn(tokens, groups, dstate, generator=generator)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+    C = (
+        torch.randn(tokens, groups, dstate, generator=generator)
+        .to(torch.bfloat16)
+        .to(device)
+    )
     return x, dt, A, B, C
 
 
@@ -2645,7 +2769,9 @@ COMBINED_FULL_CHUNKS = {
 }
 
 
-def _combined_run(case, combined_oracle, *, with_D=True, with_z=True, with_initial=False, extra=None):
+def _combined_run(
+    case, combined_oracle, *, with_D=True, with_z=True, with_initial=False, extra=None
+):
     from mate.mamba import ssd_combined_fwd_varlen
 
     device = "cpu"
@@ -2653,14 +2779,18 @@ def _combined_run(case, combined_oracle, *, with_D=True, with_z=True, with_initi
     meta = {
         "cu_seqlens": torch.tensor(case["cu_seqlens"], dtype=torch.int32),
         "cu_chunk_seqlens": torch.tensor(case["cu_chunk_seqlens"], dtype=torch.int32),
-        "last_chunk_indices": torch.tensor(case["last_chunk_indices"], dtype=torch.int32),
+        "last_chunk_indices": torch.tensor(
+            case["last_chunk_indices"], dtype=torch.int32
+        ),
         "seq_idx": torch.tensor(case["seq_idx"], dtype=torch.int32),
     }
     generator = torch.Generator().manual_seed(11)
     batch = len(case["cu_seqlens"]) - 1
     kwargs = dict(
         chunk_size=case["chunk_size"],
-        D=torch.randn(case["heads"], case["dim"], generator=generator) if with_D else None,
+        D=torch.randn(case["heads"], case["dim"], generator=generator)
+        if with_D
+        else None,
         z=torch.randn_like(x).to(torch.bfloat16) if with_z else None,
         dt_bias=torch.randn(case["heads"], generator=generator) * 0.1,
         dt_softplus=True,
@@ -2682,7 +2812,15 @@ def _combined_run(case, combined_oracle, *, with_D=True, with_z=True, with_initi
         x, dt, A, B, C, out=mine_out, return_intermediate_states=True, **meta, **kwargs
     )
     expected_states = combined_oracle(
-        x, dt, A, B, C, out=expected_out, return_intermediate_states=True, **meta, **kwargs
+        x,
+        dt,
+        A,
+        B,
+        C,
+        out=expected_out,
+        return_intermediate_states=True,
+        **meta,
+        **kwargs,
     )
     return mine_out, mine_states, expected_out, expected_states
 
@@ -2702,7 +2840,7 @@ def combined_assert_states_close(mine, expected, nchunks, case):
     magnitude above this bound.
     """
     scale = float(expected.float().abs().max())
-    bound = ATOL + RTOL * scale + nchunks * 2 ** -9 * scale
+    bound = ATOL + RTOL * scale + nchunks * 2**-9 * scale
     worst = float((mine.float() - expected.float()).abs().max())
     assert worst <= bound, (
         f"{case}: worst state difference {worst:.4f} exceeds {bound:.4f} "
@@ -2743,9 +2881,13 @@ def combined_assert_out_close(mine, expected):
     ids=["partial-first-chunk", "full-chunks"],
 )
 def test_out_and_states_match_the_independent_oracle(case, combined_oracle):
-    mine_out, mine_states, expected_out, expected_states = _combined_run(case, combined_oracle)
+    mine_out, mine_states, expected_out, expected_states = _combined_run(
+        case, combined_oracle
+    )
     combined_assert_out_close(mine_out, expected_out)
-    combined_assert_states_close(mine_states, expected_states, len(case["seq_idx"]), case["cu_chunk_seqlens"])
+    combined_assert_states_close(
+        mine_states, expected_states, len(case["seq_idx"]), case["cu_chunk_seqlens"]
+    )
 
 
 def _combined_states_fp32(case, combined_oracle, round_operands):
@@ -2756,7 +2898,9 @@ def _combined_states_fp32(case, combined_oracle, round_operands):
     meta = {
         "cu_seqlens": torch.tensor(case["cu_seqlens"], dtype=torch.int32),
         "cu_chunk_seqlens": torch.tensor(case["cu_chunk_seqlens"], dtype=torch.int32),
-        "last_chunk_indices": torch.tensor(case["last_chunk_indices"], dtype=torch.int32),
+        "last_chunk_indices": torch.tensor(
+            case["last_chunk_indices"], dtype=torch.int32
+        ),
         "seq_idx": torch.tensor(case["seq_idx"], dtype=torch.int32),
     }
     kwargs = dict(
@@ -2777,7 +2921,9 @@ def _combined_states_fp32(case, combined_oracle, round_operands):
     finally:
         mamba._stage = saved
         mamba.reset_ssd_workspaces()
-    expected = combined_oracle(x, dt, A, B, C, out=torch.zeros_like(x), **meta, **kwargs)
+    expected = combined_oracle(
+        x, dt, A, B, C, out=torch.zeros_like(x), **meta, **kwargs
+    )
     return mine, expected
 
 
@@ -2787,7 +2933,9 @@ def test_fp32_chain_is_equivalent_to_the_oracle(combined_oracle):
     transcription of the same arithmetic, and it then reproduces the oracle to
     fp32 summation order. This is what makes the shipped path's residual
     difference attributable to the rounding convention rather than to a defect."""
-    mine, expected = _combined_states_fp32(COMBINED_TINY, combined_oracle, round_operands=False)
+    mine, expected = _combined_states_fp32(
+        COMBINED_TINY, combined_oracle, round_operands=False
+    )
     assert mine.dtype == torch.float32
     scale = max(1.0, float(expected.abs().max()))
     worst = float((mine - expected).abs().max())
@@ -2810,10 +2958,12 @@ def test_the_pre_dot_rounding_costs_about_one_bf16_ulp(combined_oracle):
     ulp and nothing more. A structural error in this stage measured 3.8 (44%),
     forty times this bound, so the bound still fails loudly on real defects.
     """
-    mine, expected = _combined_states_fp32(COMBINED_TINY, combined_oracle, round_operands=True)
+    mine, expected = _combined_states_fp32(
+        COMBINED_TINY, combined_oracle, round_operands=True
+    )
     scale = float(expected.abs().max())
     worst = float((mine - expected).abs().max())
-    assert 0 < worst <= 2 ** -8 * scale, (
+    assert 0 < worst <= 2**-8 * scale, (
         f"shipped states differ from the oracle by {worst:.4e} "
         f"({worst / scale:.4%} of scale {scale:.2f}); expected a difference "
         f"bounded by the bf16 operand rounding"
@@ -2826,7 +2976,9 @@ def test_partial_chunks_do_not_leave_garbage_in_the_state_buffer(combined_oracle
     contribute, so the state must match the oracle rather than explode."""
     _, mine_states, _, expected_states = _combined_run(COMBINED_TINY, combined_oracle)
     assert torch.isfinite(mine_states.float()).all()
-    combined_assert_states_close(mine_states, expected_states, len(COMBINED_TINY["seq_idx"]), COMBINED_TINY)
+    combined_assert_states_close(
+        mine_states, expected_states, len(COMBINED_TINY["seq_idx"]), COMBINED_TINY
+    )
 
 
 @pytest.mark.usefixtures("combined_reference_stages")
@@ -2838,17 +2990,40 @@ def test_final_states_are_selected_by_last_chunk_indices(combined_oracle):
     meta = {
         "cu_seqlens": torch.tensor(case["cu_seqlens"], dtype=torch.int32),
         "cu_chunk_seqlens": torch.tensor(case["cu_chunk_seqlens"], dtype=torch.int32),
-        "last_chunk_indices": torch.tensor(case["last_chunk_indices"], dtype=torch.int32),
+        "last_chunk_indices": torch.tensor(
+            case["last_chunk_indices"], dtype=torch.int32
+        ),
         "seq_idx": torch.tensor(case["seq_idx"], dtype=torch.int32),
     }
     full = ssd_combined_fwd_varlen(
-        x, dt, A, B, C, chunk_size=case["chunk_size"], return_intermediate_states=True, **meta
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=case["chunk_size"],
+        return_intermediate_states=True,
+        **meta,
     )
     final = ssd_combined_fwd_varlen(
-        x, dt, A, B, C, chunk_size=case["chunk_size"], return_intermediate_states=False, **meta
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=case["chunk_size"],
+        return_intermediate_states=False,
+        **meta,
     )
     expected = combined_oracle(
-        x, dt, A, B, C, chunk_size=case["chunk_size"], return_intermediate_states=False, **meta
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size=case["chunk_size"],
+        return_intermediate_states=False,
+        **meta,
     )
     assert final.shape == (2, case["heads"], case["dim"], case["dstate"])
     assert final.dtype == torch.bfloat16  # C.dtype when state_dtype is unset
@@ -2867,7 +3042,9 @@ def test_state_dtype_overrides_the_default_and_is_honoured(combined_oracle):
     meta = {
         "cu_seqlens": torch.tensor(case["cu_seqlens"], dtype=torch.int32),
         "cu_chunk_seqlens": torch.tensor(case["cu_chunk_seqlens"], dtype=torch.int32),
-        "last_chunk_indices": torch.tensor(case["last_chunk_indices"], dtype=torch.int32),
+        "last_chunk_indices": torch.tensor(
+            case["last_chunk_indices"], dtype=torch.int32
+        ),
         "seq_idx": torch.tensor(case["seq_idx"], dtype=torch.int32),
     }
     states = ssd_combined_fwd_varlen(
@@ -2893,7 +3070,9 @@ def test_checkpoint_arguments_raise_instead_of_being_ignored(combined_oracle):
     meta = {
         "cu_seqlens": torch.tensor(case["cu_seqlens"], dtype=torch.int32),
         "cu_chunk_seqlens": torch.tensor(case["cu_chunk_seqlens"], dtype=torch.int32),
-        "last_chunk_indices": torch.tensor(case["last_chunk_indices"], dtype=torch.int32),
+        "last_chunk_indices": torch.tensor(
+            case["last_chunk_indices"], dtype=torch.int32
+        ),
         "seq_idx": torch.tensor(case["seq_idx"], dtype=torch.int32),
     }
     with pytest.raises(NotImplementedError, match="checkpoint_"):
@@ -2969,7 +3148,9 @@ def test_ssd_bmm_kernel_reads_strided_inputs():
     device = torch.device("musa")
     torch.manual_seed(0)
 
-    cu_chunk_seqlens = torch.tensor([0, chunk, tokens], dtype=torch.int32, device=device)
+    cu_chunk_seqlens = torch.tensor(
+        [0, chunk, tokens], dtype=torch.int32, device=device
+    )
     wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
     cmat = wide[:, :, :dstate]
     bmat = wide.flip(-1)[:, :, dstate:]
@@ -2989,7 +3170,9 @@ def test_ssd_bmm_kernel_reads_strided_inputs():
     # A token stride that is not a multiple of the 8 bf16 elements (16 bytes) the
     # operand loads vectorize is the other half of the declaration: the kernel's
     # ``T.assume`` would be false, so the view has to be refused rather than read.
-    narrow = torch.randn(tokens, groups, dstate + 4, dtype=torch.bfloat16, device=device)
+    narrow = torch.randn(
+        tokens, groups, dstate + 4, dtype=torch.bfloat16, device=device
+    )
     with pytest.raises(RuntimeError, match="multiple of 8"):
         launcher(narrow[:, :, :dstate], bmat, cu_chunk_seqlens, chunk)
 
@@ -3017,7 +3200,9 @@ def test_ssd_chunk_cumsum_kernel_reads_a_strided_dt():
     device = torch.device("musa")
     torch.manual_seed(0)
 
-    cu_chunk_seqlens = torch.tensor([0, chunk, tokens], dtype=torch.int32, device=device)
+    cu_chunk_seqlens = torch.tensor(
+        [0, chunk, tokens], dtype=torch.int32, device=device
+    )
     A = -torch.rand(heads, dtype=torch.float32, device=device)
     dt_bias = torch.rand(heads, dtype=torch.float32, device=device)
     wide = torch.randn(tokens, 2 * heads, dtype=torch.bfloat16, device=device)
@@ -3088,9 +3273,13 @@ def test_ssd_chunk_state_kernel_reads_strided_operands():
     device = torch.device("musa")
     torch.manual_seed(0)
 
-    cu_chunk_seqlens = torch.tensor([0, chunk, tokens], dtype=torch.int32, device=device)
+    cu_chunk_seqlens = torch.tensor(
+        [0, chunk, tokens], dtype=torch.int32, device=device
+    )
     x_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
-    b_wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
+    b_wide = torch.randn(
+        tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device
+    )
     x, b = x_wide[:, :, :dim], b_wide[:, :, :dstate]
     assert x.stride(-1) == 1 and not x.is_contiguous() and not b.is_contiguous()
     dt_out = torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
@@ -3118,8 +3307,12 @@ def test_ssd_state_passing_kernel_reads_strided_initial_states():
     device = torch.device("musa")
     torch.manual_seed(0)
 
-    states = torch.randn(nchunks, heads, dim, dstate, dtype=torch.float32, device=device)
-    dA_cumsum = -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device) - 0.1
+    states = torch.randn(
+        nchunks, heads, dim, dstate, dtype=torch.float32, device=device
+    )
+    dA_cumsum = (
+        -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device) - 0.1
+    )
     last_chunk_indices = torch.tensor([nchunks - 1], dtype=torch.int32, device=device)
     wide = torch.randn(1, heads, dim, 2 * dstate, dtype=torch.float32, device=device)
     initial = wide[:, :, :, :dstate]
@@ -3187,7 +3380,9 @@ def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
     torch.manual_seed(0)
 
     x_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
-    c_wide = torch.randn(tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device)
+    c_wide = torch.randn(
+        tokens, groups, 2 * dstate, dtype=torch.bfloat16, device=device
+    )
     z_wide = torch.randn(tokens, heads, 2 * dim, dtype=torch.bfloat16, device=device)
     d_wide = torch.randn(heads, 2 * dim, dtype=torch.float32, device=device)
     x, C = x_wide[:, :, :dim], c_wide[:, :, :dstate]
@@ -3197,7 +3392,9 @@ def test_ssd_chunk_scan_kernel_keeps_its_dense_contract():
     CB = torch.rand(nchunks, groups, chunk, chunk, dtype=torch.float32, device=device)
     dt_out = torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
     dA_cumsum = -torch.rand(heads, nchunks, chunk, dtype=torch.float32, device=device)
-    states = torch.randn(nchunks, heads, dim, dstate, dtype=torch.bfloat16, device=device)
+    states = torch.randn(
+        nchunks, heads, dim, dstate, dtype=torch.bfloat16, device=device
+    )
     seq_idx = torch.zeros(nchunks, dtype=torch.int32, device=device)
     cu_chunk_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
 
@@ -3288,7 +3485,9 @@ def test_ssu_packed_kernel_reads_strided_operands():
         rows, MTP_GROUPS, 2 * MTP_DSTATE, dtype=MTP_IO_DTYPE, device=device
     )
     c_wide = torch.randn_like(b_wide)
-    x_wide = torch.randn(rows, MTP_HEADS, 2 * MTP_DIM, dtype=MTP_IO_DTYPE, device=device)
+    x_wide = torch.randn(
+        rows, MTP_HEADS, 2 * MTP_DIM, dtype=MTP_IO_DTYPE, device=device
+    )
     x_view, b_view, c_view = (
         x_wide[:, :, :MTP_DIM],
         b_wide[:, :, :MTP_DSTATE],

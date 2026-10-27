@@ -34,6 +34,7 @@ _REFERENCE_COMBINATIONS: list[tuple[str, tuple[int, int, int, int]]] = [
     for qk_quant_dtype in _QK_QUANT_DTYPES
     for quant_recipe in _SUPPORTED_RECIPES
 ]
+_KV_TAIL_LENGTHS = (127, 128, 129, 255, 256, 257)
 _COMPILE_PARITY_CASES: list[
     tuple[str, tuple[int, int, int, int], torch.dtype, bool]
 ] = [
@@ -181,6 +182,24 @@ def _make_inputs(shape: ShapeSpec) -> tuple[torch.Tensor, torch.Tensor, torch.Te
     return q, k, v
 
 
+def _make_kv_tail_inputs(
+    seqlen_kv: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(20260921 + seqlen_kv)
+    q_shape = (1, 32, 2, 128)
+    kv_shape = (1, seqlen_kv, 2, 128)
+
+    q = torch.randint(0, 2, q_shape, generator=generator, dtype=torch.int8)
+    k = torch.randint(0, 2, kv_shape, generator=generator, dtype=torch.int8)
+    v = torch.randint(1, 4, kv_shape, generator=generator, dtype=torch.int8)
+
+    q = (q.to(torch.bfloat16) * 2 - 1).to("musa")
+    k = (k.to(torch.bfloat16) * 2 - 1).to("musa")
+    v = (v.to(torch.bfloat16) * 0.5).to("musa")
+    return q, k, v
+
+
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize(
     ("qk_quant_dtype", "quant_recipe"),
@@ -238,6 +257,109 @@ def test_all_recipe_dtype_combinations_match_reference(
     assert relative_l1_distance(out, out_ref) < 3e-2
     assert rmse(out, out_ref) < 1.5e-2
     assert F.cosine_similarity(lse.flatten(), lse_ref.flatten(), dim=0) > 0.999
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize(
+    ("qk_quant_dtype", "quant_recipe"),
+    _REFERENCE_COMBINATIONS,
+    ids=[
+        f"{qk_quant_dtype}-{quant_recipe}"
+        for qk_quant_dtype, quant_recipe in _REFERENCE_COMBINATIONS
+    ],
+)
+@pytest.mark.parametrize(
+    "seqlen_kv", _KV_TAIL_LENGTHS, ids=lambda value: f"skv-{value}"
+)
+def test_kv_tail_masking_matches_logical_length_reference(
+    seqlen_kv: int,
+    qk_quant_dtype: str,
+    quant_recipe: tuple[int, int, int, int],
+):
+    q, k, v = _make_kv_tail_inputs(seqlen_kv)
+    q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, q_ref, k_ref, v_ref = (
+        _build_prequantized_inputs(
+            q,
+            k,
+            v,
+            quant_recipe=quant_recipe,
+            qk_quant_dtype=qk_quant_dtype,
+        )
+    )
+
+    q_ref = q_ref.float().cpu()
+    k_ref = k_ref.float().cpu()
+    v_ref = v_ref.float().cpu()
+    softmax_scale = q.shape[-1] ** -0.5
+    expected, _, scores = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        causal=False,
+        upcast=True,
+        softmax_scale=softmax_scale,
+    )
+    expected_lse = torch.logsumexp(scores, dim=-1)
+
+    padding = (-seqlen_kv) % 128
+    if padding:
+        pad_shape = (k_ref.shape[0], padding, k_ref.shape[2], k_ref.shape[3])
+        k_padded = torch.cat((k_ref, torch.zeros(pad_shape, dtype=k_ref.dtype)), dim=1)
+        v_padded = torch.cat((v_ref, torch.zeros(pad_shape, dtype=v_ref.dtype)), dim=1)
+        padded_expected, _, padded_scores = attention_ref(
+            q_ref,
+            k_padded,
+            v_padded,
+            causal=False,
+            upcast=True,
+            softmax_scale=softmax_scale,
+        )
+        padded_expected_lse = torch.logsumexp(padded_scores, dim=-1)
+    else:
+        padded_expected = expected
+        padded_expected_lse = expected_lse
+
+    actual, actual_lse = mate.sage_attn_quantized(
+        q=q_quant,
+        k=k_quant,
+        v=v_quant,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        softmax_scale=softmax_scale,
+        causal=False,
+        quant_recipe=quant_recipe,
+        return_lse=True,
+        backend="mubin",
+    )
+    actual = actual.float().cpu()
+    actual_lse = actual_lse.float().cpu()
+
+    output_error = rmse(actual, expected)
+    lse_error = rmse(actual_lse, expected_lse)
+    padded_output_error = rmse(actual, padded_expected)
+    padded_lse_error = rmse(actual_lse, padded_expected_lse)
+    case = (
+        f"seqlen_kv={seqlen_kv}, qk_dtype={qk_quant_dtype}, quant_recipe={quant_recipe}"
+    )
+
+    assert torch.isfinite(actual).all(), case
+    assert torch.isfinite(actual_lse).all(), case
+    assert output_error <= 2e-2, f"{case}, output_rmse={output_error}"
+    assert lse_error <= 1e-2, f"{case}, lse_rmse={lse_error}"
+
+    output_reference_gap = rmse(expected, padded_expected)
+    if output_reference_gap > 4e-2:
+        assert output_error < padded_output_error, (
+            f"{case}, output_rmse={output_error}, "
+            f"padded_output_rmse={padded_output_error}"
+        )
+
+    lse_reference_gap = rmse(expected_lse, padded_expected_lse)
+    if lse_reference_gap > 2e-2:
+        assert lse_error < padded_lse_error, (
+            f"{case}, lse_rmse={lse_error}, padded_lse_rmse={padded_lse_error}"
+        )
 
 
 @supported_musa_compute_capability([31])

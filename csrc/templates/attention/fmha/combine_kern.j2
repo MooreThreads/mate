@@ -23,11 +23,16 @@ void {{ func_name }} (
   ffi::TensorView lse_accum,
   ffi::Optional<ffi::TensorView> metadata,
   int num_split
+  {% if has_max_logits %},
+  ffi::TensorView max_logits,
+  ffi::TensorView max_logits_accum
+  {% endif %}
 ) {
   // FMHA config
   constexpr bool HasCuseqlensQ = {{ 'true' if has_cu_seqlens_q else 'false' }};
   constexpr bool HasSequsedQ = {{ 'true' if has_seqused_q else 'false' }};
   constexpr bool HasMetadata = {{ 'true' if has_metadata else 'false' }};
+  constexpr bool HasMaxLogits = {{ 'true' if has_max_logits else 'false' }};
 
   constexpr int TileM = {{ tile_m }};
   constexpr int TileN = {{ tile_n }};
@@ -62,7 +67,7 @@ void {{ func_name }} (
   using CombineKernel = mate::attention::fmha::FmhaFwdCombine<TileShape_MK, MaxSplits,
                                                               256 /*kNThreads*/, 1 /*AlignmentLSE*/,
                                                               IsVarlenQ, HasCuseqlensQ, HasSequsedQ,
-                                                              Element, ElementPartial>;
+                                                              Element, ElementPartial, HasMaxLogits>;
 
   // Set Params
   mate::attention::fmha::FmhaFwdParams params {
@@ -119,6 +124,10 @@ void {{ func_name }} (
     .stride_O = {params.o_row_stride, _1{}, params.o_head_stride, !HasCuseqlensQ ? params.o_batch_stride : 0},
     .ptr_LSE = static_cast<float*>(params.softmax_lse_ptr),
     .stride_LSE = {_1{}, !HasCuseqlensQ ? params.seqlen_q : params.total_q, !HasCuseqlensQ ? params.h * params.seqlen_q : 0},
+    {% if has_max_logits %}
+    .ptr_max_logits = static_cast<float*>(max_logits.data_ptr()),
+    .ptr_max_logits_partial = static_cast<float const*>(max_logits_accum.data_ptr()),
+    {% endif %}
     .cu_seqlens = params.cu_seqlens_q,
     .seqused = params.seqused_q,
     .num_splits_dynamic_ptr = num_splits_dynamic_ptr,

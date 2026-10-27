@@ -4,7 +4,11 @@
 #include <mutlass/mutlass.h>
 #include <tvm/ffi/extra/musa/device_guard.h>
 
-#include "mate/mega_moe/mega_moe_stage2.hpp"
+{% if cc == 31 %}
+#include "mate/mega_moe/decode/mp31_decode_stage2.hpp"
+{% else %}
+#error "Unsupported MegaMoE decode Stage 2 compute capability"
+{% endif %}
 #include "op_utils.hpp"
 
 using namespace tvm;
@@ -47,7 +51,7 @@ void {{ func_name }}(
   TVM_FFI_ICHECK_GE(y.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(y.size(1), {{ hidden }});
   TVM_FFI_ICHECK_GE(num_tokens, 0);
-  TVM_FFI_ICHECK_LE(num_tokens, {{ num_max_tokens_per_rank }});
+  TVM_FFI_ICHECK_LE(num_tokens, {{ decode_max_tokens_per_rank }});
 
   ffi::MUSADeviceGuard device_guard(l2_acts.device().device_id);
   auto sym_buffer = mate::mega_moe::make_sym_buffer<{{ num_ranks }}>(sym_buffer_ptrs, rank_idx);
@@ -74,7 +78,7 @@ void {{ func_name }}(
       l2_weights.data_ptr(),
       fp8_dtype).desc;
 
-  auto kernel = ::mega_moe::fp8_fp8_mega_moe_stage2_impl<
+  auto kernel = ::mega_moe::mp31_fp8_fp8_mega_moe_stage2_impl<
       {{ num_max_tokens_per_rank }},
       {{ hidden }}, {{ intermediate_hidden }},
       {{ num_experts }}, {{ num_topk }},

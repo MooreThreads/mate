@@ -74,6 +74,7 @@ template <uint32_t BLOCK_M,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumMPs,
           uint32_t kNumRanks,
+          bool     kUseGroupedSwizzle = false,
           uint32_t kNumExpertsPerLane =
               math::constexpr_ceil_div(kNumExpertsPerRank, uint32_t(mutlass::NumThreadsPerWarp)),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
@@ -91,6 +92,8 @@ struct L1TileScheduler {
   uint32_t                 current_pool_block_offset                        = 0;
   uint32_t                 block_idx                                        = 0;
   uint32_t                 m_block_idx                                      = 0;
+  uint32_t                 n_block_idx                                      = 0;
+  bool                     use_grouped_swizzle                              = kUseGroupedSwizzle;
   uint32_t                 stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
   __device__ explicit L1TileScheduler(const layout::Workspace& workspace) : workspace(workspace) {
@@ -138,6 +141,14 @@ struct L1TileScheduler {
     return warp_reduce_add_u32(num_blocks);
   }
 
+  __device__ __forceinline__ uint32_t get_total_num_m_blocks() const {
+    return get_pool_block_offset(kNumExpertsPerRank);
+  }
+
+  __device__ __forceinline__ void set_grouped_swizzle(const bool enabled) {
+    use_grouped_swizzle = kUseGroupedSwizzle && enabled;
+  }
+
   __device__ __forceinline__ uint32_t get_current_num_m_blocks() const {
     return math::ceil_div(current_num_tokens, BLOCK_M);
   }
@@ -165,15 +176,44 @@ struct L1TileScheduler {
   }
 
   __device__ __forceinline__ bool fetch_next_l1_block() {
-    const uint32_t wave_end_expert_idx = get_wave_expert_end_idx();
+    constexpr uint32_t kNBlocksPerGroup    = 4;
+    const uint32_t     wave_end_expert_idx = get_wave_expert_end_idx();
     while (current_local_expert_idx < wave_end_expert_idx) {
       const uint32_t num_m_blocks = get_current_num_m_blocks();
-      m_block_idx                 = block_idx / kNumL1BlockNs;
-      if (m_block_idx < num_m_blocks) {
+      const uint32_t num_blocks   = num_m_blocks * kNumL1BlockNs;
+      if (block_idx < num_blocks) {
+        if constexpr (kUseGroupedSwizzle && kNumL1BlockNs % kNBlocksPerGroup == 0) {
+          if (use_grouped_swizzle) {
+            const uint32_t blocks_per_n_group = num_m_blocks * kNBlocksPerGroup;
+            uint32_t       n_group_idx        = 0;
+            if ((blocks_per_n_group & (blocks_per_n_group - 1u)) == 0u) {
+              n_group_idx = block_idx >> (31u - static_cast<uint32_t>(__clz(blocks_per_n_group)));
+            } else {
+              n_group_idx = block_idx / blocks_per_n_group;
+            }
+            const uint32_t in_group_idx = block_idx - n_group_idx * blocks_per_n_group;
+            uint32_t       m_in_group   = in_group_idx / kNBlocksPerGroup;
+            uint32_t       n_offset     = in_group_idx - m_in_group * kNBlocksPerGroup;
+            if ((m_in_group & 1u) != 0u) {
+              n_offset = kNBlocksPerGroup - 1u - n_offset;
+            }
+            if ((n_group_idx & 1u) != 0u) {
+              m_in_group = num_m_blocks - 1u - m_in_group;
+            }
+            m_block_idx = m_in_group;
+            n_block_idx = n_group_idx * kNBlocksPerGroup + n_offset;
+          } else {
+            m_block_idx = block_idx / kNumL1BlockNs;
+            n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+          }
+        } else {
+          m_block_idx = block_idx / kNumL1BlockNs;
+          n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+        }
         return true;
       }
 
-      block_idx -= num_m_blocks * kNumL1BlockNs;
+      block_idx -= num_blocks;
       advance_expert_idx();
     }
     return false;
@@ -223,7 +263,7 @@ struct L1TileScheduler {
     while (current_local_expert_idx < kNumExpertsPerRank) {
       if (fetch_next_l1_block()) {
         const uint32_t current_m_block_idx = m_block_idx;
-        const uint32_t current_n_block_idx = block_idx - current_m_block_idx * kNumL1BlockNs;
+        const uint32_t current_n_block_idx = n_block_idx;
         const uint32_t pool_block_idx      = get_current_pool_block_offset() + current_m_block_idx;
         block_idx += kNumMPs;
         desc = L1TileDesc::make(current_local_expert_idx, pool_block_idx, current_n_block_idx, get_valid_m());
@@ -260,7 +300,8 @@ template <uint32_t BLOCK_M,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumMPs,
-          uint32_t kNumRanks>
+          uint32_t kNumRanks,
+          bool     kUseGroupedSwizzle = false>
 using MegaMoEL1Scheduler = L1TileScheduler<BLOCK_M,
                                            BLOCK_N,
                                            BLOCK_K,
@@ -269,6 +310,7 @@ using MegaMoEL1Scheduler = L1TileScheduler<BLOCK_M,
                                            kNumExpertsPerRank,
                                            kNumExpertsPerWave,
                                            kNumMPs,
-                                           kNumRanks>;
+                                           kNumRanks,
+                                           kUseGroupedSwizzle>;
 
 }  // namespace mega_moe::stage1_sched

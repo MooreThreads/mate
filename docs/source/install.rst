@@ -18,7 +18,7 @@ Steps at a glance
 Step 1. Check Requirements
 --------------------------
 
-MATE 0.2.6 uses the following baseline:
+MATE 0.2.8 uses the following baseline:
 
 .. list-table::
    :header-rows: 1
@@ -194,7 +194,7 @@ installs the matching ``mate`` dependency automatically.
 Run only the command for the package surface used by your framework.
 
 Delivered MUSA wrapper versions use the PEP 440 local version suffix
-``+musa``, for example ``0.2.6+musa``. Check the installed distribution to
+``+musa``, for example ``0.2.8+musa``. Check the installed distribution to
 distinguish the MATE-backed MUSA wrapper from the native implementation:
 
 .. code-block:: bash
@@ -227,7 +227,7 @@ Install the TileLang extra for operators that use the TileLang-backed path:
    python -m pip install "mate[tilelang]" \
      --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
-For MATE 0.2.6, this extra uses the ``tilelang-musa==0.1.12`` dependency line
+For MATE 0.2.8, this extra uses the ``tilelang-musa==0.1.12`` dependency line
 from the MUSA package source.
 
 Install the optional TVM-FFI extension packages when your integration needs

@@ -64,7 +64,7 @@ Notes:
 
 | Command | Purpose |
 | --- | --- |
-| `mate show-config` | Show MATE, Python, PyTorch, MUSA, JIT, and AOT information |
+| `mate show-config` | Show MATE, MTCC, TileLang, Python, PyTorch, MUSA, JIT, and AOT information |
 | `mate module-status [--detailed]` | Show registered JIT/AOT module status without compiling |
 | `mate list-modules [MODULE]` | List registered JIT/AOT modules or inspect one module |
 | `mate export-compile-commands [PATH]` | Export compile commands for registered JIT modules |
@@ -100,6 +100,8 @@ The command reports:
 - MATE version and git version
 - Python version
 - PyTorch version
+- MTCC (`MCC`) version, git version, and install path
+- `tilelang-musa` version and git version
 - `torch_musa` version and whether MUSA is available
 - Resolved JIT MUSA architecture list, cache key, and whether the value came from `MATE_MUSA_ARCH_LIST` or auto-detection
 - JIT workspace/cache/generated-source directories, AOT directory, JIT toggles, and registered module counts

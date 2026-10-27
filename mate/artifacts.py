@@ -16,7 +16,13 @@ import requests  # type: ignore[import-untyped]
 
 DEFAULT_MUBIN_CACHE_DIR = Path.home() / ".cache" / "mate" / "mubin"
 MATE_MUBIN_DOWNLOAD_VERBOSE_ENV = "MATE_MUBIN_DOWNLOAD_VERBOSE"
-MATE_MUBIN_MODULES = ("gemm", "flash_attention", "flash_mla", "sage_attention")
+MATE_MUBIN_MODULES = (
+    "gemm",
+    "flash_attention",
+    "flash_attention_bwd",
+    "flash_mla",
+    "sage_attention",
+)
 
 
 @dataclass(frozen=True)
@@ -63,9 +69,12 @@ class ArtifactPath:
     """Artifactory paths for MATE MUBIN artifact families."""
 
     GEMM: str = "gemm/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    FLASH_ATTENTION: str = "flash_attention/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    FLASH_MLA: str = "flash_mla/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    SAGE_ATTENTION: str = "sage_attention/fbd1a6df72047350033cb4c524dd8145b8f18698/"
+    FLASH_ATTENTION: str = "flash_attention/537c521e874ecd495a613931060f242e38b0261d/"
+    FLASH_ATTENTION_BWD: str = (
+        "flash_attention_bwd/537c521e874ecd495a613931060f242e38b0261d/"
+    )
+    FLASH_MLA: str = "flash_mla/537c521e874ecd495a613931060f242e38b0261d/"
+    SAGE_ATTENTION: str = "sage_attention/537c521e874ecd495a613931060f242e38b0261d/"
 
     @classmethod
     @functools.cache
@@ -74,6 +83,8 @@ class ArtifactPath:
             return cls.GEMM
         if module == "flash_attention":
             return cls.FLASH_ATTENTION
+        if module == "flash_attention_bwd":
+            return cls.FLASH_ATTENTION_BWD
         if module == "flash_mla":
             return cls.FLASH_MLA
         if module == "sage_attention":
@@ -95,11 +106,14 @@ class KernelMapHash:
     KERNEL_MAP_FILE: str = "kernel_map.json"
     GEMM: str = "ea051c7e23e3ea57eb77140c632097392ceae938ecd6ff3c41272b921e6c8844"
     FLASH_ATTENTION: str = (
-        "52b8827226245461715112125d2a59c5b6eda41bec3881c2c07500a627ae0307"
+        "01ccb88b15bafaf94e01a5636fbd7b5531e1a76a046831d263d8cc2dda234b3c"
     )
-    FLASH_MLA: str = "9d0fdf71fd6cd11dfa04d4ec15c57279d21c3e3f6e670597b4162c6a339c7d06"
+    FLASH_ATTENTION_BWD: str = (
+        "4dcaadc20d651160fe185ac8de236495326953324d4b1dcf4b91eaa9977916ce"
+    )
+    FLASH_MLA: str = "875baaee8ec41c09a5ebd4efaed3f1dbc0945be1886e7ea7388d819822ab7a27"
     SAGE_ATTENTION: str = (
-        "50455bbe5328d5a1462dc87ac2b66dbe0ce5537f9d1a4d0a5e479fa265efbfdb"
+        "9369ecee41db0d483a53c5b668df32433cbf8f1a5d6b6c43a330562961685f20"
     )
 
     @classmethod
@@ -109,6 +123,8 @@ class KernelMapHash:
             return cls.GEMM
         if module == "flash_attention":
             return cls.FLASH_ATTENTION
+        if module == "flash_attention_bwd":
+            return cls.FLASH_ATTENTION_BWD
         if module == "flash_mla":
             return cls.FLASH_MLA
         if module == "sage_attention":

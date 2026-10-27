@@ -82,6 +82,53 @@ struct ChunkKdaWorkDesc {
   }
 };
 
+// Decode one real recurrence work item.  The single-task recurrence launch and
+// host-side work construction share this mapping.
+template <bool IsVarlen, class LogicalShape, class IndexType, int ValueTile, class ProblemSize>
+MUTLASS_HOST_DEVICE ChunkKdaWorkDesc<IsVarlen, LogicalShape, IndexType> decode_recurrence_work(
+    ProblemSize const& problem_size, uint32_t work_idx) {
+  using WorkDesc            = ChunkKdaWorkDesc<IsVarlen, LogicalShape, IndexType>;
+  constexpr int kChunk      = LogicalShape::Chunk;
+  constexpr int kValueDim   = LogicalShape::ValueDim;
+  constexpr int kValueTiles = kValueDim / ValueTile;
+  static_assert(kValueTiles > 0 && kValueDim % ValueTile == 0);
+
+  if (problem_size.N <= 0 || problem_size.H <= 0) {
+    return WorkDesc{0, -1, 0, 0, 0, 0, 0, 0, 0};
+  }
+  uint32_t head_seq = work_idx / uint32_t(kValueTiles);
+  uint32_t seq_idx  = head_seq / uint32_t(problem_size.H);
+  if (seq_idx >= uint32_t(problem_size.N)) {
+    return WorkDesc{0, -1, 0, 0, 0, 0, 0, 0, 0};
+  }
+  int head_idx    = int(head_seq % uint32_t(problem_size.H));
+  int value_start = int(work_idx % uint32_t(kValueTiles)) * ValueTile;
+
+  int64_t bos;
+  int64_t seq_len;
+  int64_t workspace_base;
+  if constexpr (IsVarlen) {
+    bos            = int64_t(problem_size.cu_seqlens[seq_idx]);
+    seq_len        = int64_t(problem_size.cu_seqlens[seq_idx + 1]) - bos;
+    workspace_base = mutlass::ceil_div(bos, int64_t(kChunk)) + seq_idx;
+  } else {
+    bos            = int64_t(seq_idx) * problem_size.T;
+    seq_len        = problem_size.T;
+    workspace_base = int64_t(seq_idx) * problem_size.workspace_chunks;
+  }
+  return WorkDesc{
+      static_cast<IndexType>(bos),
+      int(seq_idx),
+      head_idx,
+      detail::grouped_head_idx(head_idx, problem_size.H, problem_size.Hqk),
+      static_cast<IndexType>(seq_len),
+      int(mutlass::ceil_div(seq_len, int64_t(kChunk))),
+      0,
+      static_cast<IndexType>(workspace_base),
+      value_start,
+  };
+}
+
 template <class LogicalShape_, class CuSeqlensElement_, class SchedulePolicy_, class... Options_>
 struct ChunkKdaPrepareTileScheduler {
   using LogicalShape     = LogicalShape_;
@@ -292,7 +339,7 @@ struct ChunkKdaPrepareTileScheduler {
 };
 
 template <class LogicalShape_, class CuSeqlensElement_, class SchedulePolicy_, class... Options_>
-struct ChunkKdaRecurrenceTileScheduler {
+struct ChunkKdaRecurrenceScheduler {
   using LogicalShape     = LogicalShape_;
   using CuSeqlensElement = CuSeqlensElement_;
   using SchedulePolicy   = SchedulePolicy_;
@@ -303,103 +350,26 @@ struct ChunkKdaRecurrenceTileScheduler {
   using WorkDesc  = ChunkKdaWorkDesc<IsVarlen, LogicalShape, WorkIndex>;
   static_assert(std::is_integral_v<CuSeqlensElement>);
 
-  static constexpr int kChunk      = LogicalShape::Chunk;
-  static constexpr int kHeadDim    = LogicalShape::HeadDim;
-  static constexpr int kValueDim   = LogicalShape::ValueDim;
-  static constexpr int kValueTile  = SchedulePolicy::RecurrenceValueTile;
-  static constexpr int kValueTiles = kValueDim / kValueTile;
-  // The value slice and occupancy target are supplied by the architecture
-  // policy; the recurrent work traversal itself is architecture-independent.
-  static constexpr int CtasPerMp = SchedulePolicy::RecurrenceCtasPerMp;
+  static constexpr int kHeadDim   = LogicalShape::HeadDim;
+  static constexpr int kValueDim  = LogicalShape::ValueDim;
+  static constexpr int kValueTile = SchedulePolicy::RecurrenceValueTile;
   static_assert(kHeadDim == 128);
   static_assert(kValueDim % kValueTile == 0);
 
-  struct Params {
-    int num_seqs;
-    int num_heads;
-    int total_works;
-  };
-
-  int  seq_idx;
-  int  head_idx;
-  int  num_seqs;
-  int  num_heads;
-  int  work_idx;
-  bool scheduled = false;
-
-  MUTLASS_DEVICE explicit ChunkKdaRecurrenceTileScheduler(Params const& params)
-      : seq_idx(0), head_idx(0), num_seqs(params.num_seqs), num_heads(params.num_heads), work_idx(int(blockIdx.x)) {
-    if constexpr (IsVarlen) {
-      seq_idx  = int(blockIdx.x);
-      head_idx = int(blockIdx.y);
+  template <class ProblemSize>
+  static MUTLASS_HOST_DEVICE dim3 get_grid_shape(ProblemSize const& problem_size) {
+    if (problem_size.N <= 0 || problem_size.H <= 0) {
+      return dim3(0, 1, 1);
     }
+    return dim3(static_cast<uint32_t>(problem_size.N) * static_cast<uint32_t>(problem_size.H) *
+                    static_cast<uint32_t>(kValueDim / kValueTile),
+                1,
+                1);
   }
 
   template <class ProblemSize>
-  static MUTLASS_HOST_DEVICE Params to_underlying_arguments(ProblemSize const& problem_size) {
-    return Params{problem_size.N, problem_size.H, problem_size.N * problem_size.H * kValueTiles};
-  }
-
-  static dim3 get_grid_shape(Params const& params, int mp_count) {
-    if constexpr (IsVarlen) {
-      return dim3(params.num_seqs, params.num_heads, kValueTiles);
-    } else {
-      int target_ctas = (mp_count > 0 ? mp_count : 1) * CtasPerMp;
-      int grid_x      = params.total_works < target_ctas ? params.total_works : target_ctas;
-      return dim3(static_cast<uint32_t>(grid_x > 0 ? grid_x : 1), 1, 1);
-    }
-  }
-
-  static dim3 get_grid_shape(Params const& params) {
-    return get_grid_shape(params, mutlass::KernelHardwareInfo::query_device_multiprocessor_count());
-  }
-
-  template <class ProblemSize>
-  MUTLASS_DEVICE WorkDesc get_next_work(ProblemSize const& problem_size) {
-    int value_start;
-    if constexpr (IsVarlen) {
-      if (scheduled) {
-        return WorkDesc{0, -1, head_idx, 0, 0, 0, 0, 0, 0};
-      }
-      scheduled   = true;
-      value_start = int(blockIdx.z) * kValueTile;
-    } else {
-      int current_work = work_idx;
-      if (current_work >= num_seqs * num_heads * kValueTiles) {
-        return WorkDesc{0, -1, 0, 0, 0, 0, 0, 0, 0};
-      }
-      work_idx += int(gridDim.x);
-      int head_seq = current_work / kValueTiles;
-      value_start  = (current_work - head_seq * kValueTiles) * kValueTile;
-      head_idx     = head_seq % num_heads;
-      seq_idx      = head_seq / num_heads;
-    }
-
-    int64_t bos;
-    int64_t eos;
-    int64_t workspace_base;
-    if constexpr (IsVarlen) {
-      bos            = int64_t(problem_size.cu_seqlens[seq_idx]);
-      eos            = int64_t(problem_size.cu_seqlens[seq_idx + 1]);
-      workspace_base = mutlass::ceil_div(bos, int64_t(kChunk)) + seq_idx;
-    } else {
-      bos            = int64_t(seq_idx) * problem_size.T;
-      eos            = bos + problem_size.T;
-      workspace_base = int64_t(seq_idx) * problem_size.workspace_chunks;
-    }
-    int64_t seq_len = eos - bos;
-    using IndexType = typename WorkDesc::IndexType;
-    return WorkDesc{
-        static_cast<IndexType>(bos),
-        seq_idx,
-        head_idx,
-        detail::grouped_head_idx(head_idx, problem_size.H, problem_size.Hqk),
-        static_cast<IndexType>(seq_len),
-        mutlass::ceil_div(seq_len, int64_t(kChunk)),
-        0,
-        static_cast<IndexType>(workspace_base),
-        value_start,
-    };
+  MUTLASS_DEVICE static WorkDesc get_next_work(ProblemSize const& problem_size) {
+    return decode_recurrence_work<IsVarlen, LogicalShape, WorkIndex, kValueTile>(problem_size, uint32_t(blockIdx.x));
   }
 };
 

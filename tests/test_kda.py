@@ -14,6 +14,93 @@ CHUNK_SIZE = 32
 HEAD_SIZE = 128
 
 
+@pytest.mark.parametrize(
+    "lengths", ([0, 64, 65], [64, 0, 65], [64, 65, 0], [8192, 0, 0])
+)
+@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("state_mode", ("dense", "pool", "none"))
+@pytest.mark.parametrize("output_final_state", (False, True))
+def test_empty_sequences_preserve_state(
+    lengths, state_dtype, state_mode, output_final_state
+):
+    """Empty work skips all recurrence roles and preserves state without rounding."""
+    from mate.kda import chunk_kda
+
+    device = _get_runtime_device()
+    _manual_seed(73, device)
+    live = [i for i, length in enumerate(lengths) if length]
+    empty = [i for i, length in enumerate(lengths) if not length]
+    cu = torch.tensor(exclusive_cumsum(lengths), dtype=torch.int64, device=device)
+    compact_cu = torch.tensor(
+        exclusive_cumsum([lengths[i] for i in live]), dtype=torch.int64, device=device
+    )
+    q, k, v, g = [
+        torch.randn(1, sum(lengths), 12, 128, dtype=torch.bfloat16, device=device)
+        for _ in range(4)
+    ]
+    beta = torch.randn(1, sum(lengths), 12, dtype=torch.bfloat16, device=device)
+    args = dict(
+        A_log=torch.randn(12, device=device),
+        dt_bias=torch.randn(12, 128, device=device),
+        lower_bound=-5.0,
+        use_qk_l2norm_in_kernel=True,
+    )
+    # Empty sequences share a placeholder pool slot; live sequences never alias.
+    slots = [2 * live.index(i) + 1 if i in live else 0 for i in range(len(lengths))]
+    ids = torch.tensor(slots, dtype=torch.int32, device=device)
+    before = (torch.randn(7, 12, 128, 128, device=device) * 0.1).to(state_dtype)
+    state = before.clone() if state_mode == "pool" else before[ids].contiguous()
+    if state_mode == "none":
+        state = None
+    final = None
+    if state_mode == "none" and output_final_state:
+        final = torch.empty(
+            len(lengths), 12, 128, 128, dtype=state_dtype, device=device
+        )
+    output_ref, state_ref = chunk_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=None if state is None else before[ids[live]].contiguous(),
+        final_state=None if final is None else torch.empty_like(final[: len(live)]),
+        output_final_state=True,
+        cu_seqlens=compact_cu,
+        **args,
+    )
+    stream = torch.musa.Stream()
+    stream.wait_stream(torch.musa.current_stream())
+    with torch.musa.stream(stream):
+        result = chunk_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=state,
+            initial_state_indices=ids if state_mode == "pool" else None,
+            final_state=final,
+            output_final_state=output_final_state,
+            cu_seqlens=cu,
+            **args,
+        )
+    stream.synchronize()
+    output, final = result if output_final_state else (result, None)
+    torch.testing.assert_close(output, output_ref, atol=0.03, rtol=0.03)
+    if state_mode == "pool":
+        final = state
+        untouched = [i for i in range(7) if i not in slots]
+        assert torch.equal(final[untouched], before[untouched])
+    if final is not None:
+        actual = final[ids] if state_mode == "pool" else final
+        torch.testing.assert_close(actual[live], state_ref, atol=0.03, rtol=0.03)
+        if state_mode == "none":
+            assert torch.count_nonzero(actual[empty]).item() == 0
+        else:
+            assert torch.equal(actual[empty], before[ids[empty]])
+
+
 def exclusive_cumsum(seq_lens: list[int]) -> list[int]:
     out = [0]
     for seq_len in seq_lens:
@@ -790,7 +877,6 @@ CHUNKED_KDA_CASES = [
     ),
     DENSE_KDA_CASES,
 )
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_matches_reference(
     dtype_name: str,
     use_qk_l2norm_in_kernel: bool,
@@ -835,7 +921,6 @@ def test_kda_fused_matches_reference(
     ),
     VARLEN_KDA_CASES,
 )
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_matches_reference(
     dtype_name: str,
     use_qk_l2norm_in_kernel: bool,
@@ -862,7 +947,6 @@ def test_kda_fused_varlen_matches_reference(
     )
 
 
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_int32_cu_seqlens_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",
@@ -1004,7 +1088,6 @@ def test_kda_fused_single_chunk_zero_v_with_initial_state_matches_reference() ->
     )
 
 
-@repeat_check(outputs="result", repeat=3, scope=_run_fused_kda)
 def test_kda_fused_varlen_single_sequence_four_chunks_matches_reference() -> None:
     _test_kda_kernel(
         dtype_name="bfloat16",

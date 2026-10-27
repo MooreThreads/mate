@@ -547,6 +547,7 @@ struct FmhaFwdKernelWarpSpecialized {
           epilogue.template store<StoreZero, SplitKV>(params.epilogue,
                                                       acc,
                                                       lse,
+                                                      get<2>(values),
                                                       typename CollectiveMainloop::TiledMmaPV{},
                                                       threadIdx.x - MmaThreadOffset,
                                                       seqlen_info,

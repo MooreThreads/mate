@@ -20,13 +20,27 @@ using HasStateInOption =
     mate::flat::Option<mate::flat::Tag::HasStateIn, std::bool_constant<{{ has_state_in }}>>;
 using HasStateOutOption =
     mate::flat::Option<mate::flat::Tag::HasStateOut, std::bool_constant<{{ has_state_out }}>>;
+using HasChunkStatesOutOption =
+    mate::flat::Option<mate::flat::Tag::HasChunkStatesOut, std::bool_constant<{{ has_chunk_states_out }}>>;
+// The host selects the pool row mapping: `has_checkpoint_cadence` is true only
+// for `chunk_kda(checkpoint_every_n_tokens=...)`, and the kernel branches on
+// that mode rather than on the cadence value.  `checkpoint_every_n_tokens` is
+// rendered only as the divisor of the row arithmetic; the host has already
+// rejected anything that is not a positive multiple of the chunk, and the
+// components `static_assert` the same contract.
+using HasCheckpointCadenceOption =
+    mate::flat::Option<mate::flat::Tag::HasCheckpointCadence, std::bool_constant<{{ has_checkpoint_cadence }}>>;
+using CheckpointEveryNTokensOption =
+    mate::flat::Option<mate::flat::Tag::CheckpointEveryNTokens,
+                       std::integral_constant<int, {{ checkpoint_every_n_tokens }}>>;
 using IsVarlenOption =
     mate::flat::Option<mate::flat::Tag::IsVarlen, std::bool_constant<{{ is_varlen }}>>;
 using LogicalShape = kda::ChunkKdaLogicalShape<{{ chunk_size }}, {{ head_dim }}, {{ head_dim }}>;
 using TileShape = mute::Shape<mute::Int<{{ chunk_size }}>, mute::Int<{{ chunk_size }}>, mute::Int<{{ head_dim }}>>;
 using StrideV = kda::ChunkKdaVoStride;
 using StrideO = StrideV;
-using Kernel = typename kda::Mp31ChunkKdaRecurrenceBuilder<Element,
+using Kernel = typename kda::ChunkKdaRecurrenceBuilder<{{ arch_tag }},
+                                                        Element,
                                                         StateElement,
                                                         CuSeqlensElement,
                                                         LogicalShape,
@@ -35,26 +49,46 @@ using Kernel = typename kda::Mp31ChunkKdaRecurrenceBuilder<Element,
                                                         StrideO,
                                                         HasStateInOption,
                                                         HasStateOutOption,
+                                                        HasChunkStatesOutOption,
+                                                        HasCheckpointCadenceOption,
+                                                        CheckpointEveryNTokensOption,
                                                         IsVarlenOption>::Kernel;
 using Components = typename Kernel::Components;
 using Workspace = typename Components::Workspace;
 
 static constexpr int kHeadDim = Kernel::CollectiveRecurrence::kHeadDim;
-static_assert(Kernel::MaxThreadsPerBlock == 512,
-              "KDA K2 requires 1 producer, 2 state, and 1 output warp squad");
-static_assert(Kernel::CollectiveRecurrence::TmeStages == 2,
-              "KDA K2 requires a two-stage pipeline");
+// MP32 gives each CTA one 64-column value slice, with separate state and output
+// consumer squads.
+// MP31 retains separate output and state squads.
+{% if arch_tag == "mutlass::arch::Mp32" %}
+static_assert(Kernel::CollectiveRecurrence::NumProducerSquads == 1 &&
+                  Kernel::CollectiveRecurrence::NumStateSquads == 1 &&
+                  Kernel::CollectiveRecurrence::NumOutputSquads == 1 &&
+                  Kernel::MaxThreadsPerBlock == 384 &&
+                  Components::kRecurrenceValueTile == 64,
+              "MP32 KDA K2 requires producer, state, and output squads for a 64-column slice");
+{% else %}
+static_assert(Kernel::CollectiveRecurrence::NumProducerSquads == 1 &&
+                  Kernel::CollectiveRecurrence::NumStateSquads >= 1 &&
+                  Kernel::CollectiveRecurrence::NumOutputSquads == 1,
+              "MP31 KDA K2 requires 1 producer, state, and output squads");
+{% endif %}
+// The input rings are driven by explicit named barriers rather than a pipeline,
+// so the depth is a free choice and one stage is what the recurrence runs.
+static_assert(Kernel::CollectiveRecurrence::TmeStages >= 1,
+              "KDA K2 requires at least one input stage");
 
 void launch_chunk_kda_mutlass(Element const* v,
                               void const*    initial_state,
                               Element*       out,
                               void*          final_state,
+                              void*          chunk_states,
 
                               Element const* workspace_decayed,
                               Element const* workspace_k_restored,
                               Element const* workspace_inverse,
                               Element const* workspace_p,
-                              float const*   workspace_total,
+                              Element const* workspace_total,
                               int32_t const* state_indices,
 
                               CuSeqlensElement const* cu_seqlens,
@@ -65,6 +99,7 @@ void launch_chunk_kda_mutlass(Element const* v,
                               int               Hqk,
                               int               Hv,
                               int               N,
+                              int32_t           checkpoint_pool_rows,
                               musaStream_t      stream) {
   typename Kernel::Arguments arguments{
       typename Kernel::ProblemSize{
@@ -81,6 +116,7 @@ void launch_chunk_kda_mutlass(Element const* v,
           initial_state,
           out,
           final_state,
+          chunk_states,
           state_indices,
           v_stride,
           out_stride,
@@ -91,14 +127,22 @@ void launch_chunk_kda_mutlass(Element const* v,
               workspace_p,
               workspace_total,
           },
+          // Last field of the collective's argument contract: the pool's row
+          // count, or 0 when the caller has no pool.
+          checkpoint_pool_rows,
       },
   };
 
   typename Kernel::Params params = Kernel::to_underlying_arguments(arguments);
+  dim3                    grid = Kernel::get_grid_shape(params);
+  if (grid.x == 0) {
+    return;
+  }
   auto                    kernel = mutlass::device_kernel<Kernel>;
   MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
       kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Kernel::SharedStorageSize)));
-  kernel<<<Kernel::TileScheduler::get_grid_shape(params.scheduler), Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+  kernel<<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 inline StrideV stride_v(ffi::TensorView x) {
@@ -121,6 +165,58 @@ inline void check_kda_tensor_4d(ffi::TensorView x, const char* name) {
   check_last_dim_contiguous(x, name);
 }
 
+// The five workspace tensors are views into ONE chunk-major allocation: all
+// five fields of a record are adjacent, so the record dimension strides by
+// Workspace::RecordStride and these views are deliberately NOT contiguous.
+// Validate the expected chunk-major layout (strides + shared-buffer offsets)
+// instead of requiring contiguity, so a genuinely wrong buffer is still
+// rejected.
+inline void check_workspace_field(ffi::TensorView x, DLDataType dtype, const char* name,
+                                  ffi::TensorView ref, int64_t rows, int64_t cols) {
+  CHECK_MUSA(x); CHECK_INPUT_TYPE(x, dtype); CHECK_DEVICE(ref, x);
+  TVM_FFI_ICHECK_GT(x.numel(), 0) << name << " must not be empty";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 4) << name << " must be [records, heads, rows, cols]";
+  TVM_FFI_ICHECK_EQ(x.size(2), rows) << name << " has an unexpected row count";
+  TVM_FFI_ICHECK_EQ(x.size(3), cols) << name << " has an unexpected inner dimension";
+  TVM_FFI_ICHECK_EQ(x.stride(3), 1) << name << " inner dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(2), cols) << name << " rows must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(1), Workspace::RecordStride)
+      << name << " must be a chunk-major workspace view (per-head stride "
+      << Workspace::RecordStride << ")";
+  TVM_FFI_ICHECK_EQ(x.stride(0), x.size(1) * Workspace::RecordStride)
+      << name << " outer dimension must stride by heads * chunk-major record stride";
+}
+
+inline void check_workspace_total(ffi::TensorView x, ffi::TensorView ref) {
+  CHECK_MUSA(x); CHECK_INPUT_TYPE(x, {{ element_dtype }}); CHECK_DEVICE(ref, x);
+  TVM_FFI_ICHECK_GT(x.numel(), 0) << "workspace_total must not be empty";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 3) << "workspace_total must be [records, heads, kHeadDim]";
+  TVM_FFI_ICHECK_EQ(x.size(2), Components::kHeadDim) << "workspace_total has an unexpected inner dimension";
+  TVM_FFI_ICHECK_EQ(x.stride(2), 1) << "workspace_total inner dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(1), Workspace::RecordStride)
+      << "workspace_total must use the chunk-major record stride";
+  TVM_FFI_ICHECK_EQ(x.stride(0), x.size(1) * Workspace::RecordStride)
+      << "workspace_total outer dimension must stride by heads * record stride";
+}
+
+// All five views must be slices of the same buffer, at the field offsets
+// `mate/kda.py` built them with.  The kernels take data_ptr() as the field base
+// and reconstruct the record stride from the header, so this is exactly the
+// invariant they rely on.
+inline void check_workspace_offsets(ffi::TensorView decayed, ffi::TensorView k_restored,
+                                    ffi::TensorView inverse, ffi::TensorView p, ffi::TensorView total) {
+  const char*   base = static_cast<const char*>(decayed.data_ptr());
+  const int64_t esz  = static_cast<int64_t>(sizeof(Element));
+  auto at = [&](ffi::TensorView x, int64_t off_bytes, const char* name) {
+    TVM_FFI_ICHECK_EQ(static_cast<const char*>(x.data_ptr()) - base, off_bytes)
+        << name << " must alias the chunk-major workspace at byte offset " << off_bytes;
+  };
+  at(k_restored, Workspace::KRestoredOffset * esz, "workspace_k_restored");
+  at(inverse, Workspace::InverseOffset * esz, "workspace_inverse");
+  at(p, Workspace::POffset * esz, "workspace_p");
+  at(total, Workspace::TotalOffsetBytes, "workspace_total");
+}
+
 }  // namespace
 
 void {{ func_name }}(ffi::TensorView                v,
@@ -135,7 +231,13 @@ void {{ func_name }}(ffi::TensorView                v,
 
                      std::optional<ffi::TensorView> initial_state,
                      std::optional<ffi::TensorView> final_state,
-                     std::optional<ffi::TensorView> cu_seqlens) {
+                     std::optional<ffi::TensorView> cu_seqlens,
+                     // Caller-owned [rows, Hv, headDim, headDim] pool that
+                     // receives the state ENTERING every chunk.  The framework
+                     // owns the allocation and the row mapping; the kernel only
+                     // writes the [workspace_base + chunk_idx] row of each
+                     // sequence's chunk run.
+                     std::optional<ffi::TensorView> chunk_states) {
   check_mp31(v.device(), "{{ func_name }}");
   check_kda_tensor_4d(v, "v");
   check_kda_tensor_4d(out, "out");
@@ -143,18 +245,17 @@ void {{ func_name }}(ffi::TensorView                v,
   CHECK_SHAPE(out, v);
 
 
-  auto check_workspace = [&](ffi::TensorView x, DLDataType dtype, const char* name) {
-    CHECK_MUSA(x);
-    CHECK_CONTIGUOUS(x);
-    CHECK_INPUT_TYPE(x, dtype);
-    CHECK_DEVICE(v, x);
-    TVM_FFI_ICHECK_GT(x.numel(), 0) << name << " must not be empty";
-  };
-  check_workspace(workspace_decayed, {{ element_dtype }}, "workspace_decayed");
-  check_workspace(workspace_k_restored, {{ element_dtype }}, "workspace_k_restored");
-  check_workspace(workspace_inverse, {{ element_dtype }}, "workspace_inverse");
-  check_workspace(workspace_p, {{ element_dtype }}, "workspace_p");
-  check_workspace(workspace_total, dl_float32, "workspace_total");
+  check_workspace_field(workspace_decayed, {{ element_dtype }}, "workspace_decayed", v,
+                        2 * Components::kChunk, Components::kHeadDim);
+  check_workspace_field(workspace_k_restored, {{ element_dtype }}, "workspace_k_restored", v,
+                        Components::kChunk, Components::kHeadDim);
+  check_workspace_field(workspace_inverse, {{ element_dtype }}, "workspace_inverse", v,
+                        Components::kChunk, Components::kChunk);
+  check_workspace_field(workspace_p, {{ element_dtype }}, "workspace_p", v,
+                        Components::kChunk, Components::kChunk);
+  check_workspace_total(workspace_total, v);
+  check_workspace_offsets(workspace_decayed, workspace_k_restored, workspace_inverse,
+                          workspace_p, workspace_total);
   CHECK_MUSA(state_indices);
   CHECK_DIM(1, state_indices);
   CHECK_CONTIGUOUS(state_indices);
@@ -223,6 +324,77 @@ void {{ func_name }}(ffi::TensorView                v,
       << "rendered KDA kernel initial-state mode does not match inputs";
   TVM_FFI_ICHECK_EQ(has_state_out, {{ has_state_out }})
       << "rendered KDA kernel final-state mode does not match inputs";
+
+  // Chunk-boundary snapshot pool.  The pool is activation-typed by construction:
+  // the snapshot is the packed round-to-nearest bf16/fp16 copy of the fp32
+  // accumulator, so an fp32 pool cannot be filled exactly and is refused.
+  //
+  // The row mapping comes from the rendered mode flag:
+  //   false -> the packed chunk-slot rows of `chunk_kda(chunk_states=...)`, one
+  //            row per chunk (`workspace_base + chunk_idx`); the pool must cover
+  //            ceil(T/chunk) + N (varlen) or B*ceil(T/chunk) (dense) rows;
+  //   true  -> the compact checkpoint layout of
+  //            `chunk_kda(checkpoint_every_n_tokens=...)`: only the chunk whose
+  //            state enters token `j*cadence` is stored, packed per sequence, so
+  //            the pool capacity is max(total/cadence + N, 1) rows.  The host and
+  //            the components both refuse a cadence that is not a positive
+  //            multiple of the chunk.
+  //
+  // Cadence mode takes the pool's element type from the activation, not from the
+  // recurrent state: cudnn's `state_checkpoints` is io-dtype regardless of an
+  // fp32 `initial_state`, so a positive cadence permits an fp32 state.  The
+  // legacy `chunk_states` pool keeps the stricter rule (its dtype must equal the
+  // state dtype), which is what rejects an fp32 state there.
+  constexpr bool    kCheckpointCadence = Components::HasCheckpointCadence;
+  constexpr int32_t kCheckpointEveryN  = Components::CheckpointEveryNTokens;
+  bool    has_chunk_states_out = chunk_states.has_value();
+  void*   chunk_states_ptr     = nullptr;
+  int32_t chunk_states_rows    = 0;
+  TVM_FFI_ICHECK_EQ(has_chunk_states_out, {{ has_chunk_states_out }})
+      << "rendered KDA kernel chunk-state mode does not match inputs";
+  static_assert(!({{ has_chunk_states_out }} && {{ state_fp32 }} && !kCheckpointCadence),
+                "chunk_states requires the state dtype to match the activation dtype "
+                "(an fp32 state pool is not supported; use checkpoint_every_n_tokens)");
+  if (has_chunk_states_out) {
+    auto cs = chunk_states.value();
+    CHECK_MUSA(cs);
+    CHECK_DIM(4, cs);
+    CHECK_CONTIGUOUS(cs);
+    CHECK_DEVICE(v, cs);
+    CHECK_INPUT_TYPE(cs, {{ element_dtype }});
+    TVM_FFI_ICHECK_EQ(cs.size(1), Hv) << "chunk_states must have shape [rows, Hv, " << kHeadDim << ", "
+                                      << kHeadDim << "]";
+    TVM_FFI_ICHECK_EQ(cs.size(2), kHeadDim) << "chunk_states must have shape [rows, Hv, " << kHeadDim
+                                            << ", " << kHeadDim << "]";
+    TVM_FFI_ICHECK_EQ(cs.size(3), kHeadDim) << "chunk_states must have shape [rows, Hv, " << kHeadDim
+                                            << ", " << kHeadDim << "]";
+    int64_t rows_needed = 0;
+    if constexpr (kCheckpointCadence) {
+      // Capacity bound over the exact packed rows sum_b ((len_b - 1)/C + 1),
+      // which is what the kernel's per-sequence prefix base produces.
+      int64_t const total = is_varlen ? int64_t(T) : int64_t(B) * int64_t(T);
+      rows_needed = total / int64_t(kCheckpointEveryN) + int64_t(N);
+      if (rows_needed < 1) {
+        rows_needed = 1;
+      }
+    } else {
+      // Packed chunk slots, not back-to-back rows: dense packs B*chunks slots
+      // and varlen packs (sum_i ceil(len_i/chunk) + N) of them.
+      rows_needed = is_varlen ? int64_t(mutlass::ceil_div(T, Components::kChunk)) + N
+                              : int64_t(B) * mutlass::ceil_div(T, Components::kChunk);
+    }
+    TVM_FFI_ICHECK_GE(cs.size(0), rows_needed)
+        << "chunk_states needs at least " << rows_needed << " rows";
+    // The pool is written by a TME descriptor, whose global base must be
+    // 4-byte aligned (measured on S5000: a 2-byte offset is rejected by the
+    // driver, so this can not be fixed up inside the kernel).
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(cs.data_ptr()) % 4, 0)
+        << "chunk_states base must be at least 4-byte aligned";
+    TVM_FFI_ICHECK_LE(cs.size(0), int64_t(2147483647))
+        << "chunk_states rows do not fit the int32 pool row index";
+    chunk_states_ptr  = cs.data_ptr();
+    chunk_states_rows = static_cast<int32_t>(cs.size(0));
+  }
   ffi::MUSADeviceGuard device_guard(v.device().device_id);
   musaStream_t         stream   = get_stream(v.device());
   auto*                v_ptr    = static_cast<Element const*>(v.data_ptr());
@@ -232,7 +404,7 @@ void {{ func_name }}(ffi::TensorView                v,
   auto* workspace_k_restored_ptr = static_cast<Element const*>(workspace_k_restored.data_ptr());
   auto* workspace_inverse_ptr = static_cast<Element const*>(workspace_inverse.data_ptr());
   auto* workspace_p_ptr = static_cast<Element const*>(workspace_p.data_ptr());
-  auto* workspace_total_ptr = static_cast<float const*>(workspace_total.data_ptr());
+  auto* workspace_total_ptr = static_cast<Element const*>(workspace_total.data_ptr());
 
 
   StrideV             v_stride             = stride_v(v);
@@ -242,6 +414,7 @@ void {{ func_name }}(ffi::TensorView                v,
                            initial_state_ptr,
                            out_ptr,
                            final_state_ptr,
+                           chunk_states_ptr,
 
                            workspace_decayed_ptr,
                            workspace_k_restored_ptr,
@@ -257,9 +430,8 @@ void {{ func_name }}(ffi::TensorView                v,
                            Hqk,
                            Hv,
                            N,
+                           chunk_states_rows,
                            stream);
-
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});

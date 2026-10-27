@@ -1735,15 +1735,6 @@ def msa(
     return out_tensor, max_score_tensor
 
 
-def _fill_identity_topk_output(output: torch.Tensor, valid_pages: int) -> torch.Tensor:
-    topk = int(output.shape[-1])
-    ids = torch.arange(topk, dtype=torch.int32, device=output.device)
-    if valid_pages < topk:
-        ids = torch.where(ids < int(valid_pages), ids, torch.full_like(ids, -1))
-    output.copy_(ids.view(1, 1, topk).expand_as(output))
-    return output
-
-
 @mate_api
 def sparse_topk_select(
     max_score: torch.Tensor,
@@ -1829,9 +1820,6 @@ def sparse_topk_select(
 
     if total_q == 0:
         return output
-
-    if query_positions is None and valid_pages <= selected_block_count:
-        return _fill_identity_topk_output(output, valid_pages)
 
     return _msa_sparse_topk_select(
         max_score,

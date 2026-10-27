@@ -5,12 +5,10 @@ import random
 from mate.utils import ceil_div
 from mate.testing.utils import (
     align,
-    bench_kineto,
     group_quantize_fp8,
     group_dequantize_fp8,
     check_gemm_sbo_signal,
     calc_diff,
-    count_bytes,
 )
 from mate.testing import supported_musa_compute_capability
 
@@ -283,7 +281,8 @@ def ref_fp8_paged_mqa_logits(
 @pytest.mark.parametrize("batch_size, next_n", [(64, 1), (64, 4), (64, 2), (128, 1)])
 @pytest.mark.parametrize("avg_kv", [8192, 32768])
 @pytest.mark.parametrize("is_context_lens_2d", [False, True])
-def test_paged_mqa_logits(batch_size, next_n, avg_kv, is_context_lens_2d):
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+def test_paged_mqa_logits(batch_size, next_n, avg_kv, is_context_lens_2d, logits_dtype):
     # 2D context_lens only makes sense when next_n > 1
     if is_context_lens_2d and next_n == 1:
         pytest.skip(
@@ -364,6 +363,7 @@ def test_paged_mqa_logits(batch_size, next_n, avg_kv, is_context_lens_2d):
             schedule_metadata,
             max_model_len,
             True,
+            logits_dtype=logits_dtype,
         )
 
         positions = (
@@ -390,43 +390,8 @@ def test_paged_mqa_logits(batch_size, next_n, avg_kv, is_context_lens_2d):
 
         logits = logits.masked_fill(ref_neginf_mask, 0)
         ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
-        diff = calc_diff(logits, ref_logits)
+        diff = calc_diff(logits.float(), ref_logits)
         assert diff < 1e-3, f"{diff=}"
-
-        sum_lens = max_context_len_per_row.to(torch.int64).sum().item()
-        tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
-        input_bytes = (
-            count_bytes(q_fp8, weights, context_lens)
-            + sum_lens * (index_dim + 4)
-            + (sum_lens / blocksize) * 4
-        )
-        output_bytes = sum_lens * next_n * 4
-        t, clean_t = bench_kineto(
-            lambda: mate.deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                context_lens,
-                block_tables,
-                schedule_metadata,
-                max_model_len,
-                True,
-            ),
-            ("PagedMqaLogits", "clean_logits"),
-        )
-
-        if t > 0.0 and clean_t > 0.0:
-            clean_bytes = (
-                batch_size * next_n * max_model_len - neginf_mask.sum().item()
-            ) * 4 + count_bytes(context_lens)
-
-            print(
-                f" > BSZ={batch_size:3}, NextN={next_n:1}, 2D={is_context_lens_2d}, "
-                f"H={heads:2}, D={index_dim:3}, L={avg_kv:6}: "
-                f"{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, "
-                f"{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s | "
-                f"clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s"
-            )
 
 
 def get_deepgemm_group_gemm_contig_cases():
@@ -806,7 +771,8 @@ def ref_fp8_mqa_logits(
     [4001, 4096],
 )
 @pytest.mark.parametrize("disable_cp", [False, True])
-def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp, logits_dtype):
     torch.manual_seed(0)
     random.seed(0)
 
@@ -852,6 +818,7 @@ def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
             ke,
             clean_logits=False,
             max_seqlen_k=max_seqlen_k,
+            logits_dtype=logits_dtype,
         )
         assert logits_comp.shape == (seq_q, max_seqlen_k)
 
@@ -875,6 +842,7 @@ def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
             ks,
             ke,
             clean_logits=True,
+            logits_dtype=logits_dtype,
         )
         logits = logits_pad[:, :seq_kv_orig]
 
@@ -897,57 +865,8 @@ def test_mqa_logits(seq_q, seq_kv, compressed_logits, disable_cp):
         logits_masked = logits.masked_fill(neginf_mask, 0)
         ref_logits_masked = ref_logits.masked_fill(ref_neginf_mask, 0)
 
-        diff = calc_diff(logits_masked, ref_logits_masked)
+        diff = calc_diff(logits_masked.float(), ref_logits_masked)
         assert diff < 1e-3, f"{diff=}"
-
-    if compressed_logits:
-
-        def run_main():
-            mate.deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                (kv_fp8, kv_scale),
-                weights,
-                ks,
-                ke,
-                clean_logits=False,
-                max_seqlen_k=max_seqlen_k,
-            )
-
-        t = bench_kineto(
-            run_main,
-            "Fp8NonPagedMqaLogits",
-        )
-
-        print(
-            f"[fp8_mqa_logits] "
-            f"S={seq_q:4d}, SKV={seq_kv:6d}, "
-            f"H={num_heads:3d}, D={head_dim:3d}, "
-            f"CP={0 if disable_cp else 1}: "
-            f"(compressed logits)"
-        )
-    else:
-
-        def run_all():
-            mate.deep_gemm.fp8_mqa_logits(
-                q_fp8,
-                (kv_fp8, kv_scale),
-                weights,
-                ks,
-                ke,
-                clean_logits=True,
-            )
-
-        t, clean_t = bench_kineto(
-            run_all,
-            ("Fp8NonPagedMqaLogits", "mpxx_clean_logits"),
-        )
-
-        print(
-            f"[fp8_mqa_logits] "
-            f"S={seq_q:4d}, SKV={seq_kv:6d}, "
-            f"H={num_heads:3d}, D={head_dim:3d}, "
-            f"CP={0 if disable_cp else 1}: "
-        )
 
 
 @supported_musa_compute_capability([31])

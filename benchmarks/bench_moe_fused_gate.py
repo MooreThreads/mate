@@ -77,6 +77,7 @@ def benchmark(seq_length, num_experts, num_expert_group, topk_group, topk):
 if __name__ == "__main__":
     expert_configs = [
         (256, 8, 4, 8),
+        (288, 1, 1, 8),
         (384, 8, 4, 8),
         (160, 1, 2, 8),
         (384, 1, 2, 8),

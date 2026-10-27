@@ -51,22 +51,33 @@ def require_batch_topk_length(
     return topk_length
 
 
-def check_model1_k_cache(k_cache: torch.Tensor, name: str = "k_cache") -> None:
-    assert k_cache.dim() == 4, f"{name} must have shape [blocks, block, H_k, 584]"
-    assert k_cache.shape[-1] == MODEL1_KV_BYTES_PER_TOKEN, (
-        f"{name} last dimension must be {MODEL1_KV_BYTES_PER_TOKEN}"
+def check_model1_k_cache(
+    k_cache: torch.Tensor,
+    name: str = "k_cache",
+    *,
+    allow_v41: bool = False,
+    allow_fp4: bool = False,
+) -> None:
+    assert k_cache.dim() == 4, (
+        f"{name} must have shape [pages, page_size, H_k, bytes_per_token]"
+    )
+    formats = (584, 528, 288) if allow_fp4 else ((584, 528) if allow_v41 else (584,))
+    assert k_cache.shape[-1] in formats, (
+        f"{name} last dimension must be one of {formats}"
     )
     assert k_cache.shape[2] == 1, "MODEL1 sparse decode currently supports H_k == 1"
-    assert k_cache.element_size() == 1, f"{name} must be a byte-addressed FP8 cache"
+    assert k_cache.dtype in (torch.uint8, torch.int8, torch.float8_e4m3fn), (
+        f"{name} must be a byte-addressed packed cache"
+    )
     assert k_cache.stride(-1) == 1, f"{name} last dimension must be contiguous"
 
 
 def model1_cache_page_views(k_cache: torch.Tensor, *, check: bool = True):
-    """Return zero-copy flat MODEL1 cache views over each padded page row."""
+    """Return zero-copy views of a packed data section and scale footer per page."""
     if check:
         check_model1_k_cache(k_cache)
     num_blocks = k_cache.shape[0]
-    logical_block_bytes = k_cache.shape[1] * MODEL1_KV_BYTES_PER_TOKEN
+    logical_block_bytes = k_cache.shape[1] * k_cache.shape[-1]
     if num_blocks == 1:
         # A singleton page never advances stride(0), so preserve the wider load path.
         page_stride_bytes = (logical_block_bytes + 15) // 16 * 16

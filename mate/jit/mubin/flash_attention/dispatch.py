@@ -16,6 +16,8 @@ from .types import FlashAttentionMubinId
 @functools.cache
 def get_flash_attention_mubin_id_hash(asm_id: FlashAttentionMubinId) -> str:
     payload = asdict(asm_id)
+    if not payload["has_max_logits"]:
+        del payload["has_max_logits"]  # Preserve dispatch IDs for existing artifacts.
     payload["dtype"] = get_asm_dtype_from_torch_dtype(asm_id.dtype)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -37,6 +39,7 @@ class FlashAttentionMubinDispatcher:
         is_causal: bool,
         is_varlen: bool,
         headdim_qk: int,
+        has_max_logits: bool = False,
     ) -> FlashAttentionMubinId:
         return FlashAttentionMubinId(
             arch=MP31_ARCH,
@@ -44,7 +47,12 @@ class FlashAttentionMubinDispatcher:
             is_causal=is_causal,
             is_varlen=is_varlen,
             headdim_qk=128 if headdim_qk <= 128 else headdim_qk,
+            has_max_logits=has_max_logits,
         )
+
+    @functools.cache
+    def supports(self, asm_id: FlashAttentionMubinId) -> bool:
+        return get_flash_attention_mubin_id_hash(asm_id) in self._kernel_hash_map
 
     @functools.cache
     def resolve_kernel_entry(self, asm_id: FlashAttentionMubinId):

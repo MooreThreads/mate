@@ -307,9 +307,7 @@ def ssd_chunk_cumsum_reference(
         # Zero-pad the chunk's dt to the full row before scanning, so the prefix
         # sum saturates at the chunk total in the tail -- the value downstream
         # stages read from the row's last position.
-        padded = torch.zeros(
-            (chunk_size, heads), dtype=torch.float32, device=dt.device
-        )
+        padded = torch.zeros((chunk_size, heads), dtype=torch.float32, device=dt.device)
         padded[:length] = value
         prefix = torch.cumsum(padded * a_value.view(1, heads), dim=0)
         dA_cumsum[:, chunk, :] = prefix.transpose(0, 1)
@@ -348,7 +346,9 @@ def ssd_chunk_state_reference(
     zero and the masked-out tail contributes nothing.
     """
     if x.dim() != 3 or B.dim() != 3:
-        raise ValueError("x and B must be [tokens, heads, dim] / [tokens, groups, dstate].")
+        raise ValueError(
+            "x and B must be [tokens, heads, dim] / [tokens, groups, dstate]."
+        )
     tokens, heads, dim = x.shape
     if B.shape[0] != tokens:
         raise ValueError("x and B must share the token axis.")
@@ -381,16 +381,15 @@ def ssd_chunk_state_reference(
             continue
         # The chunk's total decay lives in the padded row's last position.
         last = dA_cumsum[:, chunk, block - 1].to(torch.float32)
-        delta = (last.unsqueeze(1) - dA_cumsum[:, chunk, :limit].to(torch.float32))
+        delta = last.unsqueeze(1) - dA_cumsum[:, chunk, :limit].to(torch.float32)
         delta = delta.clamp(max=0.0)
         scale = torch.exp(delta) * dt_out[:, chunk, :limit].to(torch.float32)
         x_chunk = x_fp32[start:end]
         for group in range(groups):
             head_slice = slice(group * head_ratio, (group + 1) * head_ratio)
-            scaled = (
-                b_fp32[start:end, group, :].unsqueeze(0)
-                * scale[head_slice].unsqueeze(2)
-            )
+            scaled = b_fp32[start:end, group, :].unsqueeze(0) * scale[
+                head_slice
+            ].unsqueeze(2)
             if round_operands:
                 scaled = scaled.to(x.dtype)
             # Contract the token axis exactly once: the scaled operand is
@@ -465,7 +464,9 @@ def ssd_chunk_scan_reference(
         if opens and initial_states is not None:
             prev = initial_states[seq[chunk]].to(torch.float32)
         elif opens:
-            prev = torch.zeros((heads, dim, dstate), dtype=torch.float32, device=x.device)
+            prev = torch.zeros(
+                (heads, dim, dstate), dtype=torch.float32, device=x.device
+            )
         else:
             prev = st[chunk - 1]
         for head in range(heads):
@@ -480,9 +481,7 @@ def ssd_chunk_scan_reference(
             acc = acc * torch.exp(dA_head).unsqueeze(1)
             # diagonal term over the causal triangle
             decay = torch.exp(
-                torch.clamp(
-                    dA_head.unsqueeze(1) - dA_head.unsqueeze(0), max=0.0
-                )
+                torch.clamp(dA_head.unsqueeze(1) - dA_head.unsqueeze(0), max=0.0)
             )
             if CB is None:
                 b_rows = b_fp32[start:end, group, :]  # (limit, dstate)
@@ -490,7 +489,9 @@ def ssd_chunk_scan_reference(
             else:
                 cb = CB[chunk, group, :limit, :limit].to(torch.float32)
             cb = cb * decay * dt_head.unsqueeze(0)
-            causal = torch.tril(torch.ones(limit, limit, device=x.device, dtype=torch.bool))
+            causal = torch.tril(
+                torch.ones(limit, limit, device=x.device, dtype=torch.bool)
+            )
             cb = torch.where(causal, cb, torch.zeros_like(cb))
             if round_operands:
                 cb = cb.to(x.dtype)

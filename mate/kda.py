@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from mate.api_logging import mate_api
 from mate.mate_runtime import get_physical_num_mps
 from mate.jit.kda_ops import (
-    KDA_MP31_PREPARE_CTAS_PER_MP,
     KDA_PREFILL_CHUNK_SIZE,
     KDA_PREFILL_HEAD_DIM,
     get_kda_recurrence_ops_function_name,
@@ -15,6 +16,7 @@ from mate.jit.kda_ops import (
     get_kda_prepare_ops_function_name,
     get_kda_prepare_ops_module,
     make_kda_ops_config,
+    resolve_kda_prepare_ctas_per_mp,
 )
 from mate.kda_kernels.tilelang import kda_decode as kda_decode_tilelang
 
@@ -53,6 +55,182 @@ def _check_state_dtype(
         raise TypeError(f"{name} must have dtype {value_dtype} or torch.float32.")
 
 
+def kda_chunk_state_rows(
+    *,
+    batch: int,
+    num_tokens: int,
+    cu_seqlens: torch.Tensor | None = None,
+) -> int:
+    """Rows a caller must allocate for ``chunk_kda(chunk_states=...)``.
+
+    One row per (sequence slot, chunk) pair, following the same packed chunk
+    slot space the KDA prepare workspace uses.  Callers may over-provision:
+    the kernel only writes the rows it needs, so a fixed-capacity pool sized
+    for the worst case is fine.
+    """
+    chunks = -(-num_tokens // KDA_PREFILL_CHUNK_SIZE)
+    if cu_seqlens is None:
+        return batch * chunks
+    return chunks + int(cu_seqlens.numel() - 1)
+
+
+def _kda_checkpoint_rows(
+    *,
+    batch: int,
+    num_tokens: int,
+    cu_seqlens: torch.Tensor | None = None,
+    every_n_tokens: int,
+) -> int:
+    """Rows the checkpoint pool that ``chunk_kda`` allocates needs.
+
+    Internal: the operator owns the pool, so this exists to size that allocation
+    (and to let the tests predict its shape).  The capacity is the same bound
+    cudnn-frontend allocates: ``max(total_tokens // every_n_tokens + N, 1)``,
+    which covers the exact packed row count
+    ``sum_b ((len_b - 1) // C + 1)``.  ``num_tokens`` is the per-sequence length
+    for a dense batch and the packed total for varlen.
+    """
+    if every_n_tokens <= 0:
+        raise ValueError("every_n_tokens must be positive.")
+    if every_n_tokens % KDA_PREFILL_CHUNK_SIZE:
+        raise ValueError(
+            f"every_n_tokens must be a multiple of the kernel chunk "
+            f"({KDA_PREFILL_CHUNK_SIZE}), got {every_n_tokens}."
+        )
+    sequences = batch if cu_seqlens is None else int(cu_seqlens.numel() - 1)
+    total_tokens = batch * num_tokens if cu_seqlens is None else num_tokens
+    return max(total_tokens // every_n_tokens + sequences, 1)
+
+
+# ---------------------------------------------------------------------------
+# KDA prefill workspace: ONE allocation, chunk-major record layout.
+#
+# `chunk_kda` allocates a single buffer of shape (records, H, RecordStride) and
+# hands the kernels five views into it, so for each (chunk, head) record the
+# five fields are adjacent:
+#
+#   field          elements   bytes   byte offset in the record block
+#   decayed            4096    8192        0
+#   k_restored         2048    4096     8192
+#   p                   256     512    12288
+#   inverse             256     512    12800
+#   total               128     256    13312
+#   ---------------------------------------------------------------
+#   RecordStride       6784   13568
+#
+# Every field offset and the record stride are multiples of 256 B, so every
+# field of every record is 256 B aligned -- the alignment the TME descriptors
+# and robust copies need.
+#
+# These numbers mirror ChunkKdaWorkspace in
+# include/mate/flat/kda/chunk_kda_workspace.hpp; keep the two in sync.
+# All five fields are Element rows, so RecordStride is exactly the sum of the
+# five field sizes: 4096 + 2048 + 256 + 256 + 128 = 6784.
+_KDA_WS_CHUNK = KDA_PREFILL_CHUNK_SIZE
+_KDA_WS_HEAD_DIM = KDA_PREFILL_HEAD_DIM
+_KDA_WS_DECAYED_ELEMENTS = 2 * _KDA_WS_CHUNK * _KDA_WS_HEAD_DIM
+_KDA_WS_KRESTORED_ELEMENTS = _KDA_WS_CHUNK * _KDA_WS_HEAD_DIM
+_KDA_WS_INVERSE_ELEMENTS = _KDA_WS_CHUNK * _KDA_WS_CHUNK
+_KDA_WS_P_ELEMENTS = _KDA_WS_CHUNK * _KDA_WS_CHUNK
+_KDA_WS_SCALE_ELEMENTS = _KDA_WS_HEAD_DIM  # elements in the `total` row
+_KDA_WS_DECAYED_OFFSET = 0
+_KDA_WS_KRESTORED_OFFSET = _KDA_WS_DECAYED_OFFSET + _KDA_WS_DECAYED_ELEMENTS
+# `p` precedes `inverse` so the MP32 recurrence can read both as ONE 32-row tile:
+# rows 0..15 are P (the C rows owned by warps 0/1, which also own the decayed Q
+# rows, i.e. the output path) and rows 16..31 the inverse (warps 2/3, the K rows,
+# i.e. the U path).  The fields are the same size, so the order costs nothing.
+_KDA_WS_P_OFFSET = _KDA_WS_KRESTORED_OFFSET + _KDA_WS_KRESTORED_ELEMENTS
+_KDA_WS_INVERSE_OFFSET = _KDA_WS_P_OFFSET + _KDA_WS_P_ELEMENTS
+_KDA_WS_TOTAL_OFFSET = _KDA_WS_INVERSE_OFFSET + _KDA_WS_INVERSE_ELEMENTS
+_KDA_WS_RECORD_STRIDE = _KDA_WS_TOTAL_OFFSET + _KDA_WS_SCALE_ELEMENTS
+
+# The chunk-major ABI the kernels reconstruct from ChunkKdaWorkspace.
+assert _KDA_WS_RECORD_STRIDE == 6784, _KDA_WS_RECORD_STRIDE
+assert _KDA_WS_TOTAL_OFFSET == 6656, _KDA_WS_TOTAL_OFFSET
+
+
+def _allocate_kda_workspace(tile_shape, device, dtype):
+    """Allocate the chunk-major workspace and return its five field views.
+
+    The views keep exactly the shapes the previous five separate allocations
+    had, so nothing downstream changes.  Every field of every record is 256 B
+    aligned and all five views alias the one buffer.
+    """
+    records, heads = int(tile_shape[0]), int(tile_shape[1])
+    buffer = torch.empty(
+        (records, heads, _KDA_WS_RECORD_STRIDE), device=device, dtype=dtype
+    )
+    assert buffer.element_size() == 2, (
+        "the chunk-major workspace layout assumes 2-byte activation elements"
+    )
+    row_stride = heads * _KDA_WS_RECORD_STRIDE
+
+    def view(offset, shape, inner_stride):
+        return torch.as_strided(
+            buffer,
+            size=shape,
+            stride=(row_stride, _KDA_WS_RECORD_STRIDE) + inner_stride,
+            storage_offset=offset,
+        )
+
+    decayed = view(
+        _KDA_WS_DECAYED_OFFSET,
+        (records, heads, 2 * _KDA_WS_CHUNK, _KDA_WS_HEAD_DIM),
+        (_KDA_WS_HEAD_DIM, 1),
+    )
+    k_restored = view(
+        _KDA_WS_KRESTORED_OFFSET,
+        (records, heads, _KDA_WS_CHUNK, _KDA_WS_HEAD_DIM),
+        (_KDA_WS_HEAD_DIM, 1),
+    )
+    inverse = view(
+        _KDA_WS_INVERSE_OFFSET,
+        (records, heads, _KDA_WS_CHUNK, _KDA_WS_CHUNK),
+        (_KDA_WS_CHUNK, 1),
+    )
+    p = view(
+        _KDA_WS_P_OFFSET,
+        (records, heads, _KDA_WS_CHUNK, _KDA_WS_CHUNK),
+        (_KDA_WS_CHUNK, 1),
+    )
+    total = view(
+        _KDA_WS_TOTAL_OFFSET,
+        (records, heads, _KDA_WS_HEAD_DIM),
+        (1,),
+    )
+
+    # Every field of every record must be 256 B aligned.  Each field offset and
+    # the record stride is a multiple of 256 B and a fresh allocation is at
+    # least 256 B aligned, so this holds by construction; assert it rather than
+    # trusting it.
+    base = buffer.data_ptr()
+    assert base % 256 == 0, f"workspace base {base:#x} is not 256 B aligned"
+    fields = (
+        ("decayed", decayed),
+        ("k_restored", k_restored),
+        ("inverse", inverse),
+        ("p", p),
+        ("total", total),
+    )
+    for name, tensor in fields:
+        assert tensor.data_ptr() % 256 == 0, (
+            f"{name} view at {tensor.data_ptr():#x} is not 256 B aligned"
+        )
+    if os.environ.get("MATE_KDA_WS_PROBE") == "1":
+        print(
+            f"[ws-probe] buffer base={base:#x} bytes={buffer.numel() * buffer.element_size()} "
+            f"records={records} heads={heads} RecordStride={_KDA_WS_RECORD_STRIDE}"
+        )
+        for name, tensor in fields:
+            offset = tensor.data_ptr() - base
+            print(
+                f"[ws-probe] {name:11s} byte_offset={offset:7d} "
+                f"record_stride_bytes={tensor.stride(1) * tensor.element_size():6d} "
+                f"align256={offset % 256 == 0} shape={tuple(tensor.shape)}"
+            )
+    return decayed, k_restored, inverse, p, total
+
+
 @mate_api
 def chunk_kda(
     q: torch.Tensor,
@@ -71,7 +249,9 @@ def chunk_kda(
     output: torch.Tensor | None = None,
     final_state: torch.Tensor | None = None,
     initial_state_indices: torch.Tensor | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    chunk_states: torch.Tensor | None = None,
+    checkpoint_every_n_tokens: int = 0,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Run chunk KDA as a chunk-parallel prepare kernel and a recurrence kernel.
 
     Args:
@@ -99,6 +279,39 @@ def chunk_kda(
             sequences to rows of ``initial_state``. When provided, the selected
             pool rows are read and written in place. Concurrent sequences must
             refer to distinct valid pool rows.
+        chunk_states: Optional caller-allocated pool that receives the
+            recurrent state at every chunk boundary, so a serving framework can
+            cache prefix states and skip recomputing a shared prefix on a later
+            request. Shape ``[chunk_rows, H, Dv, D]``, contiguous, with the same
+            dtype as the recurrent state; size it with
+            :func:`mate.kda.kda_chunk_state_rows` (over-provisioning is fine,
+            the kernel writes only the rows it needs). Row
+            ``workspace_slot + chunk_idx`` of each sequence receives the state
+            entering ``chunk_idx``, i.e. row 0 is the state before the first
+            token. The state after the final chunk is not written here -- that
+            is ``final_state`` / the ``initial_state`` pool.
+        checkpoint_every_n_tokens: Optional checkpoint cadence ``C``. When
+            positive (and a multiple of the kernel chunk, 16), the call returns
+            the recurrent state every ``C`` tokens instead of every chunk, in a
+            compact pool that ``chunk_kda`` allocates itself. Entry ``j`` of
+            sequence ``b`` holds the state entering token ``j * C`` of that
+            sequence, for ``j = 0 .. (len_b - 1) // C`` -- entry 0 is the
+            incoming state, and the state after the final token is only
+            ``final_state``. Entries are packed per sequence in ``cu_seqlens``
+            order, so the valid rows are ``sum_b ((len_b - 1) // C + 1)`` (empty
+            sequences contribute none) and the allocated capacity is
+            ``max(total_tokens // C + N, 1)``. The pool dtype is the
+            activation dtype even when the recurrent state is fp32, matching
+            cudnn's ``state_checkpoints``. Cannot be combined with
+            ``chunk_states`` or ``initial_state_indices`` (cudnn's
+            ``state_indices`` pool is mutually exclusive with checkpoints too).
+
+    Returns:
+        ``output``, or ``(output, final_state)`` when ``output_final_state`` is
+        set, or ``(output, final_state, checkpoints)`` when
+        ``checkpoint_every_n_tokens > 0`` -- where ``final_state`` is a
+        zero-size tensor if it was not requested. ``checkpoints`` has shape
+        ``[capacity, H, Dv, D]``, contiguous, in the activation dtype.
     """
 
     q, squeeze_varlen = _as_4d_varlen_input(q, name="q", cu_seqlens=cu_seqlens)
@@ -250,22 +463,114 @@ def chunk_kda(
     ):
         raise TypeError("initial_state and final_state must have the same dtype.")
 
-    state_fp32 = (
-        initial_state is not None and initial_state.dtype == torch.float32
-    ) or (final_state is not None and final_state.dtype == torch.float32)
+    state_fp32 = any(
+        tensor is not None and tensor.dtype == torch.float32
+        for tensor in (initial_state, final_state, chunk_states)
+    )
     state_dtype = (
         initial_state.dtype
         if initial_state is not None
         else final_state.dtype
         if final_state is not None
+        else chunk_states.dtype
+        if chunk_states is not None
         else q.dtype
     )
+    checkpoints = None
+    if checkpoint_every_n_tokens:
+        if (
+            checkpoint_every_n_tokens < 0
+            or checkpoint_every_n_tokens % KDA_PREFILL_CHUNK_SIZE
+        ):
+            raise ValueError(
+                "checkpoint_every_n_tokens must be 0 or a positive multiple of the "
+                f"kernel chunk ({KDA_PREFILL_CHUNK_SIZE}), got "
+                f"{checkpoint_every_n_tokens}."
+            )
+        if chunk_states is not None:
+            raise ValueError(
+                "chunk_states and checkpoint_every_n_tokens write the same "
+                "chunk-boundary pool with different row mappings; pass only one."
+            )
+        if initial_state_indices is not None:
+            # cudnn-frontend refuses this combination too: its `state_indices`
+            # pool and `checkpoint_every_n_tokens` are mutually exclusive.
+            raise ValueError(
+                "initial_state_indices cannot be combined with "
+                "checkpoint_every_n_tokens"
+            )
+        checkpoint_rows = _kda_checkpoint_rows(
+            batch=q.shape[0],
+            num_tokens=q.shape[1],
+            cu_seqlens=cu_seqlens,
+            every_n_tokens=checkpoint_every_n_tokens,
+        )
+        # The kernel publishes the activation-typed state tile, so the
+        # checkpoint pool is activation-typed even when the recurrent state is
+        # fp32 -- cudnn's `state_checkpoints` is io-dtype regardless of an fp32
+        # `initial_state`.
+        checkpoints = torch.empty(
+            (checkpoint_rows, *expected_state_tail),
+            device=q.device,
+            dtype=q.dtype,
+        )
+    if chunk_states is not None:
+        if chunk_states.dtype == torch.float32:
+            # The snapshot is published from the activation-typed state tile, so
+            # a fp32 pool cannot be filled exactly.  Fail loudly rather than
+            # silently handing back activation-precision values in an fp32
+            # buffer.
+            raise NotImplementedError(
+                "chunk_states does not support an fp32 pool: the kernel publishes "
+                "the activation-typed state tile, so an fp32 pool cannot be filled "
+                "exactly. Use a bf16/fp16 pool, or omit chunk_states."
+            )
+        # The pool is caller-owned; the kernel writes it as StateElement, so the
+        # dtype has to agree with whatever the other state tensors selected.
+        if chunk_states.dim() != 4 or tuple(chunk_states.shape[1:]) != (
+            v.shape[2],
+            128,
+            128,
+        ):
+            raise ValueError(
+                "chunk_states must have shape [chunk_rows, H, Dv, D], got "
+                f"{tuple(chunk_states.shape)}."
+            )
+        if chunk_states.device != q.device:
+            raise ValueError(
+                f"chunk_states must be on device {q.device}, got {chunk_states.device}."
+            )
+        if not chunk_states.is_contiguous():
+            raise ValueError("chunk_states must be contiguous.")
+        if chunk_states.dtype != state_dtype:
+            raise TypeError(
+                "chunk_states must have the same dtype as the recurrent state "
+                f"({state_dtype}), got {chunk_states.dtype}."
+            )
+        required_rows = kda_chunk_state_rows(
+            batch=q.shape[0],
+            num_tokens=q.shape[1],
+            cu_seqlens=cu_seqlens,
+        )
+        if chunk_states.shape[0] < required_rows:
+            raise ValueError(
+                f"chunk_states needs at least {required_rows} rows for this input, "
+                f"got {chunk_states.shape[0]}; see mate.kda.kda_chunk_state_rows."
+            )
+    # Exactly one of the two pools reaches the kernel.
+    state_pool = chunk_states if chunk_states is not None else checkpoints
     kda_config = make_kda_ops_config(
         q.dtype,
         state_dtype=state_dtype,
         cu_seqlens_dtype=cu_seqlens.dtype if cu_seqlens is not None else None,
         has_state_in=initial_state is not None,
         has_state_out=final_state is not None,
+        has_chunk_states_out=state_pool is not None,
+        # Compile-time row mapping for the pool: 0 keeps the packed chunk-slot
+        # rows of `chunk_states`, a positive multiple of the chunk selects the
+        # compact checkpoint layout.  It is validated by `make_kda_ops_config`
+        # (and again by the rendered kernel's static_asserts).
+        checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
         state_fp32=state_fp32,
         has_gate_params=A_log is not None,
         is_varlen=cu_seqlens is not None,
@@ -274,34 +579,24 @@ def chunk_kda(
     chunks = (q.shape[1] + KDA_PREFILL_CHUNK_SIZE - 1) // KDA_PREFILL_CHUNK_SIZE
     workspace_records = chunks + nseq if cu_seqlens is not None else nseq * chunks
     workspace_tile_shape = (workspace_records, v.shape[2])
-    workspace_decayed = torch.empty(
-        (*workspace_tile_shape, 2 * KDA_PREFILL_CHUNK_SIZE, KDA_PREFILL_HEAD_DIM),
-        device=q.device,
-        dtype=q.dtype,
-    )
-    workspace_k_restored = torch.empty(
-        (*workspace_tile_shape, KDA_PREFILL_CHUNK_SIZE, KDA_PREFILL_HEAD_DIM),
-        device=q.device,
-        dtype=q.dtype,
-    )
-    workspace_inverse = torch.empty(
-        (*workspace_tile_shape, KDA_PREFILL_CHUNK_SIZE, KDA_PREFILL_CHUNK_SIZE),
-        device=q.device,
-        dtype=q.dtype,
-    )
-    workspace_p = torch.empty_like(workspace_inverse)
-    workspace_total = torch.empty(
-        (*workspace_tile_shape, KDA_PREFILL_HEAD_DIM),
-        device=q.device,
-        dtype=torch.float32,
-    )
+    # ONE chunk-major allocation; see _allocate_kda_workspace above.
+    (
+        workspace_decayed,
+        workspace_k_restored,
+        workspace_inverse,
+        workspace_p,
+        workspace_total,
+    ) = _allocate_kda_workspace(workspace_tile_shape, q.device, q.dtype)
     # Persistent K1 uses one int4 range descriptor per launched partition.
     # The MP31 launch policy consumes at most one descriptor per resident
     # prepare CTA.  MP32 can supply a different policy without changing the
     # workspace record ABI above.
     num_seqs = cu_seqlens.numel() - 1 if cu_seqlens is not None else 1
+    # Sized by the launch policy the kernel was built with, so the arch comes
+    # from the same resolver that renders its ArchTag -- not from the device,
+    # which can disagree with MATE_MUSA_ARCH_LIST during a cross build.
     metadata_capacity = (
-        KDA_MP31_PREPARE_CTAS_PER_MP * get_physical_num_mps(q.device)
+        resolve_kda_prepare_ctas_per_mp() * get_physical_num_mps(q.device)
         if cu_seqlens is not None and num_seqs > 1
         else 1
     )
@@ -343,10 +638,17 @@ def chunk_kda(
         initial_state,
         final_state,
         cu_seqlens,
+        state_pool,
     )
 
     if squeeze_varlen:
         output = output.squeeze(0)
+    if checkpoints is not None:
+        # Cadence mode: `checkpoint_every_n_tokens` is the caller's contract, so
+        # the checkpoint series is always the third element; final_state is a
+        # zero-size tensor when it was not requested (cudnn's convention).
+        final_out = final_state if final_state is not None else output.new_empty(0)
+        return output, final_out, checkpoints
     if output_final_state:
         assert final_state is not None
         return output, final_state

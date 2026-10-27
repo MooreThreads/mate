@@ -826,6 +826,7 @@ def fp8_paged_mqa_logits(
     max_context_len: int,
     clean_logits: bool = False,
     indices: Optional[torch.Tensor] = None,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     r"""FP8 Paged MQA logits
 
@@ -862,10 +863,13 @@ def fp8_paged_mqa_logits(
     indices: Tensor, optional
         Not supported by Mate; must be left unset.
 
+    logits_dtype: torch.dtype, default=torch.float32
+        Output dtype; ``torch.float32`` or ``torch.bfloat16``.
+
     Returns
     -------
     Tensor
-        FP32 logits, shape ``(batch_size * next_n, max_context_len)``
+        Logits with dtype ``logits_dtype``, shape ``(batch_size * next_n, max_context_len)``
     """
     assert indices is None
     return mate_fp8_paged_mqa_logits(
@@ -877,6 +881,7 @@ def fp8_paged_mqa_logits(
         schedule_meta,
         max_context_len,
         clean_logits,
+        logits_dtype=logits_dtype,
     )
 
 
@@ -888,6 +893,7 @@ def fp8_mqa_logits(
     cu_seq_len_k_end: torch.Tensor,
     clean_logits: bool = False,
     max_seqlen_k: int = 0,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     r"""FP8 MQA logits.
 
@@ -920,14 +926,16 @@ def fp8_mqa_logits(
     max_seqlen_k : int, default=0
         If > 0, enables compressed logits mode. The output width becomes ``max_seqlen_k``
         (a windowed logits range per row). In this mode, ``clean_logits`` must be ``False``.
+    logits_dtype : torch.dtype, default=torch.float32
+        Output dtype; ``torch.float32`` or ``torch.bfloat16``.
 
     Returns
     -------
     torch.Tensor
-        FP32 logits tensor with shape:
+        Logits tensor with shape:
         - ``(seq_len, seq_len_kv)`` if ``max_seqlen_k == 0``
         - ``(seq_len, max_seqlen_k)`` if ``max_seqlen_k > 0``
-        and dtype ``torch.float32``.
+        and dtype ``logits_dtype``.
     """
     kv_fp8, kv_scale = kv
     if max_seqlen_k > 0 and clean_logits:
@@ -940,4 +948,5 @@ def fp8_mqa_logits(
         cu_seq_len_k_end,
         clean_logits,
         int(max_seqlen_k),
+        logits_dtype=logits_dtype,
     )

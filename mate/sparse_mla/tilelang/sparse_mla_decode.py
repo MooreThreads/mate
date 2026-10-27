@@ -66,6 +66,7 @@ def sparse_mla_decode_fwd(
     tile_scheduler_metadata: Optional[torch.Tensor],
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
+    _fused_output=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dispatch sparse decode by compile-time layout variant."""
 
@@ -117,6 +118,7 @@ def sparse_mla_decode_fwd(
             tile_scheduler_metadata=tile_scheduler_metadata,
             num_splits=num_splits,
             metadata_getter=metadata_getter,
+            _fused_output=_fused_output,
         )
 
     raise AssertionError(f"Unsupported sparse decode q.shape[-1]: {head_dim_q}")
@@ -195,11 +197,13 @@ def _sparse_decode_model1(
     tile_scheduler_metadata: Optional[torch.Tensor],
     num_splits: Optional[torch.Tensor],
     metadata_getter: MetadataGetter,
+    _fused_output=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert head_dim_v == 512, "MODEL1 sparse decode only supports head_dim_v == 512"
     assert q.shape[-1] == 512, "MODEL1 sparse decode requires q.shape[-1] == 512"
-    check_model1_k_cache(k_cache)
-    assert dim_bytes == MODEL1_KV_BYTES_PER_TOKEN
+    check_model1_k_cache(k_cache, allow_v41=True)
+    cache_format = "v4" if dim_bytes == 584 else "v41"
+    extra_cache_format = cache_format
 
     indices = normalize_sparse_decode_indices(
         indices, batch_size, seq_len_q, num_heads_k, "indices"
@@ -218,7 +222,17 @@ def _sparse_decode_model1(
         assert extra_indices_in_kvcache is not None, (
             "extra_indices_in_kvcache must be provided with extra_k_cache"
         )
-        check_model1_k_cache(extra_k_cache, "extra_k_cache")
+        check_model1_k_cache(
+            extra_k_cache, "extra_k_cache", allow_v41=True, allow_fp4=True
+        )
+        assert (dim_bytes, extra_k_cache.shape[-1]) in (
+            (584, 584),
+            (528, 528),
+            (528, 288),
+        ), "unsupported main/extra cache format pair"
+        extra_cache_format = (
+            "v41_fp4" if extra_k_cache.shape[-1] == 288 else cache_format
+        )
         assert extra_k_cache.shape[2] == num_heads_k
         extra_indices = normalize_sparse_decode_indices(
             extra_indices_in_kvcache,
@@ -301,4 +315,7 @@ def _sparse_decode_model1(
             extra_k_cache.shape[1] if extra_k_cache is not None else None
         ),
         _cache_strides_prepared=True,
+        cache_format=cache_format,
+        extra_cache_format=extra_cache_format,
+        _fused_output=_fused_output,
     )

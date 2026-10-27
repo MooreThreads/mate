@@ -152,15 +152,18 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if use_qk_l2norm_in_kernel:
-        gdn_l2norm_(q)
-        gdn_l2norm_(k)
+    # Empty inputs must not launch normalization, KKT, or prefill kernels.
+    A = None
+    if k.shape[1] > 0:
+        if use_qk_l2norm_in_kernel:
+            gdn_l2norm_(q)
+            gdn_l2norm_(k)
 
-    A = kkt_solve(
-        k=k,
-        b=beta,
-        cu_seqlens=cu_seqlens,
-    )
+        A = kkt_solve(
+            k=k,
+            b=beta,
+            cu_seqlens=cu_seqlens,
+        )
 
     o, _, final_state = fused_chunk_gdn_prefill(
         q=q,

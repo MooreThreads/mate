@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from mate.execution_context import (
@@ -5,6 +6,7 @@ from mate.execution_context import (
     raise_complete_if_dry_run,
 )
 from mate.kda import gated_delta_rule_decode
+from mate.testing import supported_musa_compute_capability
 
 TEST_SEED = 20262423
 
@@ -80,13 +82,15 @@ def _summarize_diff(name: str, got: torch.Tensor, ref: torch.Tensor):
     rel_diff = abs_diff / torch.clamp(ref_flat.abs(), min=1e-12)
     topk = min(5, rel_diff.numel())
     topk_vals, topk_idx = torch.topk(rel_diff, k=topk)
-    max_idx = int(topk_idx[0].item()) if topk > 0 else -1
 
     print(f"{name} shape: got={tuple(got.shape)} ref={tuple(ref.shape)}")
     print(f"{name} diff summary:")
     if topk > 0:
+        max_abs, max_abs_idx = torch.max(abs_diff, dim=0)
+        max_rel_idx = int(topk_idx[0].item())
         print(
-            f"  max_abs_diff={abs_diff[max_idx].item()} max_rel_diff={topk_vals[0].item()} flat_idx={max_idx} got={got_flat[max_idx].item()} ref={ref_flat[max_idx].item()}"
+            f"  max_abs_diff={max_abs.item()} flat_idx={int(max_abs_idx.item())} "
+            f"max_rel_diff={topk_vals[0].item()} flat_idx={max_rel_idx}"
         )
     print(f"  top-{topk} {name} relative diffs:")
     for rank, (idx, rel_diff_val) in enumerate(
@@ -784,7 +788,7 @@ def test_kda_decode_bf16_state():
             "IS_BETA_HEADWISE": True,
             "IS_CONTINUOUS_BATCHING": False,
             "STORE_FINAL_STATE": True,
-            "STATE_V_FIRST": False,
+            "STATE_V_FIRST": True,  # k-first removed from the kernel
             "T_fixed": 2,
         },
         {
@@ -914,97 +918,37 @@ def test_kda_decode_fp32_varlen_large_batch_config():
     assert final_state.dtype == torch.float32
 
 
-def test_kda_decode_bf16_autotune_configs():
-    from mate.kda_kernels.tilelang.kda_decode import (
-        _resolve_autotuned_kernel_config,
+@supported_musa_compute_capability([31, 32])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 17, 32, 64, 65, 512])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("is_varlen,tokens", [(False, 1), (False, 4), (True, 4)])
+def test_kda_decode_batch_correctness(batch, state_dtype, is_varlen, tokens):
+    case = generate_kda_case(
+        IS_VARLEN=is_varlen,
+        USE_INITIAL_STATE=True,
+        INPLACE_FINAL_STATE=False,
+        IS_BETA_HEADWISE=False,
+        IS_CONTINUOUS_BATCHING=False,
+        STORE_FINAL_STATE=True,
+        STATE_V_FIRST=True,
+        B=batch,
+        T_fixed=tokens,
+        H_qk=1,
+        H_v=1,
+        head_size=128,
+        input_dtype=torch.bfloat16,
+        state_dtype=state_dtype,
+        gate_batch_dtype=torch.float32,
+        output_dtype=torch.float32,
+        device="musa",
     )
-
-    expected_v_first = {
-        1: (16, 8),
-        2: (16, 8),
-        4: (16, 4),
-        8: (16, 2),
-        16: (16, 2),
-        32: (16, 4),
-        64: (16, 4),
-        65: (16, 2),
-        512: (16, 2),
-    }
-    for batch, expected in expected_v_first.items():
-        config = _resolve_autotuned_kernel_config(batch, "bfloat16", True)
-        assert (config["v_tile"], config["num_blocks_per_state"]) == expected
-
-    expected_v_first_fallback = {
-        (1, 64): (8, 8),
-        (4, 32): (8, 4),
-        (64, 32): (8, 4),
-        (512, 64): (8, 2),
-    }
-    for (batch, dim_v), expected in expected_v_first_fallback.items():
-        config = _resolve_autotuned_kernel_config(batch, "bfloat16", True, dim_v)
-        assert (config["v_tile"], config["num_blocks_per_state"]) == expected
-
-    expected_k_first = {
-        2: (8, 8),
-        4: (8, 4),
-        16: (8, 2),
-        64: (8, 4),
-        512: (8, 4),
-    }
-    for batch, expected in expected_k_first.items():
-        config = _resolve_autotuned_kernel_config(batch, "bfloat16", False)
-        assert (config["v_tile"], config["num_blocks_per_state"]) == expected
-
-    expected_fp32 = {
-        2: (8, 8),
-        4: (8, 4),
-        16: (8, 2),
-        17: (4, 4),
-        512: (4, 4),
-    }
-    for batch, expected in expected_fp32.items():
-        config = _resolve_autotuned_kernel_config(batch, "float32", True)
-        assert (config["v_tile"], config["num_blocks_per_state"]) == expected
-
-    expected_fp32_varlen = {
-        16: (8, 2),
-        17: (16, 8),
-        64: (16, 8),
-        512: (16, 8),
-    }
-    for batch, expected in expected_fp32_varlen.items():
-        config = _resolve_autotuned_kernel_config(batch, "float32", True, 128, True)
-        assert (config["v_tile"], config["num_blocks_per_state"]) == expected
-
-    fp32_varlen_fallbacks = (
-        _resolve_autotuned_kernel_config(512, "float32", False, 128, True),
-        _resolve_autotuned_kernel_config(512, "float32", True, 64, True),
+    rtol, atol = (2e-2, 8e-2) if state_dtype == torch.bfloat16 else (1e-2, 1e-2)
+    _, final_state, _, ref_final_state = kda_test_with_reference(
+        case, rtol=rtol, atol=atol
     )
-    for config in fp32_varlen_fallbacks:
-        assert (config["v_tile"], config["num_blocks_per_state"]) == (4, 8)
-
-    expected_bf16_varlen = {
-        16: (16, 2),
-        17: (32, 4),
-        64: (32, 4),
-        512: (32, 4),
-    }
-    for batch, expected in expected_bf16_varlen.items():
-        config = _resolve_autotuned_kernel_config(batch, "bfloat16", True, 128, True)
-        assert (config["v_tile"], config["num_blocks_per_state"]) == expected
-
-    bf16_varlen_fallbacks = (
-        _resolve_autotuned_kernel_config(512, "bfloat16", False, 128, True),
-        _resolve_autotuned_kernel_config(512, "bfloat16", True, 64, True),
-    )
-    assert (
-        bf16_varlen_fallbacks[0]["v_tile"],
-        bf16_varlen_fallbacks[0]["num_blocks_per_state"],
-    ) == (8, 4)
-    assert (
-        bf16_varlen_fallbacks[1]["v_tile"],
-        bf16_varlen_fallbacks[1]["num_blocks_per_state"],
-    ) == (8, 2)
+    assert final_state is not None
+    assert ref_final_state is not None
+    assert final_state.dtype == state_dtype
 
 
 if __name__ == "__main__":

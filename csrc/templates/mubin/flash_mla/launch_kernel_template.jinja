@@ -243,6 +243,7 @@ void run_{{ func_name }}(const std::string&                 object_path,
 
 {{ emit_cache_and_metadata_validation() }}
 
+  TVM_FFI_ICHECK_EQ(nr_heads, 128) << "FlashMLA MUBIN requires 128 query heads";
   check_mp31(q_nope.device(), "run_{{ func_name }}");
   ffi::MUSADeviceGuard device_guard(q_nope.device().device_id);
 
@@ -320,8 +321,8 @@ void run_{{ func_name }}(const std::string&                 object_path,
   auto batch_stride_out = int64_t{0};
   auto seq_stride_out   = out.stride(-3);
   auto head_stride_out  = out.stride(-2);
-  auto batch_stride_lse = seqlen_q * 128;
-  auto seq_stride_lse   = int64_t{128};
+  auto batch_stride_lse = int64_t{0};
+  auto seq_stride_lse   = out_lse.stride(-1);
   auto head_stride_lse  = out_lse.stride(-2);
 {% else %}
   StridedTensorView out_view(out,
@@ -344,7 +345,6 @@ void run_{{ func_name }}(const std::string&                 object_path,
   ffi::Tensor softmax_lse_accum = alloc_tensor(ffi::Shape{total_num_splits, head_out, q_seq_per_hk}, dl_float32, q_nope.device());
   ffi::Tensor out_accum = alloc_tensor(ffi::Shape{total_num_splits, head_out, q_seq_per_hk, headdim_latent}, dl_float32, q_nope.device());
 {% if spec.is_varlen_q %}
-  batch_stride_out = out_accum.stride(0);
   void* p_output                    = out.data_ptr();
   void* p_lse_output                = out_lse.data_ptr();
 {% else %}
@@ -549,6 +549,7 @@ void run_{{ func_name }}(const std::string&                 object_path,
                            &params.tile_v_dim3,
                            &params.tile_v_dim4};
   MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&launch_config, asm_func, kernel_params, nullptr));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 
   mate::flash_mla::MlaCombineParams combine_params{};
   combine_params.is_varlen_q          = {{ "true" if spec.is_varlen_q else "false" }};
@@ -564,13 +565,19 @@ void run_{{ func_name }}(const std::string&                 object_path,
   combine_params.num_splits_ptr       = static_cast<int*>(num_splits.data_ptr());
   combine_params.seqlens_q_ptr        = static_cast<int*>(seqlens_q_ptr);
 {% if spec.is_varlen_q %}
-  combine_params.o_batch_stride       = q_seq_per_hk;
-  combine_params.o_row_stride         = out.stride(1);
-  combine_params.o_head_stride        = 0;
+  combine_params.o_batch_stride       = 0;
+  combine_params.o_row_stride         = out.stride(0);
+  combine_params.o_head_stride        = out.stride(1);
+  combine_params.lse_batch_stride     = 0;
+  combine_params.lse_row_stride       = out_lse.stride(1);
+  combine_params.lse_head_stride      = out_lse.stride(0);
 {% else %}
   combine_params.o_batch_stride       = out_work.stride(0);
   combine_params.o_row_stride         = out_work.stride(1);
   combine_params.o_head_stride        = out_work.stride(2);
+  combine_params.lse_batch_stride     = out_lse_work.stride(0);
+  combine_params.lse_row_stride       = out_lse_work.stride(2);
+  combine_params.lse_head_stride      = out_lse_work.stride(1);
 {% endif %}
   combine_params.max_q_seq_per_hk     = static_cast<int>(q_seq_per_hk);
   combine_params.total_q              = static_cast<int>(total_q);
@@ -580,11 +587,10 @@ void run_{{ func_name }}(const std::string&                 object_path,
   combine_params.num_mp_parts         = static_cast<int>(num_mp_parts);
 
 {% if asm_dtype == "half" %}
-  run_mla_combine_kernel<mutlass::half_t, {{ "true" if spec.is_varlen_q else "false" }}>(combine_params, get_stream(q_nope.device()));
+  run_mla_combine_kernel<mutlass::half_t, {{ "true" if spec.is_varlen_q else "false" }}, 128>(combine_params, get_stream(q_nope.device()));
 {% else %}
-  run_mla_combine_kernel<mutlass::bfloat16_t, {{ "true" if spec.is_varlen_q else "false" }}>(combine_params, get_stream(q_nope.device()));
+  run_mla_combine_kernel<mutlass::bfloat16_t, {{ "true" if spec.is_varlen_q else "false" }}, 128>(combine_params, get_stream(q_nope.device()));
 {% endif %}
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_{{ func_name }}, run_{{ func_name }});

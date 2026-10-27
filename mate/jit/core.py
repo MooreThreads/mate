@@ -6,12 +6,18 @@ import shutil
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence, TypeAlias
 
 import tvm_ffi
 import tvm_ffi.cpp
 from tvm_ffi.utils import FileLock
 
+from .._jit_dependencies import (
+    JitDependencySpec,
+    JitSourceTemplate,
+    ResolvedJitDependencies,
+    resolve_jit_dependencies,
+)
 from . import env as jit_env
 from .cpp_ext import (
     generate_compile_commands_for_op,
@@ -143,6 +149,9 @@ class JitSpecRegistry:
 jit_spec_registry = JitSpecRegistry()
 
 
+GeneratedSource: TypeAlias = str | JitSourceTemplate
+
+
 @dataclasses.dataclass
 class JitSpec:
     name: str
@@ -151,8 +160,32 @@ class JitSpec:
     extra_cuda_cflags: Optional[List[str]] = None
     extra_ldflags: Optional[List[str]] = None
     extra_include_dirs: Optional[List[Path]] = None
-    generated_sources: Dict[Path, str] = dataclasses.field(default_factory=dict)
+    generated_sources: Dict[Path, GeneratedSource] = dataclasses.field(
+        default_factory=dict
+    )
     aot_path: Optional[Path] = None
+
+    def resolve_dependencies(self, repository: Path) -> ResolvedJitDependencies:
+        """Return source dependencies without materializing or compiling the spec."""
+        dependency_inputs = JitDependencySpec(
+            sources=tuple(dict.fromkeys(self.sources)),
+            templates=tuple(
+                dict.fromkeys(
+                    source.template
+                    for source in self.generated_sources.values()
+                    if isinstance(source, JitSourceTemplate)
+                )
+            ),
+            include_dirs=tuple(dict.fromkeys(self.extra_include_dirs or ())),
+        )
+        return resolve_jit_dependencies(
+            dependency_inputs,
+            repository=repository,
+            generated_sources={
+                path: source if isinstance(source, str) else ""
+                for path, source in self.generated_sources.items()
+            },
+        )
 
     @property
     def build_dir(self) -> Path:
@@ -192,7 +225,10 @@ class JitSpec:
         return self.jit_library_path
 
     def materialize_sources(self) -> None:
-        for path, content in self.generated_sources.items():
+        for path, source in self.generated_sources.items():
+            content = (
+                source.render() if isinstance(source, JitSourceTemplate) else source
+            )
             write_if_different(path, content)
 
     def write_ninja(self) -> None:
@@ -254,7 +290,7 @@ def gen_jit_spec(
     extra_cuda_cflags: Optional[List[str]] = None,
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[Sequence[Path | str]] = None,
-    generated_sources: Optional[Mapping[Path | str, str]] = None,
+    generated_sources: Optional[Mapping[Path | str, GeneratedSource]] = None,
     aot_path: Optional[Path | str] = None,
 ) -> JitSpec:
     normalized_sources = [Path(path) for path in sources]

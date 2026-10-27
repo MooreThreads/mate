@@ -4,5 +4,5 @@
 
 #include "mate/attention/flash_mla/mpxx_params.hpp"
 
-template <typename T, bool VarlenQ>
+template <typename T, bool VarlenQ, int HeadRatio = 0>
 void run_mla_combine_kernel(const mate::flash_mla::MlaCombineParams& params, musaStream_t stream);

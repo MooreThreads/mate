@@ -1,5 +1,8 @@
 #pragma once
 
+// M32 decode Stage1.  The public dispatcher selects this path for at most 128
+// source tokens per rank.
+
 #include <mutlass/mutlass.h>
 #include <mutlass/numeric_types.h>
 
@@ -13,12 +16,14 @@
 #include <mute/tensor.hpp>
 #include <mutlass/arch/barrier.hpp>
 #include <mutlass/gemm/collective/collective_builder.hpp>
-#include <mutlass/pipeline/mp31_pipeline.hpp>
 
+#include "mate/attention/fmha/pipeline_ws.hpp"
 #include "mate/gemm/deep_gemm/scaling_accumulation.hpp"
 #include "mate/mega_moe/mega_barrier.hpp"
 #include "mate/mega_moe/mega_moe_layout.hpp"
 #include "mate/mega_moe/mega_moe_sym_buffer.hpp"
+#include "mate/mega_moe/mega_moe_unified_layout.hpp"
+#include "mate/mega_moe/mp31_activation.hpp"
 #include "mate/mega_moe/stage1_scheduler.hpp"
 #include "mate/mega_moe/utils.hpp"
 
@@ -45,60 +50,45 @@ template <uint32_t kNumMaxTokensPerRank,
           uint32_t kNumDispatchWarps  = kNumDispatchThreads / mutlass::NumThreadsPerWarp,
           uint32_t kNumThreads        = kNumDispatchThreads + kNumComputeThreads,
           uint32_t kNumTokensPerWarp  = mutlass::NumThreadsPerWarp / kNumTopk,
-          uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks>
+          uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
+          bool     kUseSitu           = false,
+          bool     kUseSituLinear     = false>
 __global__ __launch_bounds__(kNumThreads,
-                             1) void fp8_fp8_mega_moe_stage1_impl(const uint32_t                     num_tokens,
-                                                                  const layout::SymBuffer<kNumRanks> sym_buffer,
-                                                                  const float* __restrict__ l1_weights_sf,
-                                                                  const float* __restrict__ l1_acts_sf,
-                                                                  mutlass::float_e4m3_t*   l2_acts,
-                                                                  float*                   l2_acts_sf,
-                                                                  const uint64_t           l1_weights_sf_expert_stride,
-                                                                  const uint64_t           l1_weights_sf_n_stride,
-                                                                  const uint64_t           l1_weights_sf_k_stride,
-                                                                  const uint64_t           l1_acts_sf_row_stride,
-                                                                  const uint64_t           l1_acts_sf_k_stride,
-                                                                  const uint64_t           l2_acts_sf_row_stride,
-                                                                  const uint64_t           l2_acts_sf_k_stride,
-                                                                  const MUtensorDescriptor tensor_map_l1_acts,
-                                                                  const MUtensorDescriptor tensor_map_l1_weights) {
+                             1) void mp31_fp8_fp8_mega_moe_stage1_impl(const uint32_t                     num_tokens,
+                                                                       const layout::SymBuffer<kNumRanks> sym_buffer,
+                                                                       const float* __restrict__ l1_weights_sf,
+                                                                       const float* __restrict__ l1_acts_sf,
+                                                                       mutlass::float_e4m3_t* l2_acts,
+                                                                       float*                 l2_acts_sf,
+                                                                       const uint64_t l1_weights_sf_expert_stride,
+                                                                       const uint64_t l1_weights_sf_n_stride,
+                                                                       const uint64_t l1_weights_sf_k_stride,
+                                                                       const uint64_t l1_acts_sf_row_stride,
+                                                                       const uint64_t l1_acts_sf_k_stride,
+                                                                       const uint64_t l2_acts_sf_row_stride,
+                                                                       const uint64_t l2_acts_sf_k_stride,
+                                                                       const MUtensorDescriptor tensor_map_l1_acts,
+                                                                       const MUtensorDescriptor tensor_map_l1_weights,
+                                                                       const float              activation_beta,
+                                                                       const float activation_linear_beta) {
   const uint32_t mp_idx     = blockIdx.x;
   const uint32_t thread_idx = threadIdx.x;
   const uint32_t warp_idx   = mutlass::canonical_warp_idx_sync();
   const uint32_t lane_idx   = mutlass::canonical_lane_idx();
 
-  // Workspaces
-  const auto workspace =
-      layout::Workspace(sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, BLOCK_M);
-
-  // Token and buffer layouts
-  constexpr auto fp8_token_layout              = layout::Data(kHidden);
-  constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-  constexpr auto fp8_sf_layout                 = layout::Data(kHidden / 32, false);
-  constexpr auto fp8_intermediate_sf_layout    = layout::Data(kIntermediateHidden / 32);
-  constexpr auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
-  constexpr auto input_topk_weights_layout     = layout::Data(kNumTopk * sizeof(float), false);
-  constexpr auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
-
-  const auto input_token_buffer = layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
-  const auto input_sf_buffer = layout::Buffer(fp8_sf_layout, 1, kNumMaxTokensPerRank, input_token_buffer.get_end_ptr());
-  const auto input_topk_idx_buffer =
-      layout::Buffer(input_topk_idx_layout, 1, kNumMaxTokensPerRank, input_sf_buffer.get_end_ptr());
-  const auto input_topk_weights_buffer =
-      layout::Buffer(input_topk_weights_layout, 1, kNumMaxTokensPerRank, input_topk_idx_buffer.get_end_ptr());
-
-  // L1 inputs
-  const auto l1_token_buffer =
-      layout::Buffer(fp8_token_layout, 1, kNumMaxPoolTokens, input_topk_weights_buffer.get_end_ptr());
-  const auto l1_sf_buffer = layout::Buffer(fp8_sf_layout, 1, kNumPaddedSFPoolTokens, l1_token_buffer.get_end_ptr());
-  const auto l1_topk_weights_buffer =
-      layout::Buffer(l1_topk_weights_layout, 1, kNumMaxPoolTokens, l1_sf_buffer.get_end_ptr());
-  const auto l1_topk_weights_base = l1_topk_weights_buffer.get_base_ptr<float>();
-
-  const auto l2_token_buffer =
-      layout::Buffer(fp8_intermediate_token_layout, 1, kNumMaxPoolTokens, l1_topk_weights_buffer.get_end_ptr());
-  const auto l2_sf_buffer =
-      layout::Buffer(fp8_intermediate_sf_layout, 1, kNumPaddedSFPoolTokens, l2_token_buffer.get_end_ptr());
+  const auto buffer_layout = unified::BufferLayout(
+      sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kHidden, kIntermediateHidden);
+  const auto workspace                 = buffer_layout.get_decode_workspace();
+  const auto input_token_buffer        = buffer_layout.get_input_token_buffer();
+  const auto input_sf_buffer           = buffer_layout.get_input_sf_buffer();
+  const auto input_topk_idx_buffer     = buffer_layout.get_input_topk_idx_buffer();
+  const auto input_topk_weights_buffer = buffer_layout.get_input_topk_weights_buffer();
+  const auto l1_token_buffer           = buffer_layout.get_decode_l1_token_buffer();
+  const auto l1_sf_buffer              = buffer_layout.get_decode_l1_sf_buffer();
+  const auto l1_topk_weights_buffer    = buffer_layout.get_decode_l1_topk_weights_buffer();
+  const auto l1_topk_weights_base      = l1_topk_weights_buffer.get_base_ptr<float>();
+  const auto l2_token_buffer           = buffer_layout.get_decode_l2_token_buffer();
+  const auto l2_sf_buffer              = buffer_layout.get_decode_l2_sf_buffer();
   // Shared memory
   constexpr uint32_t kSharedMemoryAlignment = 4096;
   extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
@@ -146,7 +136,8 @@ __global__ __launch_bounds__(kNumThreads,
   static_assert(kSwigluColumnGroupsPerTile == 2, "Fused masked mate output expects two SwiGLU column groups");
   static_assert(kOutputColumnsPerTile == 128, "Fused masked mate output scales expect 128 output columns per tile");
 
-  using StrideA       = decltype(make_stride(Int<L1_SHAPE_K>{}, _1{}, Int<kNumMaxPoolTokens * L1_SHAPE_K>{}));
+  using StrideA =
+      decltype(make_stride(Int<L1_SHAPE_K>{}, _1{}, C<static_cast<uint64_t>(kNumMaxPoolTokens) * L1_SHAPE_K>{}));
   using StrideB       = decltype(make_stride(Int<L1_SHAPE_K>{}, _1{}, Int<L1_SHAPE_N * L1_SHAPE_K>{}));
   using CollectiveMma = typename mutlass::gemm::collective::CollectiveBuilder<mutlass::arch::Mp31,
                                                                               mutlass::arch::OpClassTensorOp,
@@ -175,7 +166,7 @@ __global__ __launch_bounds__(kNumThreads,
   constexpr int WarpsPerWarpSquad      = NumThreadsPerWarpSquad / NumThreadsPerWarp;
   constexpr int TotalWarpSquads        = NumLoadWarpSquads + NumMmaWarpSquads;
 
-  using PipelineAB          = mutlass::Mp31PipelineTmeAsync<kNumStages>;
+  using PipelineAB          = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<kNumStages, 2>;
   using PipelineABParams    = typename PipelineAB::Params;
   using PipelineABState     = typename PipelineAB::PipelineState;
   using PipelineSeq         = mutlass::OrderedSequenceBarrier<1, NumMmaWarpSquads>;
@@ -230,7 +221,7 @@ __global__ __launch_bounds__(kNumThreads,
   Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data()), SmemLayoutA{});
   Tensor sB = make_tensor(make_smem_ptr(shared.smem_b.data()), SmemLayoutB{});
 
-  PipelineABState pipe_write = mutlass::make_producer_start_state<PipelineAB>();
+  PipelineABState pipe_write = mutlass::make_producer_start_state_warpspecialized<PipelineAB>();
   PipelineABState pipe_read;
 
   PipelineSeqParams seq_params{};
@@ -764,23 +755,51 @@ __global__ __launch_bounds__(kNumThreads,
           const uint32_t row_for_group    = uint32_t(get<0>(first_coord));
           const uint32_t swiglu_group_idx = uint32_t(get<1>(first_coord)) / kSwigluPairColumns;
           const bool     group_valid      = row_for_group < valid_m;
-          MUTE_UNROLL
-          for (int col_group = 0; col_group < kGateAccumColsPerRow; ++col_group) {
-            const int gate_i = row_group * kAccumColsPerRow + col_group;
-            const int up_i   = gate_i + kPairOffset;
-            if (!group_valid) {
-              continue;
+          if (group_valid) {
+            static_assert(kGateAccumColsPerRow % 4 == 0,
+                          "Burst4 activation requires groups of four accumulator columns");
+            MUTE_UNROLL
+            for (int col_group = 0; col_group < kGateAccumColsPerRow; col_group += 4) {
+              const int gate_i = row_group * kAccumColsPerRow + col_group;
+              float     gate_values[4];
+              float     up_values[4];
+              MUTE_UNROLL
+              for (int i = 0; i < 4; ++i) {
+                gate_values[i] = static_cast<float>(ElementD(rAcc(gate_i + i)));
+                up_values[i]   = static_cast<float>(ElementD(rAcc(gate_i + kPairOffset + i)));
+              }
+              float4 gate = make_float4(gate_values[0], gate_values[1], gate_values[2], gate_values[3]);
+              float4 up   = make_float4(up_values[0], up_values[1], up_values[2], up_values[3]);
+              if constexpr (kUseSitu) {
+                const float4 gate_sigmoid = mp31::activation_sigmoid_bst4(gate);
+                gate                      = mul(__frcp_rn(activation_beta), gate);
+                gate                      = mp31::activation_tanh_bst4(gate);
+                gate                      = mul(activation_beta, gate);
+                gate                      = mul(gate, gate_sigmoid);
+                if constexpr (kUseSituLinear) {
+                  up = mul(activation_linear_beta,
+                           mp31::activation_tanh_bst4(mul(__frcp_rn(activation_linear_beta), up)));
+                }
+              } else {
+                gate   = mul(gate, mp31::activation_sigmoid_bst4(gate));
+                gate.x = static_cast<float>(ElementD(gate.x));
+                gate.y = static_cast<float>(ElementD(gate.y));
+                gate.z = static_cast<float>(ElementD(gate.z));
+                gate.w = static_cast<float>(ElementD(gate.w));
+              }
+              const float4 output     = mul(up, gate);
+              const float  outputs[4] = {
+                  static_cast<float>(ElementD(output.x)),
+                  static_cast<float>(ElementD(output.y)),
+                  static_cast<float>(ElementD(output.z)),
+                  static_cast<float>(ElementD(output.w)),
+              };
+              MUTE_UNROLL
+              for (int i = 0; i < 4; ++i) {
+                rAcc(gate_i + i) = outputs[i];
+                local_amax       = fmaxf(local_amax, fabsf(outputs[i]));
+              }
             }
-
-            const auto  gate_bf16     = ElementD(rAcc(gate_i));
-            const auto  up_bf16       = ElementD(rAcc(up_i));
-            const float gate          = static_cast<float>(gate_bf16);
-            const float up            = static_cast<float>(up_bf16);
-            const float gate_act      = gate / (1.0f + expf(-gate));
-            const float gate_act_bf16 = static_cast<float>(ElementD(gate_act));
-            const float y             = static_cast<float>(ElementD(up * gate_act_bf16));
-            rAcc(gate_i)              = y;
-            local_amax                = fmaxf(local_amax, fabsf(y));
           }
 
           const float reduced_amax = octet_reduce_max(local_amax, lane_idx);

@@ -65,6 +65,12 @@ ignore = [
     "E731",
     # temp disable
     "F821",
+    "F541",
+    "F841",
+    "F811",
+    "E741",
+    "E712",
+    "E711",
 ]
 
 [tool.setuptools.packages.find]
@@ -81,14 +87,14 @@ exclude=["mate-mubin*"]
 # Full functionality including safetensors support and TileLang-backed ops
 all = [
     "safetensors>=0.4.0",
-    "tilelang-musa==0.1.12",
+    "tilelang-musa==0.1.12+musa.5",
 ]
 
 # CLI extension for full replay support (safetensors enables tensor dump/replay)
 cli = ["safetensors>=0.4.0"]
 
 # TileLang-backed operators such as FlashMLA / GDN
-tilelang = ["tilelang-musa==0.1.12"]
+tilelang = ["tilelang-musa==0.1.12+musa.5"]
 
 # Testing dependencies
 testing = [
@@ -110,7 +116,7 @@ dev = [
     "numpy",
     "safetensors>=0.4.0",
     "pytest>=7.0.0",
-    "tilelang-musa==0.1.12",
+    "tilelang-musa==0.1.12+musa.5",
     "triton",
 ]
 

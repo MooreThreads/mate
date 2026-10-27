@@ -182,7 +182,8 @@ template <bool     kIsCompressedLogits,
           class StrideK_,
           class StrideSFK_,
           class StrideW_,
-          class StrideLogits_>
+          class StrideLogits_,
+          class ElementLogits_ = float>
 struct Mp31Fp8NonPagedMqaLogits {
   using Element            = float_e4m3_t;
   using ElementAccumulator = float;
@@ -192,6 +193,8 @@ struct Mp31Fp8NonPagedMqaLogits {
   using StrideSFK    = StrideSFK_;
   using StrideW      = StrideW_;
   using StrideLogits = StrideLogits_;
+
+  using ElementLogits = ElementLogits_;
 
   static constexpr int NumLoadWarpSquads = 1;
   static constexpr int NumMmaWarpSquads  = 4;
@@ -315,8 +318,8 @@ struct Mp31Fp8NonPagedMqaLogits {
     int32_t const* ptr_ks;
     int32_t const* ptr_ke;
 
-    float*       ptr_logits;
-    StrideLogits stride_logits;
+    ElementLogits* ptr_logits;
+    StrideLogits   stride_logits;
 
     int32_t max_seq_kv;
   };
@@ -338,8 +341,8 @@ struct Mp31Fp8NonPagedMqaLogits {
     int32_t const* ptr_ks;
     int32_t const* ptr_ke;
 
-    float*       ptr_logits;
-    StrideLogits stride_logits;
+    ElementLogits* ptr_logits;
+    StrideLogits   stride_logits;
 
     int32_t max_seq_kv;
   };
@@ -720,7 +723,7 @@ struct Mp31Fp8NonPagedMqaLogits {
               accv    = bst4_mul_vv(sc, accv);
               f4 sum4 = warp_group_reduce_sum_f4<reduction_target>(accv);
 
-              float* out_row = params.ptr_logits + q_row * stride_row;
+              ElementLogits* out_row = params.ptr_logits + q_row * stride_row;
 
               const int64_t kv_base = kv_block_base + base_v_offset + static_cast<int64_t>(row_base) * kKVPack;
 
@@ -730,11 +733,11 @@ struct Mp31Fp8NonPagedMqaLogits {
               const float s3 = sum4[3];
 
               if constexpr (!kIsCompressedLogits) {
-                float* p       = out_row + kv_base;
-                p[0]           = s0;
-                p[1 * kKVPack] = s1;
-                p[2 * kKVPack] = s2;
-                p[3 * kKVPack] = s3;
+                ElementLogits* p = out_row + kv_base;
+                p[0]             = static_cast<ElementLogits>(s0);
+                p[1 * kKVPack]   = static_cast<ElementLogits>(s1);
+                p[2 * kKVPack]   = static_cast<ElementLogits>(s2);
+                p[3 * kKVPack]   = static_cast<ElementLogits>(s3);
               } else {
                 const int32_t ks_row  = __ldg(params.ptr_ks + q_row);
                 const int64_t lc_base = kv_base - static_cast<int64_t>(ks_row);
@@ -745,16 +748,16 @@ struct Mp31Fp8NonPagedMqaLogits {
                 const int64_t lc3 = lc_base + 3 * kKVPack;
 
                 if (lc0 >= 0 && lc3 < params.max_seq_kv) {
-                  float* p       = out_row + lc0;
-                  p[0]           = s0;
-                  p[1 * kKVPack] = s1;
-                  p[2 * kKVPack] = s2;
-                  p[3 * kKVPack] = s3;
+                  ElementLogits* p = out_row + lc0;
+                  p[0]             = static_cast<ElementLogits>(s0);
+                  p[1 * kKVPack]   = static_cast<ElementLogits>(s1);
+                  p[2 * kKVPack]   = static_cast<ElementLogits>(s2);
+                  p[3 * kKVPack]   = static_cast<ElementLogits>(s3);
                 } else {
-                  if (lc0 >= 0 && lc0 < params.max_seq_kv) out_row[lc0] = s0;
-                  if (lc1 >= 0 && lc1 < params.max_seq_kv) out_row[lc1] = s1;
-                  if (lc2 >= 0 && lc2 < params.max_seq_kv) out_row[lc2] = s2;
-                  if (lc3 >= 0 && lc3 < params.max_seq_kv) out_row[lc3] = s3;
+                  if (lc0 >= 0 && lc0 < params.max_seq_kv) out_row[lc0] = static_cast<ElementLogits>(s0);
+                  if (lc1 >= 0 && lc1 < params.max_seq_kv) out_row[lc1] = static_cast<ElementLogits>(s1);
+                  if (lc2 >= 0 && lc2 < params.max_seq_kv) out_row[lc2] = static_cast<ElementLogits>(s2);
+                  if (lc3 >= 0 && lc3 < params.max_seq_kv) out_row[lc3] = static_cast<ElementLogits>(s3);
                 }
               }
             }

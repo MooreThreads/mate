@@ -39,6 +39,9 @@ struct MlaCombineParams {
   index_t o_batch_stride;
   index_t o_row_stride;
   index_t o_head_stride;
+  index_t lse_batch_stride;
+  index_t lse_row_stride;
+  index_t lse_head_stride;
 
   int max_q_seq_per_hk;
   int total_q;

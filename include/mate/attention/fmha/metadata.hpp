@@ -4,88 +4,6 @@
 
 #include "fmha.hpp"
 
-template <typename T, typename Compare>
-__device__ __forceinline__ int merge_path_find_i(const T* A, int m, const T* B, int n, int d, Compare comp) {
-  int lo = max(0, d - n);
-  int hi = min(d, m);
-  while (lo < hi) {
-    int i = (lo + hi) >> 1;
-    int j = d - i;
-
-    // Want: A[i-1] not before B[j]  <=> B[j] before A[i-1]
-    bool a_im1_after_bj = false;
-    if (i > 0 && j < n) {
-      // if comp(B[j], A[i-1]) then A[i-1] should be after B[j]
-      a_im1_after_bj = comp(B[j], A[i - 1]);
-    }
-
-    // Want: B[j-1] before A[i]  (strict) to avoid crossing.
-    // If NOT (B[j-1] before A[i]) then we need larger i.
-    bool b_jm1_not_before_ai = false;
-    if (j > 0 && i < m) {
-      b_jm1_not_before_ai = !comp(B[j - 1], A[i]);
-    }
-
-    if (a_im1_after_bj) {
-      hi = i;
-    } else if (b_jm1_not_before_ai) {
-      lo = i + 1;
-    } else {
-      return i;
-    }
-  }
-  return lo;
-}
-
-// Block cooperative merge of two runs in shared memory.
-// Each thread writes a contiguous output segment.
-template <int BLOCK_THREADS, typename T, typename Compare>
-__device__ __forceinline__ void block_merge_two_runs(const T* in,
-                                                     T*       out,
-                                                     int      run0_begin,
-                                                     int      run0_len,
-                                                     int      run1_begin,
-                                                     int      run1_len,
-                                                     int      out_begin,
-                                                     int      out_len,
-                                                     Compare  comp) {
-  int tid = (int)threadIdx.x;
-
-  // Partition output across threads.
-  int chunk = (out_len + BLOCK_THREADS - 1) / BLOCK_THREADS;
-  int o0    = tid * chunk;
-  int o1    = min(out_len, o0 + chunk);
-  if (o0 >= o1) return;
-
-  const T* A = in + run0_begin;
-  const T* B = in + run1_begin;
-  int      m = run0_len, n = run1_len;
-
-  int d0 = o0;
-  int d1 = o1;
-  int i0 = merge_path_find_i(A, m, B, n, d0, comp);
-  int j0 = d0 - i0;
-  int i1 = merge_path_find_i(A, m, B, n, d1, comp);
-  int j1 = d1 - i1;
-
-  int ia = i0, ib = j0;
-  int out_idx = out_begin + o0;
-
-  // Stable merge: if neither is strictly before the other, take from left (A).
-  while (ia < i1 || ib < j1) {
-    bool takeA;
-    if (ib >= j1)
-      takeA = true;
-    else if (ia >= i1)
-      takeA = false;
-    else {
-      // take A unless B should come before A
-      takeA = !comp(B[ib], A[ia]);
-    }
-    out[out_idx++] = takeA ? A[ia++] : B[ib++];
-  }
-}
-
 template <typename T, int BLOCK_THREADS>
 struct BlockMergeSortLike_1Item {
   static constexpr int ITEMS_PER_THREAD = 1;
@@ -101,46 +19,29 @@ struct BlockMergeSortLike_1Item {
   __device__ __forceinline__ explicit BlockMergeSortLike_1Item(TempStorage& s) : temp(s) {
   }
 
+  // Stable rank sort: each lane counts the elements that must precede its own, which is its output index.
   template <typename Compare>
   __device__ __forceinline__ void Sort(T (&items)[1], Compare comp) {
     int tid = (int)threadIdx.x;
 
-    // Write to shared
     temp.buf0[tid] = items[0];
     __syncthreads();
 
-    T* in  = temp.buf0;
-    T* out = temp.buf1;
-
-    // Merge passes: run length doubles
-    MUTLASS_PRAGMA_UNROLL
-    for (int run = 1; run < TILE_ITEMS; run <<= 1) {
-      int pair_len = run << 1;
-
-      // Merge all pairs in this pass
-      MUTLASS_PRAGMA_UNROLL
-      for (int base = 0; base < TILE_ITEMS; base += pair_len) {
-        int len0 = min(run, TILE_ITEMS - base);
-        int len1 = min(run, TILE_ITEMS - (base + run));
-        if (len1 <= 0) {
-          // copy leftover run
-          int chunk = (len0 + BLOCK_THREADS - 1) / BLOCK_THREADS;
-          int o0    = tid * chunk;
-          int o1    = min(len0, o0 + chunk);
-          for (int k = o0; k < o1; ++k) out[base + k] = in[base + k];
-        } else {
-          block_merge_two_runs<BLOCK_THREADS>(in, out, base, len0, base + run, len1, base, len0 + len1, comp);
-        }
-      }
-
-      __syncthreads();
-      T* tmp = in;
-      in     = out;
-      out    = tmp;
-      __syncthreads();
+    T const mine = items[0];
+    int     rank = 0;
+    // Bounded on purpose: TILE_ITEMS reaches 1024, where a full unroll costs far more than it saves.
+#pragma unroll 8
+    for (int j = 0; j < TILE_ITEMS; ++j) {
+      T const other = temp.buf0[j];
+      // Equivalent elements fall back to lane order, which is what keeps the sort stable.
+      bool const before = comp(other, mine) || (!comp(mine, other) && j < tid);
+      rank += before ? 1 : 0;
     }
 
-    items[0] = in[tid];
+    temp.buf1[rank] = mine;
+    __syncthreads();
+
+    items[0] = temp.buf1[tid];
   }
 };
 
@@ -337,8 +238,14 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
     return min(nheads_in_l2, num_head);
   };
 
-  int num_m_blocks = get_num_m_blocks(batch_idx);
-  int num_n_blocks = get_num_n_blocks(batch_idx);
+  int       num_m_blocks = get_num_m_blocks(batch_idx);
+  int       num_n_blocks = get_num_n_blocks(batch_idx);
+  int const m_blocks_static =
+      mutlass::ceil_div(seqlen_q_static * (PackGQA ? qhead_per_khead : 1), blockm_divmod.divisor);
+  int const rows_static = num_batch * num_head * m_blocks_static;
+  int const split_waves =
+      static_cast<int>(std::max<int64_t>(mutlass::ceil_div(1LL * rows_static * num_splits_static, num_mp), 1));
+  int const wave_capacity = num_mp * split_waves;
 
   int num_splits_dynamic;
   if (num_splits_static == 1 || static_cast<int>(gridDim.x) != 1) {
@@ -354,16 +261,11 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
     __syncthreads();
     total_blocks = total_blocks_smem[0];
 
-    int blocks_per_mp =
-        static_cast<int>(ceilf(static_cast<float>(total_blocks) * 1.1f * static_cast<float>(num_head) / num_mp));
+    int blocks_per_mp = std::max(
+        static_cast<int>(ceilf(static_cast<float>(total_blocks) * 1.1f * static_cast<float>(num_head) / wave_capacity)),
+        1);
     // if (threadIdx.x == 0) printf("total_block=%d, blocks_per_mp=%d\n", total_blocks, blocks_per_mp);
     num_splits_dynamic = std::max(std::min(mutlass::ceil_div(num_n_blocks, blocks_per_mp), num_splits_static), 1);
-
-    if (num_m_blocks == 1 && num_batch * num_head <= 3) {
-      // Large number of splits is possible when total workload is small
-      // We decide each split should have at least 4 N blocks, otherwise the combine kernel will be too slow.
-      num_splits_dynamic = clamp_num_splits_for_min_n_blocks(num_n_blocks, num_splits_dynamic, 4);
-    }
 
     int valid_thread = (lane < kNumBatchPerWarp && batch_idx < num_batch) ? 1 : 0;
 
@@ -377,7 +279,7 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
     }
     __syncthreads();
 
-    int overflow = max(total_splits_smem - num_mp, 0);
+    int overflow = max(total_splits_smem - wave_capacity, 0);
     while (overflow > 0) {
       SplitReductionCandidate items[BATCH_PER_THREAD];
       items[0] = {valid_thread ? split_removal_cost(num_n_blocks, num_splits_dynamic) : INT_MAX,
@@ -404,10 +306,6 @@ __global__ void get_metadata_kernel(int                   seqlen_q_static,
 
       if (total_splits_smem == 0) break;
       overflow -= total_splits_smem;
-    }
-    if (num_m_blocks == 1 && num_batch * num_head <= 3) {
-      // ceil_div may produce low-workload splits, so check again.
-      num_splits_dynamic = clamp_num_splits_for_min_n_blocks(num_n_blocks, num_splits_dynamic, 4);
     }
     num_n_blocks = mutlass::ceil_div(num_n_blocks, num_splits_dynamic);
   }
@@ -490,11 +388,6 @@ inline int num_splits_heuristic(int  total_mblocks,
   constexpr float kMinWaveOccupancy = 0.8f;
   constexpr float kEfficiencySlack  = 0.85f;
 
-  // If M blocks can already fill the SMs, SplitKV adds accumulator/combine
-  // overhead without increasing parallelism; do not apply the L2-residency exception.
-  if (total_mblocks >= kMinWaveOccupancy * num_mp) {
-    return 1;
-  }
   // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
   if (num_n_blocks <= 4) {
     return 1;
@@ -562,15 +455,9 @@ inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n, b
     printf("size_one_kv_head: %d, total_mblocks: %d\n", size_one_kv_head, total_mblocks);
   }
 
-  int max_splits             = 128;
-  int min_n_blocks_per_split = 0;
-  if (num_m_blocks == 1 && total_mblocks <= 3) {
-    // Small workload case: when each request has only 1 M block, and the total is no more than 3
-    // the original rule tends to increase splits to fill the GPU.
-    min_n_blocks_per_split    = get_min_n_blocks_per_split(total_mblocks);
-    int const combine_cap     = get_combine_split_cap(num_n_blocks, tile_n, max_splits);
-    int const granularity_cap = std::max(num_n_blocks / min_n_blocks_per_split, 1);
-    max_splits                = std::min(combine_cap, granularity_cap);
+  int max_splits = 128;
+  if (total_mblocks > 0 && 2LL * total_mblocks <= params.num_mp) {
+    max_splits = std::min(max_splits, params.num_mp / total_mblocks);
   }
 
   return num_splits_heuristic(total_mblocks,
@@ -579,8 +466,7 @@ inline int get_num_splits(FmhaFwdParams const& params, int tile_m, int tile_n, b
                               num_m_blocks,
                               size_one_kv_head,
                               params.is_causal || params.is_local,
-                              max_splits,
-                              min_n_blocks_per_split);
+                              max_splits);
 }
 
 }  // namespace mate::attention::fmha

@@ -8,6 +8,86 @@ For runtime, API, and compatibility changes, see
 
 The current docs site history starts at ``0.2.2``.
 
+0.2.8
+-----
+
+**Dense attention**
+
+- Added max-logit output and backward backend selection to
+  :doc:`Attention <api/attention>`, covering the supported forward backends, the
+  MLA metadata restriction, and rank-local behavior under context parallelism.
+- Noted the ``NaN`` limitation for FMHA with head dimensions below 128 and
+  non-contiguous KV padded with ``NaN``/infinity.
+
+**GEMM and MoE GEMM**
+
+- Extended :doc:`Mega MoE <api/mega_moe>` with SiTU activation, the split
+  prefill pipeline, the ``prefill_pool_capacity_ratio`` and
+  ``prefill_l1_ring`` memory modes, and the token-alignment query.
+- Documented BF16 logits output for the DeepGEMM indexer logits helpers in
+  :doc:`GEMM <api/gemm>`.
+
+**Linear attention**
+
+- Added :doc:`KDA <api/kda>` notes for the prepare/recurrence split, the
+  ``chunk_states`` pool, and ``checkpoint_every_n_tokens`` state checkpoints.
+- Updated the :doc:`GDN support matrix <gdn>` for BF16-state decode and MTP.
+
+**Sparse attention**
+
+- Added :doc:`QSA <api/qsa>` coverage for MQA score and sparse Core Attention.
+- Documented the sparse MLA packed KV cache formats (V3.2, V4, V4.1, and the
+  NVFP4 extra cache), the extra-cache inputs, and the ``NaN`` limitation when a
+  cached token contains ``NaN`` in :doc:`Attention <api/attention>`.
+- Extended :doc:`Sparse MLA <api/sparse_mla>` and the
+  :doc:`FlashInfer wrapper <wrappers/flashinfer_wrapper>` with GLM NoPE sparse
+  decode.
+- Documented exact sparse top-k selection in :doc:`MSA <api/msa>`.
+
+**Miscellaneous**
+
+- Documented GLM-5.3-Flash-style 288-expert routing in the
+  :doc:`Python API index <api_reference>`.
+- Added :doc:`Mamba / SSU <api/mamba>` coverage for native
+  ``selective_state_update``, packed variable-length SSD prefill, and kernel
+  prewarm/workspace control, plus the :doc:`FlashInfer wrapper
+  <wrappers/flashinfer_wrapper>` Mamba/SSD adapter surface.
+- Updated the :doc:`installation <install>` baseline to 0.2.8 version
+  references.
+
+**CLI**
+
+- Added the MTCC and TileLang version rows reported by ``mate show-config`` to
+  the :doc:`MATE CLI reference <mate_cli>`.
+
+0.2.7
+-----
+
+- Updated the :doc:`installation and compatibility guidance <install>` for the
+  MUSA SDK 5.2.0 build baseline.
+- Added :doc:`FlashAttention forward support
+  <wrappers/flash_attention_forward_compatibility>` for chunked large head
+  dimensions, including Gemma 512-512 attention.
+- Added :doc:`FlashMLA <api/attention>` metadata support for arbitrary batch
+  sizes, including the additional multi-batch cases covered by the release
+  tests.
+- Added :doc:`KDA <api/kda>` state-pool support.
+- Added :doc:`FlashInfer Norm API reference <api/flashinfer>`.
+- Extended the :doc:`DeepGEMM wrapper <wrappers/deep_gemm_wrapper>` with
+  cuBLASLt-style GEMM, M-grouped and K-grouped FP8 interfaces, scale-layout
+  helpers, and ``disable_ue8m0_cast=True`` compatibility. The wrapper page
+  documents its MUSA-specific behavior and limits.
+- Fixed hangs in affected MUTLASS S4FP8 decode scenarios.
+- Extended the :doc:`SageAttention wrapper
+  <wrappers/sageattention_wrapper>` with dense FP8/FP16 compatibility names
+  and a varlen entry point. The wrapper page documents which arguments are
+  signature-compatible only and which MATE paths execute.
+- Added :doc:`MSA <api/msa>` notes for indexer behavior and short-query
+  metadata handling.
+- Added the :doc:`Glossary <glossary>` page for core MATE terms.
+- Documented the ``MATE_DRY_RUN`` developer and diagnostic option in the
+  :doc:`environment-variable reference <environment_variables>`.
+
 0.2.6
 -----
 

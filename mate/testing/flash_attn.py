@@ -375,7 +375,18 @@ def lse_ref_from_score(
             score, b, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k
         )
 
-        lse_ref = torch.logsumexp(s, dim=-1)
+        # MUSA's reduction over an empty last dimension may return undefined
+        # data instead of the mathematical value -inf.  An empty KV row has
+        # no valid logits, so handle it explicitly before calling logsumexp.
+        if seqlen_k == 0:
+            lse_ref = torch.full(
+                (head_qo, seqlen_q),
+                float("-inf"),
+                device=score.device,
+                dtype=score.dtype,
+            )
+        else:
+            lse_ref = torch.logsumexp(s, dim=-1)
         if learnable_sink is not None:
             lse_ref = torch.logaddexp(lse_ref, learnable_sink)
 

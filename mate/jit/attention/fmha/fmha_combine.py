@@ -1,20 +1,22 @@
 from functools import lru_cache
 import functools
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
+from mate._jit_dependencies import JitSourceTemplate
+
 from ... import env as jit_env
 from ...core import JitSpec, gen_jit_spec
-from ...utils import dtype_torch2mutlass_map, TVM_HEADER, EXPORT_FUNC
+from ...utils import dtype_torch2mutlass_map, TVM_HEADER, EXPORT_FUNC_SOURCE
 from ...configs import KernelConfigGraph, ParamSpec
 from .fmha_utils import (
     FMHA_EXTRA_CUDA_CFLAGS,
     fmha_extra_include_paths,
-    get_fmha_template,
 )
 from ....execution_context import skip_kernel_launch_if_dry_run
+from ....mate_runtime import get_physical_num_mps
 
 
 def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
@@ -39,19 +41,20 @@ def _fmha_fwd_combine_encode(config: Mapping[str, object]) -> str:
         name_list.append(mode)
     if config["has_metadata"]:
         name_list.append("metadata")
+    if config.get("has_max_logits", False):
+        name_list.append("max_logits")
     return "_".join(name_list)
 
 
-def _render_fmha_fwd_combine_source(config: Mapping[str, object]) -> str:
+def _fmha_fwd_combine_render_config(
+    config: Mapping[str, object],
+) -> dict[str, object]:
     render_config = dict(config)
+    render_config.setdefault("has_max_logits", False)
     render_config["func_name"] = str(
         render_config.get("func_name") or _fmha_fwd_combine_encode(render_config)
     )
-    return (
-        TVM_HEADER
-        + get_fmha_template("combine_kern.j2").render(render_config)
-        + EXPORT_FUNC.render(render_config)
-    )
+    return render_config
 
 
 @lru_cache
@@ -140,6 +143,12 @@ specs_select = [
 specs.extend(mode_q)
 specs.extend(specs_select)
 aot_combine_configs = KernelConfigGraph(specs).resolve_and_expand()
+aot_combine_configs += [
+    {**config, "tile_m": tile_m, "tile_n": 32}
+    for config in aot_combine_configs
+    for tile_m in (8, 16)
+    if tile_m == 16 or config["max_splits"] >= 32
+]
 
 
 def get_fmha_fwd_combine_aot_configs(config_level: int) -> list[dict[str, object]]:
@@ -151,10 +160,20 @@ def get_fmha_fwd_combine_aot_configs(config_level: int) -> list[dict[str, object
 def gen_fmha_fwd_combine_spec(config: Mapping[str, object]) -> JitSpec:
     dispatch_name = _fmha_fwd_combine_encode(config)
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    render_config = _fmha_fwd_combine_render_config(config)
     return gen_jit_spec(
         name=dispatch_name,
         sources=[source_file],
-        generated_sources={source_file: _render_fmha_fwd_combine_source(config)},
+        generated_sources={
+            source_file: JitSourceTemplate(
+                template=(
+                    jit_env.MATE_TEMPLATE_DIR / "attention" / "fmha" / "combine_kern.j2"
+                ),
+                context=render_config,
+                prefix=TVM_HEADER,
+                suffix=EXPORT_FUNC_SOURCE,
+            )
+        },
         extra_cuda_cflags=list(FMHA_EXTRA_CUDA_CFLAGS),
         extra_include_paths=fmha_extra_include_paths(),
     )
@@ -181,6 +200,8 @@ def _fmha_fwd_combine(
     max_seqlen_q: Optional[int] = None,
     num_split: int = 0,
     metadata: Optional[torch.Tensor] = None,
+    max_logits: Optional[torch.Tensor] = None,
+    max_logits_accum: Optional[torch.Tensor] = None,
 ) -> None:
     if metadata is None and num_split <= 1:
         return
@@ -195,6 +216,16 @@ def _fmha_fwd_combine(
         assert metadata.shape[0] >= batch_size * 4, "metadata buffer is too small"
 
     tile_m, max_splits = _get_fwd_combine_kernel_config(tile_n, num_split=num_split)
+    if tile_n == 64 and num_split >= 4:
+        batch = cu_seqlens_q.shape[0] - 1 if cu_seqlens_q is not None else out.shape[0]
+        rows = (
+            max_seqlen_q if cu_seqlens_q is not None else out.shape[-3]
+        ) * out.shape[-2]
+        ctas = batch * ((rows + 15) // 16) * ((out.shape[-1] + 63) // 64)
+        num_mps = get_physical_num_mps(out.device)
+        if ctas <= 2 * num_mps:
+            tile_m, tile_n = (8 if 4 * ctas <= 2 * num_mps else 16), 32
+            max_splits = max(max_splits, 256 // tile_m)
     constexpr_dict = {
         "has_cu_seqlens_q": cu_seqlens_q is not None,
         "has_seqused_q": seqused_q is not None,
@@ -204,13 +235,16 @@ def _fmha_fwd_combine(
         "tile_n": tile_n,
         "max_splits": max_splits,
     }
+    if max_logits is not None:
+        assert max_logits_accum is not None
+        constexpr_dict["has_max_logits"] = True
 
     dispatch_name, mod = _fmha_fwd_combine_module(constexpr_dict)
     fmha_fwd_combine_impl = mod.get_function(dispatch_name)
     if skip_kernel_launch_if_dry_run():
         return
 
-    fmha_fwd_combine_impl(
+    ffi_arguments: tuple[Any, ...] = (
         cu_seqlens_q,
         seqused_q,
         max_seqlen_q,
@@ -221,6 +255,9 @@ def _fmha_fwd_combine(
         metadata,
         num_split,
     )
+    if max_logits is not None:
+        ffi_arguments += (max_logits, max_logits_accum)
+    fmha_fwd_combine_impl(*ffi_arguments)
 
 
 def _flash_attn_combine(

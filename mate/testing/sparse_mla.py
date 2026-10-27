@@ -7,8 +7,10 @@ from typing import Literal, Optional
 
 import torch
 
+from mate.execution_context import is_dry_run_enabled
 
-Variant = Literal["v32", "v4"]
+
+Variant = Literal["v32", "v4", "glm53", "v41", "v41_fp4"]
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,8 @@ class SparseMlaCase:
     extra_kv_len: int = 0
     extra_topk: int = 0
     full: bool = False
+    extra_variant: Optional[Variant] = None
+    extra_page_size: Optional[int] = None
 
     @property
     def head_dim(self) -> int:
@@ -164,6 +168,8 @@ def ref_sparse_mla_attention(
     extra_kv: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    q_scale: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference sparse MQA with FlashMLA invalid-row and sink semantics."""
     q = q.float()
@@ -184,6 +190,7 @@ def ref_sparse_mla_attention(
         gathered = source.index_select(0, safe.flatten().long()).reshape(
             rows, -1, head_dim
         )
+        gathered.masked_fill_(invalid.reshape(rows, -1, 1), 0.0)
         return gathered, invalid
 
     gathered, invalid = select(kv, indices, topk_length)
@@ -196,6 +203,8 @@ def ref_sparse_mla_attention(
         invalid = torch.cat((invalid, extra_invalid), dim=-1)
 
     logits = (q @ gathered.transpose(1, 2)) * sm_scale
+    if q_scale is not None:
+        logits *= q_scale
     logits.masked_fill_(invalid.view(rows, 1, -1), float("-inf"))
     all_invalid = invalid.view(rows, -1).all(dim=-1, keepdim=True).expand(rows, heads)
     max_logits = logits.amax(dim=-1)
@@ -208,7 +217,7 @@ def ref_sparse_mla_attention(
     if attn_sink is not None:
         out *= torch.sigmoid(lse - attn_sink.view(1, heads)).unsqueeze(-1)
     out.masked_fill_(all_invalid.unsqueeze(-1), 0.0)
-    return out.to(torch.bfloat16), max_logits.float(), lse.float()
+    return out.to(out_dtype), max_logits.float(), lse.float()
 
 
 def make_prefill_data(
@@ -251,29 +260,80 @@ def _power_of_two_scale(value: torch.Tensor) -> torch.Tensor:
     return torch.pow(2, torch.clamp_min(value, 1e-4).log2().ceil()).float()
 
 
+def _quantize_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Saturating nearest-even E2M1 encoding; even elements occupy low nibbles."""
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    magnitude = torch.nan_to_num(x.abs(), nan=0.0, posinf=6.0).clamp_max(6.0)
+    lo = torch.bucketize(magnitude, midpoints, right=False)
+    hi = torch.bucketize(magnitude, midpoints, right=True)
+    code = torch.where(lo != hi, lo + (lo & 1), lo).to(torch.uint8)
+    return code | (torch.signbit(x).to(torch.uint8) << 3)
+
+
 def quantize_sparse_mla_cache(kv: torch.Tensor, variant: Variant) -> torch.Tensor:
-    """Build the official V3.2 (656-byte) or V4 (584-byte) paged cache."""
+    """Build a model's inline or page-footer cache from canonical BF16 values."""
     blocks, page_size, kv_heads, head_dim = kv.shape
     assert kv_heads == 1
     kv = kv.squeeze(2)
 
-    if variant == "v32":
-        assert head_dim == 576
+    if variant in ("v32", "glm53"):
+        assert head_dim == (576 if variant == "v32" else 512)
+        row_bytes = 656 if variant == "v32" else 528
         cache = torch.empty(
-            (blocks, page_size, 656), dtype=torch.uint8, device=kv.device
+            (blocks, page_size, row_bytes), dtype=torch.uint8, device=kv.device
         )
         nope = cache[..., :512].view(torch.float8_e4m3fn)
         scales = cache[..., 512:528].view(torch.float32)
-        rope = cache[..., 528:].view(torch.bfloat16)
-        rope.copy_(kv[..., 512:])
+        if variant == "v32":
+            cache[..., 528:].view(torch.bfloat16).copy_(kv[..., 512:])
         for tile in range(4):
             source = kv[..., tile * 128 : (tile + 1) * 128].float()
-            scale = _power_of_two_scale(source.abs().amax(dim=-1) / 448.0)
+            amax = source.abs().amax(dim=-1) / 448.0
+            scale = (
+                amax.clamp_min(1e-4)
+                if variant == "glm53"
+                else _power_of_two_scale(amax)
+            )
             scales[..., tile] = scale
             nope[..., tile * 128 : (tile + 1) * 128] = (
                 source / scale.unsqueeze(-1)
             ).to(torch.float8_e4m3fn)
-        return cache.view(blocks, page_size, 1, 656)
+        return cache.view(blocks, page_size, 1, row_bytes)
+
+    if variant in ("v41", "v41_fp4"):
+        assert head_dim == 512
+        fp4 = variant == "v41_fp4"
+        data_bytes, groups, width = (256, 32, 16) if fp4 else (512, 16, 32)
+        row_bytes = data_bytes + groups
+        page_bytes = page_size * row_bytes
+        storage = torch.empty(
+            (blocks, (page_bytes + 511) // 512 * 512),
+            dtype=torch.uint8,
+            device=kv.device,
+        )
+        cache = storage[:, :page_bytes]
+        data = cache[:, : page_size * data_bytes].view(blocks, page_size, data_bytes)
+        sf = cache[:, page_size * data_bytes :].view(blocks, page_size, groups)
+        x = kv.float().reshape(blocks, page_size, groups, width)
+        if fp4:
+            amax = torch.nan_to_num(x.abs(), nan=float("inf")).amax(dim=-1)
+            scale = (amax / 6.0).clamp(2.0**-9, 448.0).to(torch.float8_e4m3fn).float()
+            scale.masked_fill_(torch.isinf(amax), float("nan"))
+            sf.copy_(scale.to(torch.float8_e4m3fn).view(torch.uint8))
+            codes = _quantize_e2m1(x / scale.unsqueeze(-1)).reshape(
+                blocks, page_size, 512
+            )
+            data.copy_(codes[..., 0::2] | (codes[..., 1::2] << 4))
+        else:
+            scale = _power_of_two_scale(x.abs().amax(dim=-1) / 448.0)
+            sf.copy_((scale.log2().to(torch.int32) + 127).to(torch.uint8))
+            data.copy_(
+                (x / scale.unsqueeze(-1))
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+                .reshape(blocks, page_size, 512)
+            )
+        return cache.view(blocks, page_size, 1, row_bytes)
 
     assert variant == "v4" and head_dim == 512
     bytes_per_token = 584
@@ -308,16 +368,43 @@ def dequantize_sparse_mla_cache(cache: torch.Tensor, variant: Variant) -> torch.
         (blocks, page_size, result_dim), dtype=torch.bfloat16, device=cache.device
     )
 
-    if variant == "v32":
-        assert bytes_per_token == 656
+    if variant in ("v32", "glm53"):
+        assert bytes_per_token in ((656,) if variant == "v32" else (528, 656))
         cache = cache.view(blocks, page_size, bytes_per_token)
         nope = cache[..., :512].view(torch.float8_e4m3fn)
         scales = cache[..., 512:528].view(torch.float32)
-        result[..., 512:] = cache[..., 528:].view(torch.bfloat16)
+        if variant == "v32":
+            result[..., 512:] = cache[..., 528:].view(torch.bfloat16)
         for tile in range(4):
             result[..., tile * 128 : (tile + 1) * 128] = nope[
                 ..., tile * 128 : (tile + 1) * 128
             ].float() * scales[..., tile].unsqueeze(-1)
+    elif variant in ("v41", "v41_fp4"):
+        fp4 = variant == "v41_fp4"
+        data_bytes, groups, width = (256, 32, 16) if fp4 else (512, 16, 32)
+        assert bytes_per_token == data_bytes + groups
+        flat = cache.view(torch.uint8).view(blocks, -1)
+        data = flat[:, : page_size * data_bytes].reshape(blocks, page_size, data_bytes)
+        sf = flat[:, page_size * data_bytes :].reshape(blocks, page_size, groups)
+        if fp4:
+            codes = torch.stack((data & 15, data >> 4), dim=-1).reshape(
+                blocks, page_size, 512
+            )
+            magnitude = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=cache.device)
+            values = magnitude[(codes & 7).long()] * torch.where(
+                (codes & 8) != 0, -1, 1
+            )
+            scales = sf.view(torch.float8_e4m3fn).float()
+        else:
+            values = data.view(torch.float8_e4m3fn).float()
+            scales = (sf.to(torch.int32) << 23).view(torch.float32)
+            scales = torch.where(sf == 0, torch.full_like(scales, 2.0**-127), scales)
+            scales.masked_fill_(sf == 255, float("nan"))
+        result.copy_(
+            (
+                values.reshape(blocks, page_size, groups, width) * scales.unsqueeze(-1)
+            ).reshape(blocks, page_size, 512)
+        )
     else:
         assert variant == "v4" and bytes_per_token == 584
         flat = cache.view(blocks, -1)
@@ -338,7 +425,10 @@ def dequantize_sparse_mla_cache(cache: torch.Tensor, variant: Variant) -> torch.
 
 
 def make_decode_data(
-    case: SparseMlaCase, device: torch.device | str = "musa"
+    case: SparseMlaCase,
+    device: torch.device | str = "musa",
+    *,
+    softmax_scale: Optional[float] = None,
 ) -> DecodeData:
     _seed(
         case.batch,
@@ -392,11 +482,12 @@ def make_decode_data(
 
     extra_k_cache = extra_indices = extra_topk_length = extra_dequantized = None
     if case.extra_topk:
-        extra_pages = (case.extra_kv_len + case.page_size - 1) // case.page_size
+        extra_page_size = case.extra_page_size or case.page_size
+        extra_pages = (case.extra_kv_len + extra_page_size - 1) // extra_page_size
         extra_kv = (
             torch.randn(
                 extra_pages,
-                case.page_size,
+                extra_page_size,
                 1,
                 case.head_dim,
                 dtype=torch.bfloat16,
@@ -417,9 +508,11 @@ def make_decode_data(
             device,
             invalid_rows=case.invalid_rows,
         )
-        extra_k_cache = quantize_sparse_mla_cache(extra_kv, case.variant)
+        extra_k_cache = quantize_sparse_mla_cache(
+            extra_kv, case.extra_variant or case.variant
+        )
         extra_dequantized = dequantize_sparse_mla_cache(
-            extra_k_cache, case.variant
+            extra_k_cache, case.extra_variant or case.variant
         ).view(-1, 1, case.head_dim)
 
     row_lengths = (
@@ -434,7 +527,7 @@ def make_decode_data(
         q.view(-1, case.heads, case.head_dim),
         dequantized,
         indices.view(-1, 1, case.topk),
-        sm_scale=case.head_dim**-0.5,
+        sm_scale=case.head_dim**-0.5 if softmax_scale is None else softmax_scale,
         topk_length=row_lengths,
         attn_sink=attn_sink,
         extra_kv=extra_dequantized,
@@ -567,19 +660,24 @@ def make_fp8_decode_data(
         dtype=torch.float32,
         device=device,
     )
-    flat_kv_float = flat_kv.float()
-    for batch_index, active in enumerate(seq_lens.cpu().tolist()):
-        for query_index in range(case.q_len):
-            selected = indices[batch_index, query_index, :active]
-            selected = selected[(selected >= 0) & (selected < storage_tokens)].long()
-            if not selected.numel():
-                continue
-            selected_kv = flat_kv_float.index_select(0, selected)
-            scores = query[batch_index, query_index].float() @ selected_kv.T * 0.0625
-            ref_out[batch_index, query_index] = (
-                torch.softmax(scores, dim=-1) @ selected_kv[:, :512]
-            ).to(torch.bfloat16)
-            ref_lse[batch_index, query_index] = torch.logsumexp(scores, dim=-1)
+    if not is_dry_run_enabled():
+        flat_kv_float = flat_kv.float()
+        for batch_index, active in enumerate(seq_lens.cpu().tolist()):
+            for query_index in range(case.q_len):
+                selected = indices[batch_index, query_index, :active]
+                selected = selected[
+                    (selected >= 0) & (selected < storage_tokens)
+                ].long()
+                if not selected.numel():
+                    continue
+                selected_kv = flat_kv_float.index_select(0, selected)
+                scores = (
+                    query[batch_index, query_index].float() @ selected_kv.T * 0.0625
+                )
+                ref_out[batch_index, query_index] = (
+                    torch.softmax(scores, dim=-1) @ selected_kv[:, :512]
+                ).to(torch.bfloat16)
+                ref_lse[batch_index, query_index] = torch.logsumexp(scores, dim=-1)
     return Fp8DecodeData(query, kv_cache, indices, seq_lens, ref_out, ref_lse)
 
 
@@ -627,3 +725,49 @@ def assert_sparse_mla_close(
         torch.testing.assert_close(
             max_logits.float(), ref_max_logits.float(), rtol=0.002, atol=0.02
         )
+
+
+def fused_mla_prepare_q_reference(q, positions, cos_sin, enable_norm, eps):
+    """Stepwise Q permutation, optional RMS norm and interleaved RoPE.
+
+    Used as the unfused runtime comparison; the attention tests independently
+    check the upstream convention of applying RMS scale to QK logits.
+    """
+    rows, heads, dim = q.shape
+    x = q.reshape(rows, dim // 16, heads, 16).transpose(1, 2).reshape_as(q).float()
+    inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) if enable_norm else 1.0
+    cosine = cos_sin[positions.long(), :32].unsqueeze(1)
+    sine = cos_sin[positions.long(), 32:].unsqueeze(1)
+    even, odd = x[..., 448::2].clone(), x[..., 449::2].clone()
+    x[..., 448::2] = even * cosine - odd * sine
+    x[..., 449::2] = even * sine + odd * cosine
+    return (x * inv).to(torch.bfloat16)
+
+
+def fused_mla_finish_o_reference(out, positions, cos_sin, groups):
+    """Stepwise inverse RoPE, Wv layout, group-32 FP8 and packed scale cast."""
+    rows, heads, dim = out.shape
+    x = out.float()
+    cosine = cos_sin[positions.long(), :32].unsqueeze(1)
+    sine = cos_sin[positions.long(), 32:].unsqueeze(1)
+    even, odd = x[..., 448::2].clone(), x[..., 449::2].clone()
+    x[..., 448::2] = even * cosine + odd * sine
+    x[..., 449::2] = odd * cosine - even * sine
+    x = x.reshape(rows, groups, heads // groups, 16, 32).transpose(2, 3)
+    x = x.reshape(rows, groups, -1, 32)
+    scales = torch.exp2(
+        torch.ceil(torch.log2(x.abs().amax(-1).clamp_min(1e-4).div(448)))
+    )
+    quant = (x / scales[..., None]).to(torch.float8_e4m3fn).reshape(rows, groups, -1)
+    exponents = (scales.view(torch.int32) >> 23) & 255
+    shifts = torch.arange(4, dtype=torch.int32, device=out.device) * 8
+    packed = (exponents.reshape(rows, groups, -1, 4) << shifts).sum(-1).to(torch.int32)
+    padded_rows = (rows + 3) // 4 * 4
+    sf = torch.empty_strided(
+        packed.shape,
+        (1, padded_rows * packed.shape[-1], padded_rows),
+        dtype=torch.int32,
+        device=out.device,
+    )
+    sf.copy_(packed)
+    return quant, sf

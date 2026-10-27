@@ -42,7 +42,7 @@ struct MsaMaxScoreMetadataKernel {
     const int     work_per_batch    = q_tiles * num_kv_heads;
     const int     batch_idx         = q_work_idx / work_per_batch;
     const int     rem               = q_work_idx - batch_idx * work_per_batch;
-    const int     q_tile_idx        = rem / num_kv_heads;
+    const int     q_tile_idx        = rem % q_tiles;
     const int     q_len             = IsVarlen ? cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx] : max_seqlen_q;
     const int     kv_len            = IsVarlen ? cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx] : max_seqlen_k;
     const int     q_local_begin     = q_tile_idx * q_tokens_per_tile;

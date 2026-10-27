@@ -25,11 +25,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from mate.flash_attention.tilelang.flash_attention_varlen_bwd import (  # noqa: E402
     _select_bwd_plan,
+    _select_kernel_dim,
+)
+from mate.flash_attention.backward import (  # noqa: E402
     flashattn_varlen_bwd_interface,
 )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class InterfaceCase:
     batch: int
     heads: int
@@ -37,9 +40,15 @@ class InterfaceCase:
     total_seq_q: int
     total_seq_kv: int
     dim: int
+    v_dim: int = 0
     dtype: torch.dtype
     causal: bool
     deterministic: bool
+
+    def __post_init__(self):
+        # V head dim defaults to the QK head dim (symmetric heads).
+        if self.v_dim == 0:
+            object.__setattr__(self, "v_dim", self.dim)
 
     @property
     def max_seq_q(self) -> int:
@@ -51,7 +60,11 @@ class InterfaceCase:
 
     @property
     def plan(self) -> str:
-        return _select_bwd_plan(self.dim, self.deterministic)
+        # Mirror the runtime kernel_dim selection: head dims map to a compile
+        # dim (192 -> 256), which _select_bwd_plan consumes. This avoids passing
+        # a raw 192 that _select_bwd_plan does not accept.
+        kernel_dim = max(_select_kernel_dim(self.dim), _select_kernel_dim(self.v_dim))
+        return _select_bwd_plan(kernel_dim, self.deterministic)
 
     @property
     def uses_separate_kernels(self) -> bool:
@@ -61,32 +74,42 @@ class InterfaceCase:
     def term_scale(self) -> int:
         return 1 if self.causal else 2
 
-    def flops_for_terms(self, terms: int) -> float:
-        return (
+    def flops_for_terms(self, terms_qk: int, terms_v: int) -> float:
+        """GEMM FLOPs for bwd with separate QK and V head dims.
+
+        bwd logical gemms: S=QK^T (qk), dp=dO.V^T (v), dQ=dS.K (qk),
+        dK=dS^T.Q (qk), dV=P^T.dO (v) -> 3 qk + 2 v.
+        """
+        base = (
             self.total_seq_q
             * self.total_seq_kv
             / self.batch
             * self.heads
-            * terms
             * self.term_scale
-            * self.dim
         )
+        return base * (terms_qk * self.dim + terms_v * self.v_dim)
 
     @property
     def dkdv_flops(self) -> float:
-        return self.flops_for_terms(4)
+        # split-dkdv kernel: dK (qk) x2 + dV (v) x2 head-dim splits.
+        return self.flops_for_terms(2, 2)
 
     @property
     def dq_flops(self) -> float:
-        return self.flops_for_terms(3)
+        # split-dq kernel: dQ (qk) x2 + dp (v) x1.
+        return self.flops_for_terms(2, 1)
 
     @property
     def actual_flops(self) -> float:
-        return self.flops_for_terms(7 if self.uses_separate_kernels else 5)
+        # unified: 5 gemms (3 qk + 2 v); split/separate: 7 (4 qk + 3 v)
+        # because S and dp are recomputed in each of dkdv/dq kernels.
+        if self.uses_separate_kernels:
+            return self.flops_for_terms(4, 3)
+        return self.flops_for_terms(3, 2)
 
     @property
     def logical_flops(self) -> float:
-        return self.flops_for_terms(5)
+        return self.flops_for_terms(3, 2)
 
 
 def _sync() -> None:
@@ -214,8 +237,8 @@ def _load_shape_list(path: Path) -> list[InterfaceCase]:
     deterministic_values = _shape_axis(payload, "deterministic", bool)
     if any(sequence <= 0 or sequence % batch for sequence in sequences):
         raise ValueError("shape list sequences must be positive and divisible by batch")
-    if any(dim not in (128, 256) for dim in dims):
-        raise ValueError("shape list supports only D128 and D256")
+    if any(dim not in (128, 192, 256) for dim in dims):
+        raise ValueError("shape list supports only D128, D192, and D256")
     dtypes = [_dtype_from_name(name) for name in dtype_names]
 
     # Sequence is innermost so each compiled signature is reused for all lengths.
@@ -227,6 +250,8 @@ def _load_shape_list(path: Path) -> list[InterfaceCase]:
             total_seq_q=sequence,
             total_seq_kv=sequence,
             dim=dim,
+            # Asymmetric MLA-style heads: QK=192 pairs with V=128.
+            v_dim=128 if dim == 192 else 0,
             dtype=dtype,
             causal=causal,
             deterministic=deterministic,
@@ -274,17 +299,31 @@ def _make_perf_inputs(case: InterfaceCase, device: str, *, synthetic: bool):
     ).contiguous()
     v = (
         torch.randn(
-            (case.total_seq_kv, case.heads_kv, case.dim),
+            (case.total_seq_kv, case.heads_kv, case.v_dim),
             device=device,
             dtype=case.dtype,
         )
         / 10
     ).contiguous()
-    dout = (torch.randn_like(q) / 10).contiguous()
+    dout = (
+        torch.randn(
+            (case.total_seq_q, case.heads, case.v_dim),
+            device=device,
+            dtype=case.dtype,
+        )
+        / 10
+    ).contiguous()
     cu_q = _make_cu_seqlens(case.total_seq_q, case.batch, device)
     cu_k = _make_cu_seqlens(case.total_seq_kv, case.batch, device)
     if synthetic:
-        out = (torch.randn_like(q) / 10).contiguous()
+        out = (
+            torch.randn(
+                (case.total_seq_q, case.heads, case.v_dim),
+                device=device,
+                dtype=case.dtype,
+            )
+            / 10
+        ).contiguous()
         softmax_lse = torch.zeros(
             (case.heads, case.total_seq_q),
             device=device,
@@ -309,7 +348,10 @@ def _ref_flashattn_fwd(
     heads_kv = k.shape[1]
     head_groups = heads_q // heads_kv
     scale = dim**-0.5
-    out = torch.zeros_like(q, dtype=torch.float32)
+    v_dim = v.shape[-1]
+    out = torch.zeros(
+        (q.shape[0], heads_q, v_dim), dtype=torch.float32, device=q.device
+    )
     lse_out = torch.zeros((q.shape[0], heads_q), dtype=torch.float32, device=q.device)
 
     for batch_idx in range(cu_q.numel() - 1):
@@ -384,7 +426,7 @@ def _ref_flashattn_bwd(
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
-def _call_interface(case: InterfaceCase, inputs):
+def _call_interface(case: InterfaceCase, inputs, backend: str = "auto"):
     q, k, v, out, dout, softmax_lse, cu_q, cu_k = inputs
     return flashattn_varlen_bwd_interface(
         q,
@@ -402,6 +444,7 @@ def _call_interface(case: InterfaceCase, inputs):
         dtype=None,
         is_bhsd=False,
         deterministic=case.deterministic,
+        backend=backend,
     )
 
 
@@ -501,7 +544,7 @@ def _tflops(flops: float, us: float) -> float:
     return flops / (us * 1e-6) / 1e12
 
 
-def _validate_correctness(case: InterfaceCase) -> None:
+def _validate_correctness(case: InterfaceCase, backend: str = "auto") -> None:
     head_groups = case.heads // case.heads_kv
     check_case = dataclasses.replace(
         case,
@@ -513,7 +556,7 @@ def _validate_correctness(case: InterfaceCase) -> None:
         dtype=torch.bfloat16,
     )
     inputs = _make_perf_inputs(check_case, "musa", synthetic=False)
-    dq, dk, dv = _call_interface(check_case, inputs)
+    dq, dk, dv = _call_interface(check_case, inputs, backend=backend)
     q, k, v, _out, dout, softmax_lse, cu_q, cu_k = inputs
     ref_dq, ref_dk, ref_dv = _ref_flashattn_bwd(
         q,
@@ -545,6 +588,7 @@ def _print_case_header(case: InterfaceCase, *, synthetic: bool) -> None:
         "[bench] "
         f"batch={case.batch} heads={case.heads} heads_kv={case.heads_kv} "
         f"seq_q={case.total_seq_q} seq_kv={case.total_seq_kv} dim={case.dim} "
+        f"v_dim={case.v_dim} "
         f"dtype={case.dtype} causal={case.causal} deterministic={case.deterministic} "
         f"plan={case.plan} synthetic_inputs={synthetic}"
     )
@@ -552,10 +596,10 @@ def _print_case_header(case: InterfaceCase, *, synthetic: bool) -> None:
 
 def _run_case(args: argparse.Namespace, case: InterfaceCase) -> None:
     if args.check_correctness:
-        _validate_correctness(case)
+        _validate_correctness(case, backend=args.backend)
 
     inputs = _make_perf_inputs(case, "musa", synthetic=args.synthetic_inputs)
-    fn = lambda: _call_interface(case, inputs)
+    fn = lambda: _call_interface(case, inputs, backend=args.backend)
     fn()
     _sync()
     _print_case_header(case, synthetic=args.synthetic_inputs)
@@ -625,6 +669,7 @@ def _variant_to_case(args: argparse.Namespace, variant: str) -> InterfaceCase:
         total_seq_q=args.total_seq_q,
         total_seq_kv=args.total_seq_kv,
         dim=dim,
+        v_dim=args.v_dim,
         dtype=_dtype_from_name(args.dtype),
         causal=args.causal,
         deterministic=deterministic,
@@ -641,7 +686,7 @@ def _compile_branch_cases(args: argparse.Namespace) -> list[InterfaceCase]:
     for dtype_name in ("bf16", "fp16"):
         for causal in (True, False):
             for heads_kv in (args.heads, gqa_heads_kv):
-                for dim in (128, 256):
+                for dim in (128, 192, 256):
                     for deterministic in (False, True):
                         cases.append(
                             InterfaceCase(
@@ -651,6 +696,7 @@ def _compile_branch_cases(args: argparse.Namespace) -> list[InterfaceCase]:
                                 total_seq_q=args.total_seq_q,
                                 total_seq_kv=args.total_seq_kv,
                                 dim=dim,
+                                v_dim=128 if dim == 192 else 0,
                                 dtype=_dtype_from_name(dtype_name),
                                 causal=causal,
                                 deterministic=deterministic,
@@ -669,9 +715,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dim",
         type=int,
-        choices=[128, 256],
+        choices=[128, 192, 256],
         default=None,
         help="Override the head dim selected by --variant. Defaults to 128 for auto, 256 for split variants, and 128 for unsplit variants.",
+    )
+    parser.add_argument(
+        "--v-dim",
+        type=int,
+        choices=[128, 256],
+        default=0,
+        help="V head dim (defaults to the QK head dim). Use 128 with --dim 192 for asymmetric MLA-style heads.",
     )
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument(
@@ -679,6 +732,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--deterministic", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "mubin", "tilelang"],
+        default="auto",
+        help="Backward backend: auto (default), mubin (ASM), or tilelang.",
     )
     parser.add_argument(
         "--variant",

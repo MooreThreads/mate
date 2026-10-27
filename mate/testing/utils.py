@@ -13,6 +13,30 @@ from mate.utils import ceil_div
 from typing import Optional, Literal
 
 
+def sliced_tensor(tensor, step=2, *, feature_step=False):
+    """Return an offset, strided tensor view and its sentinel-filled storage."""
+    metadata = not tensor.is_floating_point() or tensor.ndim < 2
+    factors = [step] * tensor.ndim
+    if not metadata and not feature_step:
+        factors[-1] = 1
+    starts = [1] * tensor.ndim
+    if not metadata:
+        starts[-1] = 8
+    shape = tuple(
+        size * factor + start + 16
+        for size, factor, start in zip(tensor.shape, factors, starts)
+    )
+    storage = torch.full(shape, 97, dtype=tensor.dtype, device=tensor.device)
+    view = storage[
+        tuple(
+            slice(start, start + size * factor, factor)
+            for size, factor, start in zip(tensor.shape, factors, starts)
+        )
+    ]
+    view.copy_(tensor)
+    return view, storage
+
+
 def align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 

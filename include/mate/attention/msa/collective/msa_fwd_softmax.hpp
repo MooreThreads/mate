@@ -71,12 +71,14 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
       if constexpr (!IsFirst) {
         this->row_max(i) = max(row_max_prev(i), this->row_max(i));
       }
+      bool    is_all_masked = false;
+      Element max_scaled    = this->row_max(i);
       if constexpr (CheckInf) {
-        this->row_max(i) =
-            this->row_max(i) == -std::numeric_limits<Element>::infinity() ? Element{0} : this->row_max(i);
+        is_all_masked = this->row_max(i) == -std::numeric_limits<Element>::infinity();
+        max_scaled    = is_all_masked ? Element{0} : this->row_max(i);
       }
 
-      Element scale_max = this->row_max(i) * this->sm_scale_log2;
+      Element scale_max = max_scaled * this->sm_scale_log2;
       MUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < size<1>(acc_qk_mn); j += 4) {
         float4 values = make_float4(acc_qk_mn(i, j) * this->sm_scale_log2 - scale_max + MaxOffset,
@@ -91,8 +93,9 @@ struct MsaFwdSoftmax : ::mate::attention::fmha::Softmax<Rows, false, MaxOffset> 
       }
 
       if constexpr (!IsFirst) {
-        correction_scales(i) = exp2f((row_max_prev(i) - this->row_max(i)) * this->sm_scale_log2);
-        this->row_sum(i)     = correction_scales(i) * this->row_sum(i);
+        correction_scales(i) =
+            is_all_masked ? Element{1.f} : exp2f((row_max_prev(i) - this->row_max(i)) * this->sm_scale_log2);
+        this->row_sum(i) = correction_scales(i) * this->row_sum(i);
       }
 
       float4 row_sum_cur;

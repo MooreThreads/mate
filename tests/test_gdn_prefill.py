@@ -133,7 +133,11 @@ def _to_kernel_gate_space(g: torch.Tensor, is_log_space: bool) -> torch.Tensor:
 
 
 def _safe_exp(x: torch.Tensor) -> torch.Tensor:
-    return torch.exp(torch.where(x <= 0, x, torch.full_like(x, -float("inf"))))
+    # Causality is masked by token order. Rounded-positive differences mean
+    # no decay, while NaN and infinities from padding remain masked.
+    return torch.exp(
+        torch.where(x <= 0, x, torch.where(x < 1.0, torch.zeros_like(x), -float("inf")))
+    )
 
 
 def _inverse_from_neg_strict_lower(p: torch.Tensor) -> torch.Tensor:
@@ -289,6 +293,8 @@ def _test_prefill_kernel(
     seed: int,
     is_log_space: bool = True,
     use_zero_alpha: bool = False,
+    unit_alpha_stride: int = 0,
+    gate_scale: float = 1.0,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> None:
     device = _get_runtime_device()
@@ -307,8 +313,12 @@ def _test_prefill_kernel(
         normalize_k=not use_qk_l2norm_in_kernel,
     )
     g, beta = gen_gates(sum(seq_lens), num_v_heads, device)
+    if gate_scale != 1.0:
+        g.pow_(gate_scale)
     if use_zero_alpha:
         g[7::17, :] = 0.0
+    if unit_alpha_stride:
+        g[::unit_alpha_stride, :] = 1.0
     initial_state = 0.05 * torch.randn(
         len(seq_lens),
         num_v_heads,
@@ -503,6 +513,14 @@ CHUNKED_PREFILL_CASES = [
 ]
 
 
+ZERO_LOG_GATE_CASES = [
+    pytest.param([256], 1, 1, False, 1, 10, id="full-256-all"),
+    pytest.param([256], 1, 2, False, 5, 11, id="gva-256-every5"),
+    pytest.param([100, 37, 300], 1, 1, True, 1, 12, id="varlen-all"),
+    pytest.param([100, 37, 300], 2, 2, True, 5, 13, id="varlen-every5-h2"),
+]
+
+
 # @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("dtype_name", ["float16"])
 @pytest.mark.parametrize(
@@ -552,6 +570,54 @@ def test_gdn_prefill_alpha_space_matches_reference() -> None:
         varlen=False,
         seed=seed,
         is_log_space=False,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "seq_lens",
+        "num_qk_heads",
+        "num_v_heads",
+        "varlen",
+        "unit_alpha_stride",
+        "seed_offset",
+    ),
+    ZERO_LOG_GATE_CASES,
+)
+def test_gdn_prefill_zero_log_gate_matches_reference(
+    seq_lens: list[int],
+    num_qk_heads: int,
+    num_v_heads: int,
+    varlen: bool,
+    unit_alpha_stride: int,
+    seed_offset: int,
+) -> None:
+    _test_prefill_kernel(
+        dtype_name="float16",
+        num_qk_heads=num_qk_heads,
+        num_v_heads=num_v_heads,
+        seq_lens=seq_lens,
+        scale=1.0,
+        use_initial_state=True,
+        varlen=varlen,
+        seed=int(os.environ.get("SEED", "0")) + seed_offset,
+        unit_alpha_stride=unit_alpha_stride,
+    )
+
+
+@pytest.mark.parametrize("is_log_space", [True, False])
+def test_gdn_prefill_small_log_gate_matches_reference(is_log_space: bool) -> None:
+    _test_prefill_kernel(
+        dtype_name="float16",
+        num_qk_heads=2,
+        num_v_heads=4,
+        seq_lens=[127, 65],
+        scale=1.0,
+        use_initial_state=True,
+        varlen=True,
+        seed=int(os.environ.get("SEED", "0")) + 14,
+        is_log_space=is_log_space,
+        gate_scale=1e-5,
     )
 
 
@@ -631,3 +697,67 @@ def test_gdn_prefill_chunked_matches_reference(
         scale=scale,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("varlen", [True, False])
+@pytest.mark.parametrize("use_initial_state", [True, False])
+@pytest.mark.parametrize("preallocated_state", [True, False])
+def test_gdn_prefill_zero_tokens(
+    varlen: bool,
+    use_initial_state: bool,
+    preallocated_state: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _get_runtime_device()
+    _manual_seed(int(os.environ.get("SEED", "0")) + 703, device)
+    num_seqs, num_qk_heads, num_v_heads = 3, 1, 2
+    token_shape = (0,) if varlen else (num_seqs, 0)
+    q = torch.empty(
+        *token_shape, num_qk_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    k = torch.empty_like(q)
+    v = torch.empty(
+        *token_shape, num_v_heads, HEAD_SIZE, dtype=torch.float16, device=device
+    )
+    g = torch.empty(*token_shape, num_v_heads, dtype=torch.float32, device=device)
+    beta = torch.empty_like(g)
+    cu_seqlens = (
+        torch.zeros(num_seqs + 1, dtype=torch.int32, device=device) if varlen else None
+    )
+    initial_state = 0.05 * torch.randn(
+        num_seqs, num_v_heads, HEAD_SIZE, HEAD_SIZE, device=device
+    )
+    output_state = (
+        torch.full_like(initial_state, float("nan")) if preallocated_state else None
+    )
+
+    def unexpected_kernel(*args, **kwargs):
+        pytest.fail("Zero-token prefill must not compile or launch a GDN kernel.")
+
+    monkeypatch.setattr("mate.gdn_prefill.gdn_l2norm_", unexpected_kernel)
+    monkeypatch.setattr("mate.gdn_prefill.kkt_solve", unexpected_kernel)
+    monkeypatch.setattr(
+        "mate.gdn_kernels.tilelang.gdn_prefill.tilelang_fused_chunk_gdn_prefill",
+        unexpected_kernel,
+    )
+
+    o, final_state = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=HEAD_SIZE**-0.5,
+        initial_state=initial_state if use_initial_state else None,
+        output_final_state=True,
+        output_state=output_state,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+    )
+    _synchronize(device)
+
+    assert o.shape == v.shape
+    expected = initial_state if use_initial_state else torch.zeros_like(initial_state)
+    assert torch.equal(final_state, expected)
+    if preallocated_state:
+        assert final_state.data_ptr() == output_state.data_ptr()

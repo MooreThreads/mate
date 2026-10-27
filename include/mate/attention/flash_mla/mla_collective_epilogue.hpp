@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <mute/tensor.hpp>
 
 namespace mate::flash_mla {
@@ -26,6 +27,8 @@ struct MlaFwdEpilogue {
     ElementAccumulator* ptr_O_accum;
     ElementAccumulator* ptr_LSE_accum;
     int                 q_seq_per_hk;
+    int64_t             o_query_stride;
+    int64_t             lse_head_stride;
   };
 
   using Params = Arguments;
@@ -114,23 +117,36 @@ struct MlaFwdEpilogue {
                 tAcc_frg(i));
       }
 
+      // Capture metadata before stores so output aliasing cannot force reloads.
+      Element* const            ptr_O           = params.ptr_O;
+      ElementAccumulator* const ptr_LSE         = params.ptr_LSE;
+      int64_t const             o_query_stride  = params.o_query_stride;
+      int64_t const             o_head_stride   = get<0>(params.stride_O);
+      int64_t const             lse_head_stride = params.lse_head_stride;
+
       MUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size<0>(tOgO_mn); ++i) {
         int row = consumer_qo_coord * get<0>(EpilogueTileShape{}) + get<0>(tOcO_mn(i, 0));
         if (row < get<0>(problem_size)) {
+          int      h_idx = row % h_r;
+          int      q_idx = row / h_r;
+          Element* o_row = nullptr;
           if constexpr (!VarlenQ) {
             tOgLSE_mn(i, _0{}) = lse(i);
           } else {
-            int h_idx = row % h_r;
-            int q_idx = row / h_r;
-
-            mLSE((h_idx)*TotalQ + q_idx, _0{}, make_coord(_0{}, _0{})) = lse(i);
+            ptr_LSE[h_idx * lse_head_stride + seq_q_begin + q_idx] = lse(i);
+            o_row = ptr_O + (seq_q_begin + q_idx) * o_query_stride + h_idx * o_head_stride;
           }
 
           MUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < size<1>(tOgO_mn); ++j) {
-            tOgO_mn(i, j) = mutlass::NumericConverter<Element, ElementAccumulator, FloatRoundStyle::round_to_nearest>{}(
+            Element value = mutlass::NumericConverter<Element, ElementAccumulator, FloatRoundStyle::round_to_nearest>{}(
                 acc_mn(i, j));
+            if constexpr (VarlenQ) {
+              o_row[get<1>(tOcO_mn(i, j))] = value;
+            } else {
+              tOgO_mn(i, j) = value;
+            }
           }
         }
       }

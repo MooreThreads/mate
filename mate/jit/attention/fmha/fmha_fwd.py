@@ -9,6 +9,8 @@ import json
 
 from packaging.version import Version
 
+from mate._jit_dependencies import JitSourceTemplate
+
 from ... import env as jit_env
 from ...cpp_ext import get_mcc_version
 from ...core import JitSpec, gen_jit_spec
@@ -17,7 +19,6 @@ from .fmha_utils import (
     _FP8_DTYPES,
     _get_fwd_kernel_config,
     fmha_extra_include_paths,
-    get_fmha_template,
     _resolve_mask,
     round_multiple,
 )
@@ -26,13 +27,11 @@ from ...utils import (
     dtype_torch2mutlass_map,
     maybe_contiguous,
     TVM_HEADER,
-    EXPORT_FUNC,
+    EXPORT_FUNC_SOURCE,
 )
 from ...configs import KernelConfigGraph, ParamSpec, domain_by_case
 from ....execution_context import is_fake_mode, skip_kernel_launch_if_dry_run
 
-
-kern_fwd = get_fmha_template("fwd_kern.j2")
 
 FMHA_FWD_EXTRA_CUDA_CFLAGS = [
     "-Od3",
@@ -72,14 +71,13 @@ def _fmha_fwd_encode(config: Mapping[str, object]) -> str:
     return f"fmha_fwd_{uri}"
 
 
-def _render_fmha_fwd_source(config: Mapping[str, object]) -> str:
+def _fmha_fwd_render_config(config: Mapping[str, object]) -> dict[str, object]:
     render_config = dict(config)
     render_config["func_name"] = str(
         render_config.get("func_name") or _fmha_fwd_encode(render_config)
     )
-    return (
-        TVM_HEADER + kern_fwd.render(render_config) + EXPORT_FUNC.render(render_config)
-    )
+    render_config.setdefault("has_max_logits", False)
+    return render_config
 
 
 @functools.cache
@@ -607,10 +605,20 @@ def get_fmha_fwd_aot_configs(config_level: int) -> list[dict[str, object]]:
 def gen_fmha_fwd_spec(config: Mapping[str, object]) -> JitSpec:
     dispatch_name = _fmha_fwd_encode(config)
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / f"{dispatch_name}.mu")
+    render_config = _fmha_fwd_render_config(config)
     return gen_jit_spec(
         name=dispatch_name,
         sources=[source_file],
-        generated_sources={source_file: _render_fmha_fwd_source(config)},
+        generated_sources={
+            source_file: JitSourceTemplate(
+                template=(
+                    jit_env.MATE_TEMPLATE_DIR / "attention" / "fmha" / "fwd_kern.j2"
+                ),
+                context=render_config,
+                prefix=TVM_HEADER,
+                suffix=EXPORT_FUNC_SOURCE,
+            )
+        },
         extra_cuda_cflags=_get_fmha_fwd_extra_cuda_cflags(config),
         extra_include_paths=fmha_extra_include_paths(),
     )
@@ -663,6 +671,7 @@ def _fmha_fwd(
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
     only_qv: bool = False,
+    return_max_logits: bool = False,
 ):
     # Feature gates.
     assert not ((k_new is None) ^ (v_new is None)), (
@@ -934,6 +943,10 @@ def _fmha_fwd(
         softmax_scale = 1.0 / math.sqrt(
             head_dim_v if only_qv else head_dim + (head_dim_v if q_v is not None else 0)
         )
+    if return_max_logits and softmax_scale < 0 and softcap == 0:
+        raise ValueError(
+            "max logits requires non-negative softmax_scale without softcap"
+        )
 
     qhead_per_kvhead = num_head // num_head_kv
     if attention_chunk > 0:
@@ -1013,6 +1026,14 @@ def _fmha_fwd(
         assert lse.shape == lse_shape
         assert lse.dtype == torch.float32
         assert lse.device == q.device
+
+    if return_max_logits and not lse.is_contiguous():
+        raise ValueError("max logits requires a contiguous lse output")
+    max_logits = (
+        torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+        if return_max_logits
+        else None
+    )
 
     batch_rounded = round_multiple(batch_size, 4)
     # Metadata
@@ -1099,12 +1120,14 @@ def _fmha_fwd(
         "has_qv": q_v is not None,
         "only_qv": only_qv,
     }
+    if return_max_logits:
+        constexpr_dict["has_max_logits"] = True
     # print(f"tile_m: {tile_m}, tile_n: {tile_n}")
 
     dispatch_name, mod = _fmha_fwd_module(constexpr_dict)
     fmha_fwd_impl = mod.get_function(dispatch_name)
 
-    accums, num_splits = fmha_fwd_impl(
+    ffi_arguments: tuple[Any, ...] = (
         q,
         k,
         v,
@@ -1146,7 +1169,11 @@ def _fmha_fwd(
         cp_tot_seqused_k,
         skip_kernel_launch_if_dry_run(),
     )
-    o_accum, lse_accum = accums
+    if return_max_logits:
+        ffi_arguments += (max_logits,)
+    accums, num_splits = fmha_fwd_impl(*ffi_arguments)
+    o_accum, lse_accum = accums[:2]
+    max_logits_accum = accums[2] if return_max_logits else None
 
     _fmha_fwd_combine(
         out,
@@ -1159,9 +1186,12 @@ def _fmha_fwd(
         max_seqlen_q,
         num_split=num_splits,
         metadata=scheduler_metadata,
+        max_logits=max_logits,
+        max_logits_accum=max_logits_accum,
     )
 
-    return (out, lse, o_accum, lse_accum) if return_lse else (out, o_accum)
+    result = (out, lse, o_accum, lse_accum) if return_lse else (out, o_accum)
+    return (*result, max_logits) if return_max_logits else result
 
 
 def gen_fmha_fwd_aot(config_level: int = 0) -> list[JitSpec]:

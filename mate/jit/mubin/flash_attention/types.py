@@ -12,3 +12,4 @@ class FlashAttentionMubinId:
     is_causal: bool
     is_varlen: bool
     headdim_qk: int
+    has_max_logits: bool = False

@@ -58,9 +58,12 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   static constexpr int NumProducerThreads    = NumProducerWarps * NumThreadsPerWarp;
   static constexpr int NumConsumerThreads    = NumConsumerWarps * NumThreadsPerWarp;
   static constexpr int NumThreads            = NumProducerThreads + NumConsumerThreads;
-  static constexpr int QLoadWarpInProducer   = 0;
-  static constexpr int KVLoadWarpInProducer  = 1;
-  static constexpr int SmemAlignmentBytes    = 256;
+  static_assert(NumThreads % mutlass::NumThreadsPerWarpSquad == 0,
+                "SQMMA CTA dimensions must contain complete warp-squads");
+  static constexpr int QLoadWarpInProducer  = 0;
+  static constexpr int KVLoadWarpInProducer = 1;
+  static constexpr int SmemAlignmentBytes   = 256;
+  static_assert(QLoadWarpInProducer < NumProducerWarps && KVLoadWarpInProducer < NumProducerWarps);
   // The key-load permutation must cover the full 128-row sparse block in one
   // TME block. FP16/BF16 therefore need a 256-bit fragment where FP8 needs
   // 128 bits; both choices contain 16 elements.
@@ -75,6 +78,7 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   static_assert(QStages == 1, "Q is resident for one MSA forward work item and uses one stage.");
   static_assert(KStages >= 1 && VStages >= 1, "K/V TME pipelines require at least one stage.");
   static_assert(NumMmaWarpSquads == 1, "TileM=16 requires exactly one SQMMA consumer warp-squad.");
+  static_assert(TileM % NumConsumerWarps == 0);
 
   using TileShapeQK = Shape<Int<TileM>, Int<TileN>, Int<HeadDim>>;
   using TileShapePV = Shape<Int<TileM>, Int<HeadDim>, Int<TileN>>;
@@ -418,8 +422,8 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
   }
 
   // Thread 0 builds a compact union for two adjacent TP8 queries.  The input
-  // lists need not be sorted: an existing block simply gains the second
-  // query's membership bit.  A masked dummy entry keeps the online-softmax
+  // lists need not be sorted: share a block only between different queries,
+  // preserving repeated selections. A masked dummy entry keeps the online-softmax
   // pipeline well-defined when both lists are empty.
   template <class WorkTile>
   MUTLASS_DEVICE static int build_pair_union(Params const&   params,
@@ -555,13 +559,13 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
             continue;
           }
         }
-        int union_slot = 0;
+        uint32_t query_mask = uint32_t(1) << query_in_tile;
+        int      union_slot = 0;
         for (; union_slot < union_count; ++union_slot) {
-          if (union_blocks[union_slot] == logical_block) {
+          if (union_blocks[union_slot] == logical_block && (union_masks[union_slot] & query_mask) == 0) {
             break;
           }
         }
-        uint32_t query_mask = uint32_t(1) << query_in_tile;
         if (union_slot < union_count) {
           union_masks[union_slot] |= query_mask;
         } else {
@@ -770,12 +774,7 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
     if constexpr (IsCausal) {
       reject_block = reject_block || logical_begin > causal_limit;
     }
-    if (reject_block) {
-      mute::fill(acc_qk, neg_inf);
-      return;
-    }
-
-    bool whole_block_valid = logical_begin + TileN <= work_tile.kv_len;
+    bool whole_block_valid = !reject_block && logical_begin + TileN <= work_tile.kv_len;
     if constexpr (IsCausal) {
       whole_block_valid = whole_block_valid && logical_begin + TileN - 1 <= causal_limit;
     }
@@ -799,7 +798,7 @@ struct Mp31MsaFwdCollectiveTmeWarpSpecialized {
         int logical_col = (mma_col % (TileN / TmeLoadKBuilder::Fragment)) * TmeLoadKBuilder::Fragment +
                           mma_col / (TileN / TmeLoadKBuilder::Fragment);
         int  kv_local = logical_begin + logical_col;
-        bool keep     = kv_local < work_tile.kv_len;
+        bool keep     = !reject_block && kv_local < work_tile.kv_len;
         if constexpr (IsCausal) {
           keep = keep && kv_local <= causal_limit;
         }

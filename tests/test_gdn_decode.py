@@ -347,8 +347,10 @@ def _assert_decode_matches_reference(
     use_qk_l2norm: bool,
     output: torch.Tensor | None = None,
     output_rtol: float | None = None,
+    state_dtype: torch.dtype = torch.float32,
 ) -> None:
-    state = input_state_ref.transpose(-2, -1).contiguous()
+    input_state_storage = input_state_ref.to(state_dtype)
+    state = input_state_storage.transpose(-2, -1).contiguous()
     state_ptr = state.data_ptr()
     out, returned_state = mate.gated_delta_rule_decode(
         q=q,
@@ -375,7 +377,7 @@ def _assert_decode_matches_reference(
         q.squeeze(1).float(),
         k.squeeze(1).float(),
         v.squeeze(1).float(),
-        input_state_ref,
+        input_state_storage,
         A_log=A_log.float(),
         a=a.squeeze(1).float(),
         dt_bias=dt_bias.float(),
@@ -384,23 +386,29 @@ def _assert_decode_matches_reference(
         softplus_beta=1.0,
         softplus_threshold=20.0,
         use_l2_norm=use_qk_l2norm,
+        state_dtype=state_dtype,
     )
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.transpose(-2, -1).contiguous()
 
     default_atol = 1e-3 if q.dtype == torch.float16 else 5e-3
     default_rtol = 1e-3 if q.dtype == torch.float16 else 5e-3
+    output_atol = 1e-2 if state_dtype == torch.bfloat16 else default_atol
+    state_atol = 2e-2 if state_dtype == torch.bfloat16 else default_atol
+    state_rtol = 1e-2 if state_dtype == torch.bfloat16 else default_rtol
     torch.testing.assert_close(
         out.squeeze(1),
         ref_o,
-        atol=default_atol,
-        rtol=default_rtol if output_rtol is None else output_rtol,
+        atol=output_atol,
+        rtol=(1e-2 if state_dtype == torch.bfloat16 else default_rtol)
+        if output_rtol is None
+        else output_rtol,
     )
     torch.testing.assert_close(
         returned_state,
         ref_state,
-        atol=default_atol,
-        rtol=default_rtol,
+        atol=state_atol,
+        rtol=state_rtol,
     )
 
 
@@ -409,6 +417,7 @@ def _make_decode_pool_inputs(
     batch_size: int,
     pool_size: int,
     seed: int,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -446,7 +455,7 @@ def _make_decode_pool_inputs(
         num_v_heads,
         head_size,
         head_size,
-        dtype=torch.float32,
+        dtype=state_dtype,
         device=device,
     )
 
@@ -522,12 +531,13 @@ def _assert_decode_pool_matches_reference(
             softplus_beta=1.0,
             softplus_threshold=20.0,
             use_l2_norm=True,
+            state_dtype=state_pool.dtype,
         )
         ref_out[valid_batch, 0] = ref_o.to(q.dtype)
         ref_state[valid_slots] = ref_state_kv.transpose(-2, -1).contiguous()
 
-    atol = 5e-3
-    rtol = 5e-3
+    atol = 2e-2 if state_pool.dtype == torch.bfloat16 else 5e-3
+    rtol = 1e-2 if state_pool.dtype == torch.bfloat16 else 5e-3
     out_4d = out.unsqueeze(1) if out.dim() == 3 else out
     torch.testing.assert_close(out_4d, ref_out, atol=atol, rtol=rtol)
     torch.testing.assert_close(state_under_test, ref_state, atol=atol, rtol=rtol)
@@ -580,8 +590,10 @@ def test_decode_kernel_pool_state_indices_pretranspose(
 
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("batch_size", [4, 8, 32])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_decode_kernel_pool_negative_state_indices_pretranspose(
     batch_size: int,
+    state_dtype: torch.dtype,
     seed: int = _get_default_seed(),
 ) -> None:
     pool_size = batch_size * 2
@@ -589,6 +601,7 @@ def test_decode_kernel_pool_negative_state_indices_pretranspose(
         batch_size=batch_size,
         pool_size=pool_size,
         seed=seed,
+        state_dtype=state_dtype,
     )
     state_indices = torch.randperm(pool_size, device=q.device)[:batch_size].to(
         torch.int32
@@ -926,9 +939,11 @@ def test_decode_kernel_basic_pretranspose(
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 @pytest.mark.parametrize("dt_bias_dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_decode_kernel_sglang_split_qkv_pretranspose(
     dtype: str,
     dt_bias_dtype: str,
+    state_dtype: torch.dtype,
     seed: int = _get_default_seed(),
 ) -> None:
     random.seed(seed)
@@ -990,6 +1005,7 @@ def test_decode_kernel_sglang_split_qkv_pretranspose(
         scale=scale,
         output=None,
         use_qk_l2norm=True,
+        state_dtype=state_dtype,
     )
 
 

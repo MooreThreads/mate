@@ -169,6 +169,7 @@ def _bench_graph_us(
     fn: Callable[[], object],
     repeat: int,
     num_iters_within_graph: int,
+    samples_us: list[float] | None = None,
 ) -> float:
     backend = _gpu_backend()
     num_iters_within_graph = max(1, num_iters_within_graph)
@@ -200,6 +201,8 @@ def _bench_graph_us(
         start_events[idx].elapsed_time(end_events[idx]) / num_iters_within_graph
         for idx in range(repeat)
     ]
+    if samples_us is not None:
+        samples_us.extend(t * 1000.0 for t in times_ms)
     _GRAPH_KEEPALIVE.append((graph, captured_outputs))
     return statistics.median(times_ms) * 1000.0
 
@@ -1427,6 +1430,280 @@ def _decode_cases(
                 )
 
 
+def _run_cache_format_matrix(args):
+    """Compare real packed formats with effective (unmasked) attention FLOPs."""
+    import json
+    from mate.execution_context import dry_run_context
+    from mate.testing.sparse_mla import (
+        SparseMlaCase,
+        make_decode_data,
+        assert_sparse_mla_close,
+    )
+    from mate.sparse_mla.glm_nope import sparse_mla_nope_decode
+    from mate.flashmla import flash_mla_with_kvcache, get_mla_metadata
+
+    def prepare(case, *, with_control=True):
+        scale = 0.0625 if case.variant == "glm53" else case.head_dim**-0.5
+        data = make_decode_data(case, softmax_scale=scale)
+        if args.formats_empty:
+            data.indices.fill_(-1)
+            data.topk_length.zero_()
+            if data.extra_indices is not None:
+                data.extra_indices.fill_(-1)
+                data.extra_topk_length.zero_()
+            data.ref_out.zero_()
+            data.ref_lse.fill_(float("inf"))
+        metadata, splits = get_mla_metadata(
+            None,
+            case.heads * case.q_len,
+            1,
+            case.heads,
+            True,
+            topk=case.topk,
+            extra_topk=case.extra_topk or None,
+            q=data.q,
+            bs=case.batch,
+            topk_length=data.topk_length,
+            extra_topk_length=data.extra_topk_length,
+        )
+
+        def run(q=data.q, cache=data.k_cache, glm=case.variant == "glm53"):
+            if glm:
+                return sparse_mla_nope_decode(
+                    q,
+                    cache,
+                    data.indices,
+                    softmax_scale=scale,
+                    topk_length=data.topk_length,
+                    tile_scheduler_metadata=metadata,
+                    num_splits=splits,
+                )
+            return flash_mla_with_kvcache(
+                q,
+                cache,
+                None,
+                None,
+                512,
+                metadata,
+                splits,
+                softmax_scale=scale,
+                is_fp8_kvcache=True,
+                indices=data.indices,
+                topk_length=data.topk_length,
+                extra_k_cache=data.extra_k_cache,
+                extra_indices_in_kvcache=data.extra_indices,
+                extra_topk_length=data.extra_topk_length,
+            )
+
+        control = control_data = None
+        if case.variant == "glm53":
+            q_pad = torch.nn.functional.pad(data.q, (0, 64))
+            cache_pad = torch.nn.functional.pad(data.k_cache, (0, 128))
+            control = lambda: run(q_pad, cache_pad, False)
+            control_data = data
+        elif with_control and case.variant == "v41":
+            control_case = dataclasses.replace(
+                case,
+                variant="v41" if case.extra_variant == "v41_fp4" else "v4",
+                extra_variant="v41" if case.extra_variant == "v41_fp4" else None,
+            )
+            control_data, control, _, _ = prepare(control_case, with_control=False)
+        return data, run, control, control_data
+
+    records = Path(args.formats_output)
+    records.parent.mkdir(parents=True, exist_ok=True)
+    for variant in args.cache_formats.split(","):
+        if variant not in ("v32", "v4", "glm53", "v41", "v41_extra", "v41_fp4"):
+            raise ValueError(f"unknown packed format: {variant}")
+        heads = args.decode_heads or (
+            [8, 16, 32, 64] if variant == "glm53" else [64, 128]
+        )
+        for batch in args.decode_batches or [1, 60, 120]:
+            for head in heads:
+                for queries in (1, 3):
+                    for topk in args.decode_topks or [2048, 2112, 2176]:
+                        case = SparseMlaCase(
+                            f"{variant}_b{batch}_q{queries}_h{head}_k{topk}",
+                            "v41" if variant in ("v41_fp4", "v41_extra") else variant,
+                            queries,
+                            4096,
+                            head,
+                            topk,
+                            batch=batch,
+                            topk_length=True,
+                            extra_kv_len=1024
+                            if variant in ("v41_fp4", "v41_extra")
+                            else 0,
+                            extra_topk=512
+                            if variant in ("v41_fp4", "v41_extra")
+                            else 0,
+                            extra_variant="v41_fp4" if variant == "v41_fp4" else None,
+                        )
+                        row = dict(
+                            case=dataclasses.asdict(case),
+                            format=variant,
+                            mp_count=resolve_num_mps(),
+                            device=torch.musa.get_device_name(0),
+                            timing="graph split+combine; metadata prepared",
+                            flop_convention="2*heads*valid_candidates*(Dqk+Dv); GLM control uses 512+512",
+                            empty_candidates=args.formats_empty,
+                            softmax_scale=0.0625
+                            if case.variant == "glm53"
+                            else case.head_dim**-0.5,
+                        )
+                        try:
+                            with dry_run_context():
+                                _, dry, control, _ = prepare(case)
+                                dry()
+                                if control is not None:
+                                    control()
+                            if args.formats_dry_run:
+                                row["status"] = "dry-run-passed"
+                            else:
+                                data, fn, control, control_data = prepare(case)
+                                out, lse = fn()
+                                assert_sparse_mla_close(
+                                    out, data.ref_out, lse, data.ref_lse
+                                )
+                                if control is not None:
+                                    old_out, old_lse = control()
+                                    assert_sparse_mla_close(
+                                        old_out,
+                                        control_data.ref_out,
+                                        old_lse,
+                                        control_data.ref_lse,
+                                    )
+
+                                def count(indices, cache, lengths):
+                                    width = indices.shape[-1]
+                                    valid = (indices >= 0) & (
+                                        indices < cache.shape[0] * cache.shape[1]
+                                    )
+                                    if lengths is not None:
+                                        valid &= (
+                                            torch.arange(width, device=indices.device)
+                                            < lengths[:, None, None, None]
+                                        )
+                                    return int(valid.sum().item())
+
+                                candidates = count(
+                                    data.indices, data.k_cache, data.topk_length
+                                )
+                                if data.extra_indices is not None:
+                                    candidates += count(
+                                        data.extra_indices,
+                                        data.extra_k_cache,
+                                        data.extra_topk_length,
+                                    )
+                                flop = 2 * head * candidates * (case.head_dim + 512)
+                                # Repeat A/B rounds, retaining all median samples. Both
+                                # paths include split+combine under the same graph policy.
+                                samples, controls = [], []
+                                raw_samples, raw_controls = [], []
+                                for repeat_round in range(3):
+                                    if control is not None and repeat_round % 2 == 0:
+                                        controls.append(
+                                            _bench_graph_us(
+                                                control,
+                                                args.repeat,
+                                                args.graph_iters,
+                                                raw_controls,
+                                            )
+                                        )
+                                    samples.append(
+                                        _bench_graph_us(
+                                            fn,
+                                            args.repeat,
+                                            args.graph_iters,
+                                            raw_samples,
+                                        )
+                                    )
+                                    if control is not None and repeat_round % 2:
+                                        controls.append(
+                                            _bench_graph_us(
+                                                control,
+                                                args.repeat,
+                                                args.graph_iters,
+                                                raw_controls,
+                                            )
+                                        )
+                                    _GRAPH_KEEPALIVE.clear()
+                                latency = statistics.median(samples)
+                                row.update(
+                                    status="passed",
+                                    effective_flops=flop,
+                                    valid_candidates=candidates,
+                                    us=latency,
+                                    samples_us=samples,
+                                    raw_samples_us=raw_samples,
+                                    p90_us=sorted(raw_samples)[
+                                        int(0.9 * (len(raw_samples) - 1))
+                                    ],
+                                    tflops=flop / latency / 1e6,
+                                    cache_bytes=data.k_cache.untyped_storage().nbytes(),
+                                    extra_cache_bytes=0
+                                    if data.extra_k_cache is None
+                                    else data.extra_k_cache.untyped_storage().nbytes(),
+                                    output_max_abs_error=float(
+                                        (out.float() - data.ref_out.float())
+                                        .abs()
+                                        .max()
+                                        .item()
+                                    ),
+                                )
+                                if controls:
+                                    baseline = statistics.median(controls)
+                                    quant_delta = (
+                                        data.ref_out.float()
+                                        - control_data.ref_out.float()
+                                    )
+                                    row.update(
+                                        control_us=baseline,
+                                        control_samples_us=controls,
+                                        control_raw_samples_us=raw_controls,
+                                        control_p90_us=sorted(raw_controls)[
+                                            int(0.9 * (len(raw_controls) - 1))
+                                        ],
+                                        control_tflops=flop / baseline / 1e6,
+                                        control_format="v32_zero_rope"
+                                        if variant == "glm53"
+                                        else "v41_extra"
+                                        if variant == "v41_fp4"
+                                        else "v4",
+                                        control_cache_bytes=data.k_cache.shape[0]
+                                        * data.k_cache.shape[1]
+                                        * 656
+                                        if variant == "glm53"
+                                        else control_data.k_cache.untyped_storage().nbytes(),
+                                        control_extra_cache_bytes=0
+                                        if control_data.extra_k_cache is None
+                                        else control_data.extra_k_cache.untyped_storage().nbytes(),
+                                        quantization_delta_max_abs=float(
+                                            quant_delta.abs().max().item()
+                                        ),
+                                        quantization_delta_relative_rms=float(
+                                            (
+                                                quant_delta.square().mean().sqrt()
+                                                / control_data.ref_out.float()
+                                                .square()
+                                                .mean()
+                                                .sqrt()
+                                                .clamp_min(1e-12)
+                                            ).item()
+                                        ),
+                                        tflops_change_pct=(baseline / latency - 1) * 100
+                                        if flop
+                                        else None,
+                                        latency_change_pct=(latency / baseline - 1)
+                                        * 100,
+                                    )
+                        except Exception as exc:
+                            row.update(status="failed", error=str(exc))
+                        with records.open("a") as stream:
+                            stream.write(json.dumps(row) + "\n")
+                        print(json.dumps(row), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("prefill", "decode", "both"), default="both")
@@ -1537,7 +1814,22 @@ def main() -> None:
         action="store_true",
         help="Disable MODEL1 persistent prefill in benchmark direct/graph paths",
     )
+    parser.add_argument(
+        "--cache-formats",
+        default=None,
+        help="Packed format matrix: v32,v4,glm53,v41,v41_extra,v41_fp4",
+    )
+    parser.add_argument("--formats-output", default="/tmp/sparse-mla-formats.jsonl")
+    parser.add_argument("--formats-dry-run", action="store_true")
+    parser.add_argument(
+        "--formats-empty",
+        action="store_true",
+        help="Measure all-empty candidate rows in the packed format matrix",
+    )
     args = parser.parse_args()
+    if args.cache_formats:
+        _run_cache_format_matrix(args)
+        return
 
     device = _device()
     torch.set_default_device(device)

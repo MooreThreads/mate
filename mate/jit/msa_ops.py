@@ -177,9 +177,24 @@ def _maxscore_tile_q(
     # Match the original FP8 MSA TileLang prefill geometry: one 128-row Q
     # tile feeds four consumer warp-squads (512 consumer threads). Keep the
     # small decode geometry because a one-row request cannot amortize that
-    # tile. BF16 retains its tested 64-row generic geometry below.
+    # tile.
     if (
         dtype == _FP8_E4M3_DTYPE
+        and parallel_k_tiles
+        and int(head_ratio) == 1
+        and max_seqlen_q is not None
+        and int(max_seqlen_q) > 512
+    ):
+        return 128
+    # BF16 prefill takes the same 128-row tile, with K prefetch (see
+    # make_msa_maxscore_config). A 64-row BF16 tile carries only 64 FLOP per
+    # byte of K, so the kernel streams K at about HBM rate. Each score is the
+    # same reduction over the same inputs with either tile, so the scores are
+    # bit-identical; MiniMax-M3 prefill on MP31 ran 1.4x (32K-query chunks)
+    # to 4.8x (4K queries at a 496K prefix) faster. Up to 512 query tokens
+    # (short extends, decode) BF16 keeps its tested 64- and 16-row tiles.
+    if (
+        dtype == torch.bfloat16
         and parallel_k_tiles
         and int(head_ratio) == 1
         and max_seqlen_q is not None
@@ -285,7 +300,11 @@ def make_msa_maxscore_config(
     # barrier/shared-state traffic. The MUTLASS builder still uses its
     # required dispatch-policy stage count internally.
     k_stages = 1
-    enable_k_prefetch = bool(selected_tile_q > 16 and dtype != torch.bfloat16)
+    # BF16 prefetches K only with the 128-row prefill tile; its 64-row tile
+    # keeps the tested no-prefetch configuration.
+    enable_k_prefetch = bool(
+        selected_tile_q > 16 and (dtype != torch.bfloat16 or selected_tile_q >= 128)
+    )
     # Keep the tested generic geometry for production. MmaTileQ remains an
     # explicit option for A/Bs; the current long-tile path uses M32, while
     # the small decode tile uses M16.
@@ -444,6 +463,10 @@ def gen_msa_maxscore_spec(
         is_varlen=is_varlen,
         has_metadata=has_metadata,
     )
+    return _gen_msa_maxscore_spec_from_config(config)
+
+
+def _gen_msa_maxscore_spec_from_config(config: Mapping[str, object]) -> JitSpec:
     dispatch_name = _msa_maxscore_encode_config(config)
     source_file = Path(jit_env.MATE_GEN_SRC_DIR / "msa" / f"{dispatch_name}.mu")
     return gen_jit_spec(
@@ -456,7 +479,10 @@ def gen_msa_maxscore_spec(
     )
 
 
-@functools.cache
+# Loaded maxscore modules, keyed by dispatch name (the kernel configuration).
+_MSA_MAXSCORE_MODULES: dict[str, object] = {}
+
+
 def get_msa_maxscore_module(
     dtype: torch.dtype,
     is_paged_kv: bool,
@@ -469,7 +495,13 @@ def get_msa_maxscore_module(
     is_varlen: bool = True,
     has_metadata: bool | None = None,
 ):
-    return gen_msa_maxscore_spec(
+    # max_seqlen_q only selects the tile geometry (_maxscore_tile_q), so cache
+    # the loaded module by the kernel configuration it resolves to. Caching by
+    # max_seqlen_q itself sent every new query length back through
+    # JitSpec.build_and_load: a file lock shared by every rank on the host, a
+    # no-op ninja run and a reload, about 0.5 s per new prefill length at 8
+    # ranks per node.
+    config = make_msa_maxscore_config(
         dtype,
         is_paged_kv=is_paged_kv,
         causal=causal,
@@ -480,7 +512,13 @@ def get_msa_maxscore_module(
         page_size=page_size,
         is_varlen=is_varlen,
         has_metadata=has_metadata,
-    ).build_and_load()
+    )
+    dispatch_name = _msa_maxscore_encode_config(config)
+    module = _MSA_MAXSCORE_MODULES.get(dispatch_name)
+    if module is None:
+        module = _gen_msa_maxscore_spec_from_config(config).build_and_load()
+        _MSA_MAXSCORE_MODULES[dispatch_name] = module
+    return module
 
 
 def _msa_maxscore(

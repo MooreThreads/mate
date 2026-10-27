@@ -176,9 +176,7 @@ def _gated_delta_rule_decode_pretranspose_impl(
     use_qk_l2norm: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if seq_len != 1:
-        raise ValueError(f"VK fp32 decode only supports T=1, got T={seq_len}")
-    if state.dtype != torch.float32:
-        raise ValueError(f"VK fp32 decode requires float32 state, got {state.dtype}")
+        raise ValueError(f"VK decode only supports T=1, got T={seq_len}")
     if state.dim() != 4 or state.shape[1:] != (
         num_v_heads,
         head_dim_v,
@@ -375,7 +373,7 @@ def gated_delta_rule_decode(
     Single entry point for decode (``T=1``) and MTP/speculative decode (``T>1``).
     The API layer owns parameter semantics and backend dispatch. The current MATE
     implementation supports the VK-layout + TileLang backends for single-token
-    decode with FP32 state and MTP/speculative decode with FP32 or BF16 state.
+    decode and MTP/speculative decode with FP32 or BF16 state.
 
     Args:
         q (torch.Tensor):
@@ -419,7 +417,7 @@ def gated_delta_rule_decode(
             - state: Updated state tensor (same storage as input on supported paths)
 
     Dispatch:
-        - ``state_layout="VK"``, ``state.dtype=float32``, ``T=1`` -> TileLang pretranspose fp32 decode
+        - ``state_layout="VK"`, ``state.dtype=float32/bfloat16``, ``T=1`` -> TileLang decode
         - ``state_layout="VK"``, ``state.dtype=float32/bfloat16``, ``T>1`` -> TileLang MTP
         - Other combinations currently raise with a clear error
 
@@ -470,19 +468,12 @@ def gated_delta_rule_decode(
         )
 
     if T == 1:
-        if state.dtype == torch.bfloat16:
-            raise NotImplementedError(
-                "VK bfloat16 T=1 decode is not implemented in MATE yet; "
-                "the bfloat16 state backend currently supports the MTP path (T>1)."
-            )
         if intermediate_states_buffer is not None:
             raise NotImplementedError(
-                "VK fp32 T=1 does not support intermediate_states_buffer"
+                "VK T=1 does not support intermediate_states_buffer"
             )
         if disable_state_update:
-            raise NotImplementedError(
-                "VK fp32 T=1 does not support disable_state_update"
-            )
+            raise NotImplementedError("VK T=1 does not support disable_state_update")
         return _gated_delta_rule_decode_pretranspose_impl(
             q=q,
             k=k,

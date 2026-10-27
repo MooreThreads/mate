@@ -18,6 +18,7 @@ import json
 import re
 import importlib
 import shlex
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -135,6 +136,105 @@ def _read_installed_package_version(package_name: str) -> str | None:
         return resolved if resolved else None
     except Exception:
         return None
+
+
+def _get_mcc_version_info() -> dict[str, str]:
+    try:
+        from mate.jit.cpp_ext import get_mcc
+
+        mcc = get_mcc()
+    except Exception:
+        # Configuration must remain inspectable without working JIT dependencies.
+        musa_home = os.environ.get("MUSA_HOME") or os.environ.get("MUSA_PATH")
+        mcc = os.environ.get("MATE_MCC") or (
+            str(Path(musa_home) / "bin" / "mcc")
+            if musa_home
+            else shutil.which("mcc") or "/usr/local/musa/bin/mcc"
+        )
+
+    info = {
+        "mcc_path": mcc,
+        "mcc_version": "unknown",
+        "mcc_git_version": "unknown",
+    }
+    try:
+        result = subprocess.run(
+            [mcc, "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        info["mcc_version"] = "Not installed"
+        return info
+    except (OSError, subprocess.SubprocessError):
+        info["mcc_version"] = "Unavailable"
+        return info
+
+    output = f"{result.stdout}\n{result.stderr}"
+    version = re.search(r"(?m)^mcc version\s+(\S+)", output)
+    commit = re.search(
+        r"(?m)^(?:clang|mcc) version[^\n]*\s([0-9a-fA-F]{7,40})\)", output
+    )
+    if version:
+        info["mcc_version"] = version.group(1)
+    if commit:
+        info["mcc_git_version"] = commit.group(1)
+    return info
+
+
+def _get_tilelang_version_info() -> dict[str, str]:
+    from importlib import metadata
+
+    version = _read_installed_package_version("tilelang-musa")
+    commit = "unknown"
+    try:
+        spec = importlib.util.find_spec("tilelang")
+        root = (
+            Path(spec.origin).resolve().parent.parent if spec and spec.origin else None
+        )
+        if root and (root / ".git").exists():
+            if (root / "VERSION").is_file():
+                version = (root / "VERSION").read_text().strip() or version
+            # Only query TileLang's own checkout, never an enclosing repository.
+            result = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+            commit = result.stdout.strip() or commit
+    except (ImportError, ValueError, OSError, subprocess.SubprocessError):
+        pass
+
+    if commit == "unknown":
+        try:
+            distribution = metadata.distribution("tilelang-musa")
+            # MUSA wheels embed their build revision in the package summary.
+            match = re.search(
+                r"\bCommit ID:\s*([0-9a-fA-F]{7,40})\b",
+                distribution.metadata["Summary"] or "",
+            )
+            if match:
+                commit = match.group(1)
+            direct_url = distribution.read_text("direct_url.json")
+            if commit == "unknown" and direct_url:
+                commit = (
+                    json.loads(direct_url).get("vcs_info", {}).get("commit_id")
+                    or commit
+                )
+        except (metadata.PackageNotFoundError, OSError, ValueError, AttributeError):
+            pass
+    if commit == "unknown" and version:
+        match = re.search(r"(?:\+|\.)(?:git|g)([0-9a-fA-F]{7,40})(?:\.|$)", version)
+        if match:
+            commit = match.group(1)
+    return {
+        "tilelang_musa_version": version or "Not installed",
+        "tilelang_musa_git_version": commit,
+    }
 
 
 def _public_version(version: str) -> str:
@@ -493,6 +593,8 @@ def get_system_info():
         "jit_verbose": jit_status["jit_verbose"],
         "jit_stats": jit_status["stats"],
     }
+    info.update(_get_mcc_version_info())
+    info.update(_get_tilelang_version_info())
 
     # PyTorch info
     try:
@@ -626,6 +728,13 @@ def show_config(output_json: bool):
     print_kv("Git version", info.get("git_version", "unknown")[:16])
     print_kv("Python version", info["python_version"])
     print_kv("PyTorch version", info.get("torch_version", "N/A"))
+    print_kv("MCC version", info["mcc_version"])
+    print_kv("MCC git version", _short_commit(info["mcc_git_version"]))
+    print_kv("MCC path", info["mcc_path"])
+    print_kv("tilelang_musa version", info["tilelang_musa_version"])
+    print_kv(
+        "tilelang_musa git version", _short_commit(info["tilelang_musa_git_version"])
+    )
 
     # MUSA Info
     print_header("MUSA Information")

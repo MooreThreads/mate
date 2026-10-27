@@ -9,6 +9,7 @@
 #include <type_traits>
 
 #include "mate/flat/flat_options.hpp"
+#include "mate/flat/kda/kda_arch_traits.hpp"
 #include "mate/flat/kda/kernel/chunk_kda_tile_scheduler.hpp"
 
 namespace mate::flat::kda {
@@ -27,11 +28,19 @@ struct ChunkKdaPrepareKernel {
 
   static_assert(std::is_same_v<ProblemSize, typename TileScheduler::ProblemShape>);
 
-  static constexpr int      SharedStorageSize          = CollectivePrepare::SharedStorageSize;
-  static constexpr int      SmemAlignmentBytes         = CollectivePrepare::SmemAlignmentBytes;
+  static constexpr int SharedStorageSize  = CollectivePrepare::SharedStorageSize;
+  static constexpr int SmemAlignmentBytes = CollectivePrepare::SmemAlignmentBytes;
+  // Resident prepare CTAs per MP. The persistent K1 launch sizes its metadata
+  // workspace at KDA_MP{31,32}_PREPARE_CTAS_PER_MP * num_mps and hands one range
+  // descriptor to each resident prepare CTA, but declaring that occupancy here
+  // is counter-productive: __launch_bounds__' second argument is a scheduler
+  // target, not a cap, and naming a target makes the scheduler reshuffle into a
+  // schedule that spills (asking MP32 for eight CTAs cost 16 bytes of spill).
+  // Left unconstrained the kernel lands on the resident count anyway: 75
+  // registers / 6 CTAs on MP31 (capped by shared memory) and 62 registers /
+  // 8 CTAs on MP32, nothing spilled on either.
   static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
-  static constexpr int      MaxThreadsPerBlock =
-      CollectivePrepare::NumProducerThreads + CollectivePrepare::NumConsumerThreads;
+  static constexpr int      MaxThreadsPerBlock         = CollectivePrepare::NumThreadsPerBlock;
 
   struct Arguments {
     ProblemSize                           problem_size;
@@ -52,6 +61,27 @@ struct ChunkKdaPrepareKernel {
     };
   }
 
+  template <auto Runner>
+  MUTLASS_DEVICE static void run_role(SharedStorage& shared_storage,
+                                      Params const&  params,
+                                      TileScheduler& tile_scheduler,
+                                      Pipeline&      pipeline,
+                                      int            thread_idx) {
+    using WorkDesc    = typename TileScheduler::WorkDesc;
+    using ProblemSize = typename TileScheduler::ProblemShape;
+    auto work_cursor  = tile_scheduler.get_initial_work(params.scheduler, params.problem_size);
+    while (work_cursor.remaining > 0) {
+#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
+      __musa_loop_transparent_outermost();
+#endif
+      auto work_desc = tile_scheduler.get_work(params.scheduler, params.problem_size, work_cursor);
+      for (int chunk_idx = 0; chunk_idx < work_desc.n_chunks; ++chunk_idx) {
+        Runner(shared_storage, params.prepare, params.problem_size, work_desc, pipeline, thread_idx, chunk_idx);
+      }
+      tile_scheduler.advance(params.scheduler, params.problem_size, work_cursor);
+    }
+  }
+
   MUTLASS_DEVICE void operator()(Params const& params, char* smem) {
     int thread_idx = int(threadIdx.x);
     int warp_idx   = mutlass::canonical_warp_idx();
@@ -67,65 +97,28 @@ struct ChunkKdaPrepareKernel {
 
     __syncthreads();
 
-    auto work_cursor = tile_scheduler.get_initial_work(params.scheduler, params.problem_size);
-    while (work_cursor.remaining > 0) {
-#if defined(__MUSA_ARCH__) && (__MUSA_ARCH__ >= 310)
-      __musa_loop_transparent_outermost();
-#endif
-      auto work_desc = tile_scheduler.get_work(params.scheduler, params.problem_size, work_cursor);
-
-      if (warp_idx < CollectivePrepare::NumConsumerWarps) {
-        CollectivePrepare::compute_consumer_operands(
-            shared_storage, params.prepare, params.problem_size, work_desc, pipeline, thread_idx);
-      } else {
-        int producer_warp = warp_idx - CollectivePrepare::NumConsumerWarps;
-        if (producer_warp == CollectivePrepare::QkProducerWarp) {
-          if (work_desc.n_chunks > 0) {
-            typename CollectivePrepare::LoadQ load_q(params.prepare.tme_q, pipeline.qk, shared_storage.smem_q_raw);
-            typename CollectivePrepare::LoadK load_k(params.prepare.tme_k, pipeline.qk, shared_storage.smem_k_raw);
-            auto                              q_src_dst =
-                load_q.partition_SD(params.problem_size, typename CollectivePrepare::TileShape{}, work_desc);
-            auto k_src_dst =
-                load_k.partition_SD(params.problem_size, typename CollectivePrepare::TileShape{}, work_desc);
-            for (int chunk_idx = 0; chunk_idx < work_desc.n_chunks; ++chunk_idx) {
-              if (mutlass::canonical_lane_idx() == 0) {
-                pipeline.qk.producer_acquire(pipeline.qk_write);
-              }
-              auto q_write = pipeline.qk_write;
-              auto k_write = pipeline.qk_write;
-              load_q.template step<false>(q_src_dst, chunk_idx, q_write);
-              load_k.template step<false>(k_src_dst, chunk_idx, k_write);
-              if (mutlass::canonical_lane_idx() == 0) {
-                ++pipeline.qk_write;
-              }
-            }
-          }
-        } else if (producer_warp == CollectivePrepare::GateProducerWarp) {
-          if (work_desc.n_chunks > 0) {
-            typename CollectivePrepare::LoadG load_g(params.prepare.tme_g, pipeline.g, shared_storage.smem_g_raw);
-            auto                              g_src_dst =
-                load_g.partition_SD(params.problem_size, typename CollectivePrepare::TileShape{}, work_desc);
-            for (int chunk_idx = 0; chunk_idx < work_desc.n_chunks; ++chunk_idx) {
-              if (mutlass::canonical_lane_idx() == 0) {
-                pipeline.g.producer_acquire(pipeline.qk_write);
-              }
-              auto g_write = pipeline.qk_write;
-              load_g.template step<false>(g_src_dst, chunk_idx, g_write);
-              if (mutlass::canonical_lane_idx() == 0) {
-                ++pipeline.qk_write;
-              }
-            }
-          }
-        } else if (producer_warp == CollectivePrepare::StoreProducerWarp) {
-          CollectivePrepare::store_workspace_tme(params.prepare,
-                                                 params.problem_size,
-                                                 work_desc,
-                                                 shared_storage,
-                                                 pipeline,
-                                                 thread_idx - CollectivePrepare::NumConsumerThreads);
-        }
-      }
-      tile_scheduler.advance(params.scheduler, params.problem_size, work_cursor);
+    // MP31 assigns the producer squad (Q, K, G, inverse) to warps 0-3 and the
+    // SQMMA/epilogue squad to warps 4-7, matching the recurrence kernel's
+    // `thread_idx - NumProducerThreads` convention.
+    if (warp_idx >= CollectivePrepare::ConsumerWarpBase) {
+      run_role<&CollectivePrepare::template consumer_loop<ProblemSize, typename TileScheduler::WorkDesc>>(
+          shared_storage,
+          params,
+          tile_scheduler,
+          pipeline,
+          thread_idx - CollectivePrepare::ConsumerWarpBase * mutlass::NumThreadsPerWarp);
+    } else if (warp_idx == CollectivePrepare::NormalizeQWarp) {
+      run_role<&CollectivePrepare::template producer_normalize_q_loop<ProblemSize, typename TileScheduler::WorkDesc>>(
+          shared_storage, params, tile_scheduler, pipeline, thread_idx);
+    } else if (warp_idx == CollectivePrepare::NormalizeKWarp) {
+      run_role<&CollectivePrepare::template producer_normalize_k_loop<ProblemSize, typename TileScheduler::WorkDesc>>(
+          shared_storage, params, tile_scheduler, pipeline, thread_idx);
+    } else if (warp_idx == CollectivePrepare::GateWarp) {
+      run_role<&CollectivePrepare::template producer_gate_loop<ProblemSize, typename TileScheduler::WorkDesc>>(
+          shared_storage, params, tile_scheduler, pipeline, thread_idx);
+    } else {
+      run_role<&CollectivePrepare::template producer_inverse_loop<ProblemSize, typename TileScheduler::WorkDesc>>(
+          shared_storage, params, tile_scheduler, pipeline, thread_idx);
     }
   }
 };

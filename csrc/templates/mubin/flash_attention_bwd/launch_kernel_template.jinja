@@ -1,0 +1,266 @@
+// FlashAttention backward MUBIN launcher. Outputs and workspaces are caller-owned.
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <musa.h>
+#include <musa_runtime.h>
+#include <mutlass/fast_math.h>
+#include <mute/arch/copy_mp31_desc.hpp>
+#include "op_utils.hpp"
+
+{# Keep packed and dense persistent signatures/parameter arrays independent. #}
+{% macro emit_packed_launcher() %}
+void run_{{ func_name }}(const std::string& object_path,
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView dout, ffi::TensorView lse, ffi::TensorView delta,
+    ffi::TensorView dq, ffi::TensorView dk, ffi::TensorView dv,
+    ffi::TensorView cu_q, ffi::TensorView cu_k,
+    int64_t max_q, int64_t max_k, double softmax_scale) {
+  for (auto tensor : {q, k, v, dout, lse, delta, dq, dk, dv, cu_q, cu_k}) {
+    CHECK_MUSA(tensor);
+    CHECK_DEVICE(q, tensor);
+    CHECK_CONTIGUOUS(tensor);
+  }
+  for (auto tensor : {q, k, v, dout, dk, dv}) { CHECK_DIM(3, tensor); }
+  CHECK_DIM(4, dq);
+  CHECK_DIM(2, lse);
+  CHECK_DIM(2, delta);
+  CHECK_DIM(1, cu_q);
+  CHECK_DIM(1, cu_k);
+  auto io_type = {{ "dl_float16" if asm_dtype == "half" else "dl_bfloat16" }};
+  for (auto tensor : {q, k, v, dout}) {
+    TVM_FFI_ICHECK(dtype_equal(tensor.dtype(), io_type));
+  }
+  for (auto tensor : {lse, delta, dq}) {
+    TVM_FFI_ICHECK(dtype_equal(tensor.dtype(), dl_float32));
+  }
+  for (auto tensor : {dk, dv}) {
+    TVM_FFI_ICHECK(dtype_equal(tensor.dtype(), {{ "dl_float32" if spec.is_gqa else "io_type" }}));
+  }
+  TVM_FFI_ICHECK(dtype_equal(cu_q.dtype(), dl_int32));
+  TVM_FFI_ICHECK(dtype_equal(cu_k.dtype(), dl_int32));
+  TVM_FFI_ICHECK_EQ(cu_q.size(0), cu_k.size(0));
+  TVM_FFI_ICHECK_GT(cu_q.size(0), 1);
+  TVM_FFI_ICHECK_GT(max_q, 0);
+  TVM_FFI_ICHECK_GT(max_k, 0);
+  int32_t batch = cu_q.size(0) - 1, nheads = q.size(1), kv_heads = k.size(1);
+  int32_t headdim_qk = q.size(2), headdim_v = v.size(2);
+  TVM_FFI_ICHECK_GT(nheads, 0);
+  TVM_FFI_ICHECK_GT(kv_heads, 0);
+  TVM_FFI_ICHECK_EQ(nheads % kv_heads, 0);
+  TVM_FFI_ICHECK_EQ(nheads > kv_heads, {{ "true" if spec.is_gqa else "false" }});
+  TVM_FFI_ICHECK_EQ(headdim_qk % 8, 0);
+{% if spec.headdim_qk == 128 %}
+  TVM_FFI_ICHECK_LE(headdim_qk, 128);
+  TVM_FFI_ICHECK_EQ(headdim_v, headdim_qk);
+{% else %}
+  TVM_FFI_ICHECK_EQ(headdim_qk, 192);
+  TVM_FFI_ICHECK_EQ(headdim_v, 128);
+{% endif %}
+  expect_shape(k, {k.size(0), kv_heads, headdim_qk}, "k");
+  expect_shape(v, {k.size(0), kv_heads, headdim_v}, "v");
+  expect_shape(dout, {q.size(0), nheads, headdim_v}, "dout");
+  expect_shape(lse, {nheads, q.size(0)}, "lse");
+  expect_shape(delta, {nheads, q.size(0)}, "delta");
+  expect_shape(dq, {batch, nheads, ((max_q + 63) / 64) * 64, {{ spec.headdim_qk }}}, "dq");
+  expect_shape(dk, {k.size(0), {{ "nheads" if spec.is_gqa else "kv_heads" }}, {{ spec.headdim_qk if spec.is_gqa else "headdim_qk" }}}, "dk");
+  expect_shape(dv, {k.size(0), {{ "nheads" if spec.is_gqa else "kv_heads" }}, {{ spec.headdim_qk if spec.is_gqa else "headdim_v" }}}, "dv");
+  musaDeviceProp properties{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&properties, q.device().device_id));
+  TVM_FFI_ICHECK(properties.major == 3 && properties.minor == 1)
+      << "run_{{ func_name }} requires MP31";
+  ffi::MUSADeviceGuard guard(q.device().device_id);
+  musaStream_t stream = get_stream(q.device());
+  auto descriptor = [&](ffi::TensorView tensor) {
+    for (int i = 0; i < 2; ++i) {
+      TVM_FFI_ICHECK_EQ((tensor.stride(i) * 2) % 16, 0) << "TME strides must be 16-byte aligned";
+    }
+    return TmeDesc(mute::make_tuple(tensor.size(2), tensor.size(1), tensor.size(0)),
+                   mute::make_tuple(tensor.stride(1), tensor.stride(0)),
+                   tensor.data_ptr(), dl_dtype_to_tme_type(io_type));
+  };
+  auto q_desc = descriptor(q), k_desc = descriptor(k);
+  auto v_desc = descriptor(v), do_desc = descriptor(dout);
+  using Input = {{ "mutlass::half_t" if asm_dtype == "half" else "mutlass::bfloat16_t" }};
+  auto key_ptr = mute::make_robust_desc(static_cast<Input*>(k.data_ptr()), k.numel()).reg;
+  auto v_ptr = mute::make_robust_desc(static_cast<Input*>(v.data_ptr()), v.numel()).reg;
+  auto lse_ptr = mute::make_robust_desc(static_cast<float*>(lse.data_ptr()), lse.numel()).reg;
+  auto delta_ptr = mute::make_robust_desc(static_cast<float*>(delta.data_ptr()), delta.numel()).reg;
+  void* dq_ptr = dq.data_ptr(), *dk_ptr = dk.data_ptr(), *dv_ptr = dv.data_ptr();
+  void* cu_q_ptr = cu_q.data_ptr(), *cu_k_ptr = cu_k.data_ptr();
+  float scale = softmax_scale, log2e = std::log2(std::exp(1.0));
+  float rln2_scale = scale * log2e;
+  auto group = mutlass::FastDivmod(nheads / kv_heads);
+  int32_t seqlen_q = max_q, seqlen_k = max_k;
+  int32_t dq_b = dq.stride(0), dq_h = dq.stride(1), dq_s = dq.stride(2);
+  // Expanded KV workspaces are token-major, with consecutive query heads.
+  int32_t dk_g = {{ "dk.stride(1)" if spec.is_gqa else "0" }};
+  int32_t dv_g = {{ "dv.stride(1)" if spec.is_gqa else "0" }};
+  int32_t dk_s = dk.stride(0), dk_h = dk.stride(1) * {{ "group.divisor" if spec.is_gqa else "1" }};
+  int32_t dv_s = dv.stride(0), dv_h = dv.stride(1) * {{ "group.divisor" if spec.is_gqa else "1" }};
+  int32_t k_s = k.stride(0), k_h = k.stride(1), v_s = v.stride(0), v_h = v.stride(1);
+  int32_t lse_b = 0, lse_h = q.size(0);
+  int32_t tile_a = 64 * 64 * 2, tile_b = 128 * 64 * 2;
+  int32_t tile2 = {{ "64 * 64 * 2" if spec.headdim_qk == 192 else "2 * tile_b" }};
+  int32_t tile_key = tile_b, tile_do = tile_b;
+  int32_t a0 = 64, a1 = 1, a2 = 64, b0 = 128, b1 = 1, b2 = 64;
+  int32_t part0 = 64, part1 = 1, part2 = 64, key0 = 64, key1 = 1, key2 = 64;
+  void* params[] = {&dq_ptr, &dk_ptr, &dv_ptr, &do_desc.desc, &q_desc.desc,
+      &k_desc.desc, &key_ptr, &v_desc.desc, &v_ptr, &lse_ptr, &delta_ptr,
+      &cu_q_ptr, &cu_k_ptr, &scale, &rln2_scale, &log2e, &batch, &nheads,
+      &kv_heads, &seqlen_q, &seqlen_k, &headdim_qk, &headdim_v,
+      &group.divisor, &group.multiplier, &group.shift_right,
+      &dq_b, &dq_h, &dq_s, &dk_g, &dk_s, &dk_h, &dv_g, &dv_s, &dv_h,
+      &k_s, &k_h, &v_s, &v_h, &lse_b, &lse_h,
+      &tile_a, &tile_b, &tile2, &tile_key,
+{% if spec.headdim_qk == 192 %}
+      &tile_do,
+{% endif %}
+      &a0, &a1, &a2, &b0, &b1, &b2,
+{% if spec.headdim_qk == 192 %}
+      &part0, &part1, &part2,
+{% endif %}
+      &key0, &key1, &key2};
+  static MUmodule module = [&]() {
+    MUmodule result;
+    MATE_MUSA_DRIVER_CHECK(muModuleLoad(&result, object_path.c_str()));
+    return result;
+  }();
+  static MUfunction function = [&]() {
+    MUfunction result;
+    MATE_MUSA_DRIVER_CHECK(muModuleGetFunction(&result, module, "{{ func_name }}"));
+    return result;
+  }();
+  MUlaunchConfig config{};
+  config.blockDimX = 512; config.blockDimY = 1; config.blockDimZ = 1;
+  config.gridDimX = (max_k + 127) / 128; config.gridDimY = nheads; config.gridDimZ = batch;
+  config.hStream = reinterpret_cast<MUstream>(stream);
+  MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&config, function, params, nullptr));
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}
+{% endmacro %}
+
+{% macro emit_persistent_launcher() %}
+void run_{{ func_name }}(const std::string& object_path,
+    ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+    ffi::TensorView dout, ffi::TensorView lse, ffi::TensorView delta,
+    ffi::TensorView dq, ffi::TensorView dk, ffi::TensorView dv,
+    double softmax_scale) {
+  ffi::MUSADeviceGuard guard(q.device().device_id);
+  auto io_type = {{ "dl_float16" if asm_dtype == "half" else "dl_bfloat16" }};
+  for (auto t : {q, k, v, dout, lse, delta, dq, dk, dv}) {
+    CHECK_MUSA(t); CHECK_DEVICE(q, t); CHECK_CONTIGUOUS(t);
+  }
+  for (auto t : {q, k, v, dout, dq, dk, dv}) { CHECK_DIM(4, t); }
+  for (auto t : {lse, delta}) { CHECK_DIM(3, t); }
+  for (auto t : {q, k, v, dout}) { TVM_FFI_ICHECK(dtype_equal(t.dtype(), io_type)); }
+  for (auto t : {lse, delta, dq}) { TVM_FFI_ICHECK(dtype_equal(t.dtype(), dl_float32)); }
+  for (auto t : {dk, dv}) {
+    TVM_FFI_ICHECK(dtype_equal(t.dtype(), {{ "dl_float32" if spec.is_gqa else "io_type" }}));
+  }
+  int32_t batch=q.size(0), nheads=q.size(2), kv_heads=k.size(2);
+  int32_t seqlen_q=q.size(1), seqlen_kv=k.size(1);
+  int32_t headdim_qk=q.size(3), headdim_v=v.size(3);
+  TVM_FFI_ICHECK_GT(batch, 0); TVM_FFI_ICHECK_GT(seqlen_q, 0);
+  TVM_FFI_ICHECK_GT(seqlen_kv, 0); TVM_FFI_ICHECK_GT(nheads, 0);
+  TVM_FFI_ICHECK_GT(kv_heads, 0); TVM_FFI_ICHECK_EQ(nheads % kv_heads, 0);
+  TVM_FFI_ICHECK_EQ(nheads > kv_heads, {{ "true" if spec.is_gqa else "false" }});
+  TVM_FFI_ICHECK_EQ(headdim_qk, {{ spec.headdim_qk }});
+  TVM_FFI_ICHECK_EQ(headdim_v, 128);
+  int32_t padded_q=(seqlen_q+63)/64*64;
+  expect_shape(k, {batch, seqlen_kv, kv_heads, headdim_qk}, "k");
+  expect_shape(v, {batch, seqlen_kv, kv_heads, headdim_v}, "v");
+  expect_shape(dout, {batch, seqlen_q, nheads, headdim_v}, "dout");
+  expect_shape(lse, {batch, nheads, padded_q}, "lse");
+  expect_shape(delta, {batch, nheads, padded_q}, "delta");
+  expect_shape(dq, {batch, nheads, padded_q, headdim_qk}, "dq");
+  expect_shape(dk, {batch, seqlen_kv, {{ "nheads" if spec.is_gqa else "kv_heads" }}, headdim_qk}, "dk");
+  expect_shape(dv, {batch, seqlen_kv, {{ "nheads" if spec.is_gqa else "kv_heads" }}, {{ "headdim_qk" if spec.is_gqa else "headdim_v" }}}, "dv");
+  musaDeviceProp properties{};
+  MATE_MUSA_RUNTIME_CHECK(musaGetDeviceProperties(&properties, q.device().device_id));
+  TVM_FFI_ICHECK(properties.major == 3 && properties.minor == 1) << "requires MP31";
+  using Input = {{ "mutlass::half_t" if asm_dtype == "half" else "mutlass::bfloat16_t" }};
+  auto descriptor = [&](ffi::TensorView t) {
+    for (int i=0; i<3; ++i) {
+      TVM_FFI_ICHECK_EQ((t.stride(i)*2)%16, 0) << "TME strides must be 16-byte aligned";
+    }
+    return TmeDesc(mute::make_tuple(t.size(3),t.size(1),t.size(2),t.size(0)),
+        mute::make_tuple(t.stride(1),t.stride(2),t.stride(0)),
+        t.data_ptr(),dl_dtype_to_tme_type(io_type));
+  };
+  auto q_desc=descriptor(q), k_desc=descriptor(k), v_desc=descriptor(v), do_desc=descriptor(dout);
+  auto do_desc_addr=do_desc.desc, q_desc_addr=q_desc.desc, key_desc_addr=k_desc.desc, v_desc_addr=v_desc.desc;
+  MUtensorDescriptor dq_desc_addr{}, dk_desc_addr{}, dv_desc_addr{};
+  auto input_key_ptr=mute::make_robust_desc(static_cast<Input*>(k.data_ptr()),k.numel()).reg;
+  auto input_v_ptr=mute::make_robust_desc(static_cast<Input*>(v.data_ptr()),v.numel()).reg;
+  auto input_lse_ptr=mute::make_robust_desc(static_cast<float*>(lse.data_ptr()),lse.numel()).reg;
+  auto input_delta_ptr=mute::make_robust_desc(static_cast<float*>(delta.data_ptr()),delta.numel()).reg;
+  auto input_mask_ptr=mute::make_robust_desc(static_cast<int*>(nullptr),0).reg;
+  void* dq_ptr=dq.data_ptr(); void* dk_ptr=dk.data_ptr(); void* dv_ptr=dv.data_ptr();
+  void* flag_arr=nullptr;
+  int32_t loop_num=(seqlen_q+63)/64;
+  float scale=softmax_scale, nr_log2e=std::log2(std::exp(1.0f)), rln2_scale=scale*nr_log2e;
+  auto group=mutlass::FastDivmod(nheads/kv_heads);
+  int32_t head_group_ori=group.divisor;
+  uint32_t head_group_mul=group.multiplier, head_group_sft=group.shift_right;
+  int32_t batch_stride_do=dout.stride(0), head_stride_do=dout.stride(2), seq_stride_do=dout.stride(1);
+  int32_t batch_stride_dq=dq.stride(0), head_stride_dq=dq.stride(1), seq_stride_dq=dq.stride(2);
+  int32_t head_group_stride_dk={{ "dk.stride(2)" if spec.is_gqa else "0" }};
+  int32_t head_group_stride_dv={{ "dv.stride(2)" if spec.is_gqa else "0" }};
+  int32_t batch_stride_dk=dk.stride(0), head_stride_dk=dk.stride(2)*{{ "group.divisor" if spec.is_gqa else "1" }}, seq_stride_dk=dk.stride(1);
+  int32_t batch_stride_dv=dv.stride(0), head_stride_dv=dv.stride(2)*{{ "group.divisor" if spec.is_gqa else "1" }}, seq_stride_dv=dv.stride(1);
+  int32_t batch_stride_k=k.stride(0), head_stride_k=k.stride(2), seq_stride_k=k.stride(1);
+  int32_t batch_stride_v=v.stride(0), head_stride_v=v.stride(2), seq_stride_v=v.stride(1);
+  int64_t batch_stride_mask=0, head_stride_mask=0;
+  int32_t seq_stride_mask=0, batch_stride_lse_delta=lse.stride(0), head_stride_lse_delta=lse.stride(1);
+  int32_t tile_size0=64*64*2, tile_size1=128*64*2;
+  int32_t tile_size2={{ "64*64*2" if spec.headdim_qk == 192 else "2*128*64*2" }};
+  int32_t tile_size_q_do_a_row=64*64*2, tile_size_q_do_b_row=128*64*2, tile_size_q_b_row=128*64*2;
+  int32_t tile_size_do_b_row=128*64*2, tile_size_key_b_col=128*64*2, tile_size_key_b_row=128*64*2, tile_size_v_b_col=128*64*2;
+  int32_t nt=(seqlen_kv+127)/128, tile_num=batch*nheads*nt;
+  int32_t block_num=std::min(tile_num, properties.multiProcessorCount);
+  int32_t double_block_num=2*block_num, double_block_num_sub1=double_block_num-1;
+  auto div_heads=mutlass::FastDivmod(nheads*nt), div_tiles=mutlass::FastDivmod(nt);
+  int32_t seqkv_mul_heads_div=div_heads.divisor, seqkv_div=div_tiles.divisor;
+  uint32_t seqkv_mul_heads_mul=div_heads.multiplier, seqkv_mul_heads_sft=div_heads.shift_right;
+  uint32_t seqkv_mul=div_tiles.multiplier, seqkv_sft=div_tiles.shift_right;
+{% for name, values in [("tile_q_do_a_row_dims", [64,64,1,1]), ("tile_q_do_b_row_dims", [128,64,1,1]), ("tile_q_b_row_part2_dims", [64,64,1,1]), ("tile_key_b_col_dims", [64,128,1,1]), ("tile_key_b_row_dims", [64,64,1,1]), ("tile_v_b_col_dims", [128,64,1,1])] %}
+{% for value in values %}
+  int32_t {{ name }}_{{ loop.index0 }}={{ value }};
+{% endfor %}
+{% endfor %}
+  void* params[]={
+    &dq_ptr,&dk_ptr,&dv_ptr,&dq_desc_addr,&dk_desc_addr,&dv_desc_addr,&do_desc_addr,&q_desc_addr,
+    &key_desc_addr,&input_key_ptr,&v_desc_addr,&input_v_ptr,&input_mask_ptr,&input_lse_ptr,&input_delta_ptr,
+    &flag_arr,&loop_num,&scale,&rln2_scale,&nr_log2e,&batch,&nheads,&kv_heads,&seqlen_q,&seqlen_kv,&headdim_qk,&headdim_v,
+    &head_group_ori,&head_group_mul,&head_group_sft,&batch_stride_do,&head_stride_do,&seq_stride_do,
+    &batch_stride_dq,&head_stride_dq,&seq_stride_dq,&head_group_stride_dk,&batch_stride_dk,&head_stride_dk,&seq_stride_dk,
+    &head_group_stride_dv,&batch_stride_dv,&head_stride_dv,&seq_stride_dv,&batch_stride_k,&head_stride_k,&seq_stride_k,
+    &batch_stride_v,&head_stride_v,&seq_stride_v,&batch_stride_mask,&head_stride_mask,&seq_stride_mask,
+    &batch_stride_lse_delta,&head_stride_lse_delta,&tile_size0,&tile_size1,&tile_size2,&tile_size_q_do_a_row,
+    &tile_size_q_do_b_row,&tile_size_q_b_row,&tile_size_do_b_row,&tile_size_key_b_col,&tile_size_key_b_row,&tile_size_v_b_col,
+    &tile_num,&double_block_num_sub1,&double_block_num,&block_num,&seqkv_mul_heads_div,&seqkv_mul_heads_mul,
+    &seqkv_mul_heads_sft,&seqkv_div,&seqkv_mul,&seqkv_sft,
+{% for name in ["tile_q_do_a_row_dims", "tile_q_do_b_row_dims", "tile_q_b_row_part2_dims", "tile_key_b_col_dims", "tile_key_b_row_dims", "tile_v_b_col_dims"] %}
+    &{{ name }}_0,&{{ name }}_1,&{{ name }}_2,&{{ name }}_3{{ "," if not loop.last else "" }}
+{% endfor %}
+  };
+  static MUmodule module=[&](){MUmodule m; MATE_MUSA_DRIVER_CHECK(muModuleLoad(&m,object_path.c_str())); return m;}();
+  static MUfunction function=[&](){MUfunction f; MATE_MUSA_DRIVER_CHECK(muModuleGetFunction(&f,module,"{{ func_name }}")); return f;}();
+  MUlaunchConfig cfg{};
+  cfg.blockDimX=512; cfg.blockDimY=1; cfg.blockDimZ=1;
+  cfg.gridDimX=block_num; cfg.gridDimY=1; cfg.gridDimZ=1;
+  cfg.hStream=reinterpret_cast<MUstream>(get_stream(q.device()));
+  MATE_MUSA_DRIVER_CHECK(muLaunchKernelEx(&cfg,function,params,nullptr));
+  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
+}
+{% endmacro %}
+
+{% if spec.is_persistence %}
+{{ emit_persistent_launcher() }}
+{% else %}
+{{ emit_packed_launcher() }}
+{% endif %}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_{{ func_name }}, run_{{ func_name }});

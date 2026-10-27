@@ -58,6 +58,7 @@ __all__ = [
     "ssd_combined_fwd_varlen",
 ]
 
+
 def _ssu_launch():
     """Import the SSU launcher on first use.
 
@@ -715,7 +716,9 @@ class _SsdWorkspace:
 
     __slots__ = ("dt_out", "dA_cumsum", "states", "CB")
 
-    def __init__(self, heads, groups, dim, dstate, nchunks, chunk_size, state_dtype, device):
+    def __init__(
+        self, heads, groups, dim, dstate, nchunks, chunk_size, state_dtype, device
+    ):
         self.dt_out = torch.empty(
             (heads, nchunks, chunk_size), device=device, dtype=torch.float32
         )
@@ -724,7 +727,9 @@ class _SsdWorkspace:
             (nchunks, heads, dim, dstate), device=device, dtype=state_dtype
         )
         self.CB = torch.empty(
-            (nchunks, groups, chunk_size, chunk_size), device=device, dtype=torch.float32
+            (nchunks, groups, chunk_size, chunk_size),
+            device=device,
+            dtype=torch.float32,
         )
 
 
@@ -848,19 +853,29 @@ def ssd_combined_fwd_varlen(
     """
     if any(
         value is not None
-        for value in (checkpoint_token_indices, checkpoint_state_slots, checkpoint_states)
+        for value in (
+            checkpoint_token_indices,
+            checkpoint_state_slots,
+            checkpoint_states,
+        )
     ):
         raise NotImplementedError(
             "ssd_combined_fwd_varlen does not support the checkpoint_* arguments; "
             "the caller must dispatch to its reference path for checkpointed runs."
         )
     if x.dim() != 3 or dt.dim() != 2 or B.dim() != 3 or C.dim() != 3:
-        raise ValueError("packed SSD expects x [tokens, heads, dim] and dt [tokens, heads].")
+        raise ValueError(
+            "packed SSD expects x [tokens, heads, dim] and dt [tokens, heads]."
+        )
     tokens, heads, dim = x.shape
     groups, dstate = B.shape[1], B.shape[2]
     if dt.shape != (tokens, heads):
         raise ValueError("dt must be [tokens, heads].")
-    if x.dtype not in _SSD_SUPPORTED_IO_DTYPES or B.dtype != x.dtype or C.dtype != x.dtype:
+    if (
+        x.dtype not in _SSD_SUPPORTED_IO_DTYPES
+        or B.dtype != x.dtype
+        or C.dtype != x.dtype
+    ):
         raise ValueError("x, B and C must share one of fp16/bf16.")
     if dt.dtype not in _SSD_SUPPORTED_DT_DTYPES:
         raise ValueError("dt must be fp32, fp16 or bf16.")
@@ -904,7 +919,17 @@ def ssd_combined_fwd_varlen(
         state_dtype = initial_states.dtype if initial_states is not None else C.dtype
     if state_dtype not in _SSD_SUPPORTED_STATE_DTYPES:
         raise ValueError("state_dtype must be fp16, bf16 or fp32.")
-    for tensor in (x, dt, A, B, C, cu_seqlens, cu_chunk_seqlens, last_chunk_indices, seq_idx):
+    for tensor in (
+        x,
+        dt,
+        A,
+        B,
+        C,
+        cu_seqlens,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+    ):
         if not tensor.is_contiguous():
             raise ValueError(
                 "x, dt, A, B, C and the chunk metadata must be contiguous."
@@ -1003,7 +1028,11 @@ def prewarm_ssd_combined_fwd_varlen(
     prewarm_ssd_chunk_cumsum(heads, chunk_size, dt_dtype)
     prewarm_ssd_chunk_state(dim, dstate, chunk_size, head_ratio, io_dtype)
     prewarm_ssd_state_passing(
-        dim, dstate, chunk_size, state_dtype, in_dtype=state_dtype,
+        dim,
+        dstate,
+        chunk_size,
+        state_dtype,
+        in_dtype=state_dtype,
         init_dtype=state_dtype,
     )
     prewarm_ssd_bmm(chunk_size, dstate, io_dtype)

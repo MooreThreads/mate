@@ -10,10 +10,9 @@ from .jit.mubin.flash_mla import flash_mla_asm_mubin
 from .jit.mla_ops import get_mla_ops_module
 from .jit.attention.fmha import (
     _fmha_get_metadata as jit_fmha_get_metadata,
+    _fmha_fwd as jit_fmha_fwd,
 )  # noqa: F401
-from .jit.attention.fmha import _fmha_fwd as jit_fmha_fwd  # noqa: F401
 from .jit.attention.fmha.fmha_combine import _flash_attn_combine
-from .execution_context import skip_kernel_launch_if_dry_run
 
 
 @functools.cache
@@ -118,6 +117,28 @@ def _check_valid_asm_input(
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _reduce_max_logits(
+    max_logits: torch.Tensor,
+    seqused_q: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if max_logits.numel() == 0:
+        return max_logits.new_full((max_logits.shape[-2],), float("-inf"))
+    if seqused_q is not None:
+        query = torch.arange(max_logits.shape[-1], device=max_logits.device)
+        if cu_seqlens_q is None:
+            invalid = (query[None, :] >= seqused_q[:, None])[:, None, :]
+        else:
+            batch = torch.searchsorted(cu_seqlens_q[1:], query, right=True)
+            invalid = (query - cu_seqlens_q[batch] >= seqused_q[batch])[None, :]
+        max_logits = max_logits.masked_fill(invalid, float("-inf"))
+    dims = (0, 2) if max_logits.ndim == 3 else 1
+    maximum = max_logits.amax(dim=dims)
+    # Preserve all-masked heads when MUSA amax returns a finite sentinel.
+    valid_count = torch.count_nonzero(~torch.isneginf(max_logits), dim=dims)
+    return maximum.masked_fill(valid_count == 0, float("-inf"))
 
 
 def _allocate_mla_decode_outputs(q: torch.Tensor, head_dim_v: int):
@@ -265,6 +286,7 @@ def _flash_attn_forward(
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
+    return_max_logits: bool = False,
 ):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -319,6 +341,7 @@ def _flash_attn_forward(
         cp_world_size=cp_world_size,
         cp_rank=cp_rank,
         cp_tot_seqused_k=cp_tot_seqused_k,
+        return_max_logits=return_max_logits,
     )
 
     return out, softmax_lse, *rest
@@ -359,12 +382,21 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cp_rank: int = 0,
         cp_tot_seqused_k: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        return_max_logits: bool = False,
+        bwd_backend: str = "auto",
     ):
         if window_size is None:
             window_size = (-1, -1)
         if attention_chunk is None:
             attention_chunk = 0
         select_backend = backend
+        if return_max_logits:
+            if select_backend == "tilelang":
+                raise ValueError(
+                    "max logits are supported by the mubin and mutlass backends"
+                )
+            if isinstance(scheduler_metadata, tuple):
+                raise ValueError("max logits do not support MLA scheduler metadata")
         if select_backend == "auto":
             enable_mubin = _check_valid_asm_input(
                 q=q,
@@ -396,6 +428,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
                 -0.5
             )
+        if return_max_logits and softmax_scale < 0 and softcap <= 0:
+            raise ValueError("return_max_logits requires nonnegative softmax_scale")
 
         if select_backend == "mutlass":
             out, softmax_lse, *rest = _flash_attn_forward(
@@ -436,6 +470,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
                 cp_tot_seqused_k=cp_tot_seqused_k,
+                return_max_logits=return_max_logits,
             )
 
         elif select_backend == "mubin":
@@ -501,20 +536,24 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                     (batch, nr_heads, seq_q), dtype=torch.float32, device=q.device
                 )
 
-            if not skip_kernel_launch_if_dry_run():
-                flash_atten_varlen_asm_mubin(
-                    q,
-                    k,
-                    v,
-                    softmax_scale,
-                    out,
-                    softmax_lse,
-                    causal,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                )
+            max_logits_rows = (
+                torch.empty_like(softmax_lse) if return_max_logits else None
+            )
+            rest = (max_logits_rows,)
+            flash_atten_varlen_asm_mubin(
+                q,
+                k,
+                v,
+                softmax_scale,
+                out,
+                softmax_lse,
+                causal,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                max_logits=max_logits_rows,
+            )
 
         else:
             raise ValueError(
@@ -534,6 +573,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 seqused_q,
                 seqused_k,
             )
+            ctx.has_qv = qv is not None
+            ctx.has_page_table = page_table is not None
+            ctx.has_learnable_sink = learnable_sink is not None
+            ctx.has_q_descale = q_descale is not None
+            ctx.has_k_descale = k_descale is not None
+            ctx.has_v_descale = v_descale is not None
+            ctx.attention_chunk = attention_chunk
+            ctx.cp_world_size = cp_world_size
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
             ctx.softmax_scale = softmax_scale
@@ -541,8 +588,18 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.softcap = softcap
             ctx.deterministic = deterministic
+            ctx.bwd_backend = bwd_backend
 
         should_return_lse = return_softmax_lse
+
+        if return_max_logits:
+            max_logits = _reduce_max_logits(rest[-1], seqused_q, cu_seqlens_q)
+            ctx.mark_non_differentiable(max_logits)
+            return (
+                (out, softmax_lse, max_logits)
+                if should_return_lse
+                else (out, max_logits)
+            )
 
         return (out, softmax_lse) if should_return_lse else out
 
@@ -559,7 +616,30 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q,
             seqused_k,
         ) = ctx.saved_tensors
-        from .flash_attention.tilelang.flash_attention_varlen_bwd import (
+        bwd_backend = ctx.bwd_backend
+        if bwd_backend not in ("auto", "mubin", "tilelang"):
+            raise ValueError(f"Unknown FlashAttention backward backend: {bwd_backend}")
+        # These forward contracts are absent from the ASM backward ABI. Keep
+        # auto on the existing TileLang path rather than ignoring their inputs.
+        extra_bwd_features = (
+            ctx.has_qv
+            or ctx.has_page_table
+            or ctx.has_learnable_sink
+            or bool(ctx.attention_chunk)
+            or ctx.cp_world_size != 1
+            or ctx.has_q_descale
+            or ctx.has_k_descale
+            or ctx.has_v_descale
+        )
+        if extra_bwd_features:
+            if bwd_backend == "mubin":
+                raise ValueError(
+                    "MUBIN backward does not support qv, paged KV, sinks, "
+                    "chunked attention, context parallelism, or descales"
+                )
+            if bwd_backend == "auto":
+                bwd_backend = "tilelang"
+        from .flash_attention.backward import (
             flashattn_varlen_bwd_interface,
         )
 
@@ -583,43 +663,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dtype=None,
             is_bhsd=False,
             deterministic=ctx.deterministic,
+            backend=bwd_backend,
         )
-        # dq = dq[..., : dout.shape[-1]]
-        # dk = dk[..., : dout.shape[-1]]
-        # dv = dv[..., : dout.shape[-1]]
-        return (
-            dq,
-            dk,
-            dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return (dq, dk, dv) + (None,) * (len(ctx.needs_input_grad) - 3)
 
 
 @mate_api
@@ -655,6 +701,8 @@ def flash_attn_varlen_func(
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    return_max_logits: bool = False,
+    bwd_backend: str = "auto",
 ):
     r"""
     FlashAttention3 compaitible API: forward with varlen or non-varlen inputs
@@ -704,7 +752,8 @@ def flash_attn_varlen_func(
         Whether to return the logsumexp of the attention scores.
 
     backend: str
-        The backend to use. It's recommend to use the default ``auto``.
+        The backend to use: ``auto``, ``mutlass``, or ``mubin``.
+        ``auto`` preserves the existing MUBIN-then-MUTLASS selection.
     cp_world_size: int
         Total number of ranks in the Context Parallelism (CP) group. Default 1 (CP disabled).
         When > 1, the global sequence is assumed to be distributed across ranks using an
@@ -717,10 +766,22 @@ def flash_attn_varlen_func(
         ``(batch_size,)``, dtype ``int32``. Required when CP is enabled (``cp_world_size > 1``)
         so that each rank can compute masking boundaries against the full key sequence.
         Ignored when ``cp_world_size == 1``.
+    return_max_logits: bool
+        Return FP32, non-differentiable per-head maxima with shape ``(nheads,)``,
+        reduced over valid batch/query/key positions after scale/softcap/mask,
+        excluding sinks. Heads with no valid attention scores are ``-inf``.
+        Return ``(out, max_logits)`` or ``(out, lse, max_logits)`` when LSE is requested.
+        ``auto`` selects ASM where supported, otherwise MUTLASS. CP maxima are rank-local. FP8 Q/K descales
+        and, without softcap, softmax scale must be non-negative.
+
+    bwd_backend: str
+        Backward backend: ``auto`` prefers MUBIN on supported MP31 inputs and
+        otherwise uses TileLang. ``mubin`` requires ASM support; ``tilelang``
+        explicitly selects TileLang. Independent of the forward backend.
 
     Returns
     -------
-    Union[Tensor, Tuple[Tensor, Tensor]]
+    Union[Tensor, Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]
         If :attr:`return_softmax_lse` is ``False``, the attention output, shape ``(total_q, nheads, headdim_v)``
 
         If :attr:`return_softmax_lse` is ``True``, a tuple of two tensors:
@@ -761,6 +822,8 @@ def flash_attn_varlen_func(
         cp_rank,
         cp_tot_seqused_k,
         out,
+        return_max_logits,
+        bwd_backend,
     )
 
 
@@ -814,6 +877,7 @@ def flash_attn_with_kvcache(
     cp_rank: int = 0,
     cp_tot_seqused_k: Optional[torch.Tensor] = None,
     only_qv: bool = False,
+    return_max_logits: bool = False,
 ):
     r"""FlashAttention3 compatible API: forward with kv cache
 
@@ -911,10 +975,16 @@ def flash_attn_with_kvcache(
         the cyclic global positions owned by that rank. Ignored when ``cp_world_size == 1``.
     only_qv: bool
         Skip the QK score and use only the QV score.
+    return_max_logits: bool
+        Return FP32 per-head maxima with shape ``(nheads,)``, reduced over valid
+        batch/query/key positions after scale/softcap/mask, excluding sinks.
+        Heads with no valid attention scores are ``-inf``. CP maxima are rank-local.
+        Return ``(out, max_logits)`` or ``(out, lse, max_logits)`` when LSE is requested.
+        FP8 Q/K descales and, without softcap, softmax scale must be non-negative.
 
     Returns
     -------
-    Union[Tensor, Tuple[Tensor, Tensor]]
+    Union[Tensor, Tuple[Tensor, ...]]
         If :attr:`return_softmax_lse` is ``False``, the attention output, shape ``(batch_size, seqlen, nheads, headdim_v)`` if cu_seqlens_q is None,
         or ``(total_q, nheads, headdim_v)`` if cu_seqlens_q is not None
 
@@ -926,6 +996,8 @@ def flash_attn_with_kvcache(
           or ``(nheads, total_q)`` if cu_seqlens_q is not None
 
     """
+    if return_max_logits and isinstance(scheduler_metadata, tuple):
+        raise ValueError("max logits do not support MLA scheduler metadata")
     if only_qv:
         if qv is None:
             raise ValueError("only_qv=True requires qv")
@@ -1054,13 +1126,20 @@ def flash_attn_with_kvcache(
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mp_margin=sm_margin,
-            return_lse=return_softmax_lse,
+            return_lse=return_softmax_lse or return_max_logits,
             lse=None,
             out=None,
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
             cp_tot_seqused_k=cp_tot_seqused_k,
             only_qv=only_qv,
+            return_max_logits=return_max_logits,
+        )
+
+    if return_max_logits:
+        max_logits = _reduce_max_logits(rest[-1], cu_seqlens_q=cu_seqlens_q)
+        return (
+            (out, softmax_lse, max_logits) if return_softmax_lse else (out, max_logits)
         )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out

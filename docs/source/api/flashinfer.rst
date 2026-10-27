@@ -8,6 +8,9 @@ See the :doc:`FlashInfer wrapper guide <../wrappers/flashinfer_wrapper>` for
 installation, supported workflows, constraints, and the end-to-end FP8 MLA
 example.
 
+FlashInfer Norm covers RMSNorm, LayerNorm, fused add Norm, and quantized
+variants.
+
 GEMM
 ----
 

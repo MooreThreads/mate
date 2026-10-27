@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 
 from mate.artifacts import ensure_mubin_module_artifacts
+from mate.execution_context import skip_kernel_launch_if_dry_run
 
 from ..common import get_asm_dtype_from_torch_dtype
 from ..launcher import get_mubin_launch_function, render_mubin_launcher
@@ -27,9 +28,12 @@ def _get_flash_attention_mubin_launch_plan(
     is_causal: bool,
     is_varlen: bool,
     headdim_qk: int,
+    has_max_logits: bool = False,
 ):
     dispatcher = _get_flash_attention_mubin_runtime()
-    asm_id = dispatcher.get_asm_id(dtype, is_causal, is_varlen, headdim_qk)
+    asm_id = dispatcher.get_asm_id(
+        dtype, is_causal, is_varlen, headdim_qk, has_max_logits
+    )
     entry = dispatcher.resolve_kernel_entry(asm_id)
     kernel_path = dispatcher.resolve_kernel_path(asm_id)
     launch = get_mubin_launch_function(
@@ -57,11 +61,18 @@ def flash_atten_varlen_asm_mubin(
     input_cu_seqlen_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    max_logits: Optional[torch.Tensor] = None,
 ):
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("flash_atten_varlen_asm_mubin only supports fp16 and bf16")
     if q.ndim not in (3, 4):
         raise ValueError("q must be a 3D or 4D tensor")
+
+    if softmax_scale == 0.0:
+        # ASM scales scores after applying -inf masks. Use zero Q and unit
+        # scale to preserve those masks without producing 0 * -inf NaNs.
+        q = torch.zeros_like(q)
+        softmax_scale = 1.0
 
     headdim_qk = q.shape[-1]
     if headdim_qk <= 0 or (headdim_qk > 128 and headdim_qk != 192):
@@ -95,8 +106,10 @@ def flash_atten_varlen_asm_mubin(
         dispatch_is_varlen = False
 
     kernel_path, launch = _get_flash_attention_mubin_launch_plan(
-        q.dtype, is_causal, dispatch_is_varlen, headdim_qk
+        q.dtype, is_causal, dispatch_is_varlen, headdim_qk, max_logits is not None
     )
+    if skip_kernel_launch_if_dry_run():
+        return None
     launch(
         kernel_path,
         q,
@@ -109,5 +122,6 @@ def flash_atten_varlen_asm_mubin(
         input_cu_seqlen_k,
         max_seqlen_q,
         max_seqlen_kv,
+        max_logits,
     )
     return None

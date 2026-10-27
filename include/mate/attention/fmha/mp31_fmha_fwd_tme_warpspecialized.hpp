@@ -1606,7 +1606,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     // If invalid, return empty result.
     if (n_block_min >= n_block_max) {
       auto lse = make_tensor<float>(Shape<Int<Rows>>{});
-      return mute::make_tuple(false, mute::make_tuple(acc_pv, lse));
+      return mute::make_tuple(false, mute::make_tuple(acc_pv, lse, lse));
     }
 
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQFull{});
@@ -1872,6 +1872,14 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                               FragmentSize,
                               !(IsCausal || IsLocal) /*FixedPosition*/,
                               HeadRatio>;
+      // The rotary copy atom may span more rows than one TileM tile (e.g. fp8 QV forces
+      // TileM = 32 while the atom row extent is NumQKMmaThreads / GmemThreadsPerRow = 64).
+      // In that case the atom over-tiles the tile and the per-row predicates in
+      // load_cos_sin / apply_Q_* mask the excess rows, so accept either direction.
+      static_assert(TileM % MUTE_STATIC_V(shape<0>(typename Rotary_t::LayoutAtom{})) == 0 ||
+                        MUTE_STATIC_V(shape<0>(typename Rotary_t::LayoutAtom{})) % TileM == 0,
+                    "TileM and the Q rotary copy atom row extent (NumQKMmaThreads / GmemThreadsPerRow) "
+                    "must divide one another");
       Rotary_t rotary{params.ptr_rotary_cos,
                       params.shape_rotary,
                       params.stride_rotary_cos,
@@ -1881,8 +1889,7 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
                       seqlen_q,
                       seqlen_info.seqlen_rotary};
 
-      Tensor sQ_pi = mute::as_position_independent_swizzle_tensor(
-          make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQRotary{}));
+      Tensor sQ_pi = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQRotary{});
 
       auto [tRrCos, tRrSin] =
           conditional_return<!IsPackGQA>(rotary.template load_cos_sin<IsRotaryInterleaved /*IsInterleaved*/>(
@@ -2233,7 +2240,12 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
             : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
     Tensor lse = softmax.tail(acc_pv, tiled_mma_pv, sink_vals, v_descale);
 
-    return mute::make_tuple(true, mute::make_tuple(acc_pv, lse));
+    Tensor max_logits = make_fragment_like(softmax.row_max);
+    MUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(max_logits); ++i) {
+      max_logits(i) = softmax.row_max(i) == -INFINITY ? -INFINITY : softmax.row_max(i) * effective_scale;
+    }
+    return mute::make_tuple(true, mute::make_tuple(acc_pv, lse, max_logits));
   }
 
   template <class BlockCoord>
@@ -2380,10 +2392,8 @@ struct Mp31FmhaFwdTmeWarpSpecialized {
     // This aliases the same storage selected by load_kv_new.
     auto smem_k_new_ptr =
         conditional_return<UseQStorageForKNew>(shared_storage.smem_q.data(), shared_storage.smem_k.data());
-    Tensor sK =
-        mute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(smem_k_new_ptr), SmemLayoutKNew{}));
-    Tensor sV = mute::as_position_independent_swizzle_tensor(
-        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{}));
+    Tensor sK = make_tensor(make_smem_ptr(smem_k_new_ptr), SmemLayoutKNew{});
+    Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVLsu{});
 
     int const bidh_kv = !IsPackGQA ? bidh / HeadRatio : bidh;
     int const bidb_kv = !HasKvBatchIdx ? bidb : params.kv_batch_idx[bidb];

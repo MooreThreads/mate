@@ -24,7 +24,8 @@ using TileShape = mute::Shape<mute::Int<{{ chunk_size }}>, mute::Int<{{ chunk_si
 using StrideQ = kda::ChunkKdaQkStride;
 using StrideK = StrideQ;
 using StrideG = StrideQ;
-using Kernel = typename kda::Mp31ChunkKdaPrepareBuilder<Element,
+using Kernel = typename kda::ChunkKdaPrepareBuilder<{{ arch_tag }},
+                                                        Element,
                                                         CuSeqlensElement,
                                                         LogicalShape,
                                                         TileShape,
@@ -52,7 +53,7 @@ void launch_kda_prepare(Element const* q,
                         Element* workspace_kr,
                         Element* workspace_inverse,
                         Element* workspace_p,
-                        float* workspace_total,
+                        Element* workspace_total,
                         int32_t* workspace_metadata,
                         CuSeqlensElement const* cu_seqlens,
                         float const* A_log,
@@ -83,15 +84,15 @@ void launch_kda_prepare(Element const* q,
   };
   typename Kernel::Params params = Kernel::to_underlying_arguments(arguments);
 {% if is_varlen == "true" %}  if (N > 1) {
-    kda::launch_chunk_kda_metadata<Components::kChunk,
-                                   CuSeqlensElement,
-                                   typename Components::SchedulePolicy>(
-        reinterpret_cast<kda::ChunkKdaPartitionMetadata*>(workspace_metadata),
-        cu_seqlens,
-        N,
-        Hv,
-        num_partitions,
-        stream);
+    auto const metadata_status =
+        kda::launch_chunk_kda_metadata<Components::kChunk, CuSeqlensElement, typename Components::SchedulePolicy>(
+            reinterpret_cast<kda::ChunkKdaPartitionMetadata*>(workspace_metadata),
+            cu_seqlens,
+            N,
+            Hv,
+            num_partitions,
+            stream);
+    MATE_MUSA_RUNTIME_CHECK(metadata_status);
   }
 {% endif %}
   auto kernel = mutlass::device_kernel<Kernel>;
@@ -99,6 +100,7 @@ void launch_kda_prepare(Element const* q,
       kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Kernel::SharedStorageSize)));
   kernel<<<Kernel::TileScheduler::get_grid_shape(params.scheduler, mp_count), Kernel::MaxThreadsPerBlock,
            Kernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }
 
 inline StrideQ stride_q(ffi::TensorView x) {
@@ -112,9 +114,62 @@ inline void check_qkg(ffi::TensorView x, const char* name) {
       << name << " last dimension must be " << Components::kHeadDim;
   TVM_FFI_ICHECK_EQ(x.stride(3), 1) << name << " last dimension must be contiguous";
 }
-inline void check_workspace(ffi::TensorView x, DLDataType dtype, const char* name, ffi::TensorView ref) {
+// The five workspace tensors are views into ONE chunk-major allocation: all
+// five fields of a record are adjacent, so the record dimension strides by
+// Workspace::RecordStride and these views are deliberately NOT contiguous.
+// Validate the expected chunk-major layout (strides + shared-buffer offsets)
+// instead of requiring contiguity, so a genuinely wrong buffer is still
+// rejected.
+inline void check_workspace_contiguous(ffi::TensorView x, DLDataType dtype, const char* name,
+                                       ffi::TensorView ref) {
   CHECK_MUSA(x); CHECK_CONTIGUOUS(x); CHECK_INPUT_TYPE(x, dtype); CHECK_DEVICE(ref, x);
   TVM_FFI_ICHECK_GT(x.numel(), 0) << name << " must not be empty";
+}
+
+inline void check_workspace_field(ffi::TensorView x, DLDataType dtype, const char* name,
+                                  ffi::TensorView ref, int64_t rows, int64_t cols) {
+  CHECK_MUSA(x); CHECK_INPUT_TYPE(x, dtype); CHECK_DEVICE(ref, x);
+  TVM_FFI_ICHECK_GT(x.numel(), 0) << name << " must not be empty";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 4) << name << " must be [records, heads, rows, cols]";
+  TVM_FFI_ICHECK_EQ(x.size(2), rows) << name << " has an unexpected row count";
+  TVM_FFI_ICHECK_EQ(x.size(3), cols) << name << " has an unexpected inner dimension";
+  TVM_FFI_ICHECK_EQ(x.stride(3), 1) << name << " inner dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(2), cols) << name << " rows must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(1), Workspace::RecordStride)
+      << name << " must be a chunk-major workspace view (per-head stride "
+      << Workspace::RecordStride << ")";
+  TVM_FFI_ICHECK_EQ(x.stride(0), x.size(1) * Workspace::RecordStride)
+      << name << " outer dimension must stride by heads * chunk-major record stride";
+}
+
+inline void check_workspace_total(ffi::TensorView x, ffi::TensorView ref) {
+  CHECK_MUSA(x); CHECK_INPUT_TYPE(x, {{ element_dtype }}); CHECK_DEVICE(ref, x);
+  TVM_FFI_ICHECK_GT(x.numel(), 0) << "workspace_total must not be empty";
+  TVM_FFI_ICHECK_EQ(x.ndim(), 3) << "workspace_total must be [records, heads, kHeadDim]";
+  TVM_FFI_ICHECK_EQ(x.size(2), Components::kHeadDim) << "workspace_total has an unexpected inner dimension";
+  TVM_FFI_ICHECK_EQ(x.stride(2), 1) << "workspace_total inner dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(x.stride(1), Workspace::RecordStride)
+      << "workspace_total must use the chunk-major record stride";
+  TVM_FFI_ICHECK_EQ(x.stride(0), x.size(1) * Workspace::RecordStride)
+      << "workspace_total outer dimension must stride by heads * record stride";
+}
+
+// All five views must be slices of the same buffer, at the field offsets
+// `mate/kda.py` built them with.  The kernels take data_ptr() as the field base
+// and reconstruct the record stride from the header, so this is exactly the
+// invariant they rely on.
+inline void check_workspace_offsets(ffi::TensorView decayed, ffi::TensorView k_restored,
+                                    ffi::TensorView inverse, ffi::TensorView p, ffi::TensorView total) {
+  const char*   base = static_cast<const char*>(decayed.data_ptr());
+  const int64_t esz  = static_cast<int64_t>(sizeof(Element));
+  auto at = [&](ffi::TensorView x, int64_t off_bytes, const char* name) {
+    TVM_FFI_ICHECK_EQ(static_cast<const char*>(x.data_ptr()) - base, off_bytes)
+        << name << " must alias the chunk-major workspace at byte offset " << off_bytes;
+  };
+  at(k_restored, Workspace::KRestoredOffset * esz, "workspace_k_restored");
+  at(inverse, Workspace::InverseOffset * esz, "workspace_inverse");
+  at(p, Workspace::POffset * esz, "workspace_p");
+  at(total, Workspace::TotalOffsetBytes, "workspace_total");
 }
 }  // namespace
 
@@ -170,12 +225,18 @@ void {{ func_name }}(ffi::TensorView q,
     CHECK_CONTIGUOUS(A); CHECK_CONTIGUOUS(D); CHECK_DEVICE(q,A); CHECK_DEVICE(q,D);
     A_ptr=static_cast<float const*>(A.data_ptr()); dt_ptr=static_cast<float const*>(D.data_ptr());
   }
-  check_workspace(workspace_decayed, {{ element_dtype }}, "workspace_decayed", q);
-  check_workspace(workspace_kr, {{ element_dtype }}, "workspace_k_restored", q);
-  check_workspace(workspace_inverse, {{ element_dtype }}, "workspace_inverse", q);
-  check_workspace(workspace_p, {{ element_dtype }}, "workspace_p", q);
-  check_workspace(workspace_total, dl_float32, "workspace_total", q);
-{% if is_varlen == "true" %}  check_workspace(workspace_metadata, dl_int32, "workspace_metadata", q);
+  check_workspace_field(workspace_decayed, {{ element_dtype }}, "workspace_decayed", q,
+                        2 * Components::kChunk, Components::kHeadDim);
+  check_workspace_field(workspace_kr, {{ element_dtype }}, "workspace_k_restored", q,
+                        Components::kChunk, Components::kHeadDim);
+  check_workspace_field(workspace_inverse, {{ element_dtype }}, "workspace_inverse", q,
+                        Components::kChunk, Components::kChunk);
+  check_workspace_field(workspace_p, {{ element_dtype }}, "workspace_p", q,
+                        Components::kChunk, Components::kChunk);
+  check_workspace_total(workspace_total, q);
+  check_workspace_offsets(workspace_decayed, workspace_kr, workspace_inverse, workspace_p,
+                          workspace_total);
+{% if is_varlen == "true" %}  check_workspace_contiguous(workspace_metadata, dl_int32, "workspace_metadata", q);
   auto metadata_problem = make_problem_size(B, T, Hqk, Hv, N, nullptr);
   int metadata_partitions = Components::prepare_partition_count(metadata_problem, mp_count);
   if (N > 1) {
@@ -189,12 +250,12 @@ void {{ func_name }}(ffi::TensorView q,
                      static_cast<Element const*>(g.data_ptr()), static_cast<Element const*>(beta.data_ptr()),
                      static_cast<Element*>(workspace_decayed.data_ptr()),
                      static_cast<Element*>(workspace_kr.data_ptr()), static_cast<Element*>(workspace_inverse.data_ptr()),
-                     static_cast<Element*>(workspace_p.data_ptr()), static_cast<float*>(workspace_total.data_ptr()),
+                     static_cast<Element*>(workspace_p.data_ptr()),
+                     static_cast<Element*>(workspace_total.data_ptr()),
                      static_cast<int32_t*>(workspace_metadata.data_ptr()),
                      cu_ptr, A_ptr, dt_ptr,
                      stride_q(q), stride_k(k), stride_g(g), static_cast<float>(scale), static_cast<float>(lower_bound),
                      B, T, Hqk, Hv, N, get_stream(q.device()));
-  MATE_MUSA_RUNTIME_CHECK(musaGetLastError());
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});

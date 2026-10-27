@@ -94,7 +94,7 @@ out, softmax_lse = flash_attn_with_kvcache(
 | Page Size | ✅ Supported | `1`, `16`, `64`, and arbitrary page sizes |
 | Dtype | ✅ Supported | `bf16`, `fp16`, `torch.float8_e4m3fn`, and `torch.float8_e5m2` forward inputs; FP8 uses `q_descale` / `k_descale` / `v_descale` scaling |
 | QV Input | ✅ Supported | The forward path supports an optional `qv` input, including FP8 inputs with `qv` |
-| HeadDim | ✅ Supported | Any `headdim <= 512` |
+| HeadDim | ✅ Supported | `headdim <= 512`, subject to dtype- and `qv`-specific alignment rules below |
 | Optimization | ✅ Supported | `SplitKV`, `PackGQA`, `SchedulerMetadata` |
 | Output | ✅ Supported | `out`, `softmax_lse` |
 
@@ -105,10 +105,26 @@ out, softmax_lse = flash_attn_with_kvcache(
 | Context Parallel | ✅ Supported | `cp_world_size`, `cp_rank`, `cp_tot_seqused_k` |
 | Learnable Sink | ✅ Supported | Supported on the local-attention path |
 
+## Head-Dimension Alignment
+
+The forward path supports `headdim <= 512`, but the supported range does not
+mean that arbitrary head dimensions are accepted. The alignment rules are:
+
+| Configuration | Q/K head dimension | V head dimension |
+| --- | --- | --- |
+| FP16 or BF16 without `qv` | Must be divisible by 2 | Must be divisible by 2 |
+| FP8 without `qv` | Must be divisible by 4 | Must be divisible by 4 |
+| With `qv` | Must be divisible by 8 | Must be divisible by 8 |
+
+These are alignment gates in addition to the other API and kernel limits. For
+example, FP16/BF16 `D=130` and FP8 `D=132` are alignment-valid without `qv`,
+while FP16/BF16 `D=129` and FP8 `D=130` are invalid. With `qv`, Q/K `D=128`
+and V `D=256` are alignment-valid, while either dimension equal to `130` is
+invalid. The `qv` path also requires V `D <= 512`.
+
 ## Notes
 
 - This page summarizes the compatibility surface, not every internal kernel detail.
-- The statement `Any headdim <= 512` refers to the supported forward-path head-dimension range.
 - FP8 forward support includes `torch.float8_e4m3fn` and `torch.float8_e5m2`; pass optional
   `q_descale`, `k_descale`, and `v_descale` tensors with shape
   `(batch_size, num_heads_kv)` when scale factors are required.

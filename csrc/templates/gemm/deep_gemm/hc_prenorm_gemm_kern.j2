@@ -90,4 +90,5 @@ void {{ func_name }}(
   dim3 grid   = Kernel::get_grid_shape(params);
   mutlass::device_kernel<Kernel><<<grid, Kernel::MaxThreadsPerBlock,
                                    Kernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
 }

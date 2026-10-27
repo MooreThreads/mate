@@ -47,7 +47,7 @@ def sparse_attention_fwd_kernel(
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
     )
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
+    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim), (
         f"haven't check padding correctness yet, dim={tail_dim}"
     )
     topk = T.dynamic("topk")
@@ -73,7 +73,7 @@ def sparse_attention_fwd_kernel(
     dtype = "bfloat16"
     accum_dtype = "float"
     dtype_bytes = 2
-    dim_bytes = 656
+    dim_bytes = 528 + 2 * tail_dim
     q_shape = [batch, seq_len, num_heads, dim + tail_dim]
     kv_shape = [seq_len_kv, kv_group, dim_bytes]
     k_pe_shape = [seq_len_kv, kv_group, dim_bytes // 2]
@@ -130,6 +130,7 @@ def sparse_attention_fwd_kernel(
         l0_start=0,
         l1_start=dim_qk // 4,
         out_dtype=dtype,
+        guard_invalid_heads=head_kv < block_h,
         support_split=support_split,
     )
     finalize_right = make_scheduled_decode_finalize_right(
@@ -141,6 +142,7 @@ def sparse_attention_fwd_kernel(
         r0_start=dim_qk // 2,
         r1_start=dim_qk // 2 + dim_qk // 4,
         out_dtype=dtype,
+        guard_invalid_heads=head_kv < block_h,
         support_split=support_split,
     )
     stage_value_shared = make_scheduled_decode_stage_value_shared(
@@ -186,8 +188,9 @@ def sparse_attention_fwd_kernel(
             kv_shared_r = T.alloc_shared([block_i, dim_qk // 2], dtype)
             q_shared_l = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
             q_shared_r = T.alloc_shared([heads_per_block, dim_qk // 2], dtype)
-            q_tail_shared = T.alloc_shared([heads_per_block, tail_dim_qk], dtype)
-            k_tail_shared = T.alloc_shared([block_i, tail_dim_qk], dtype)
+            if tail_dim > 0:
+                q_tail_shared = T.alloc_shared([heads_per_block, tail_dim_qk], dtype)
+                k_tail_shared = T.alloc_shared([block_i, tail_dim_qk], dtype)
             v_shared_0 = T.alloc_shared([block_i, dim_qk // 4], dtype)
             v_shared_1 = T.alloc_shared([block_i, dim_qk // 4], dtype)
             scores_shared = T.alloc_shared([heads_per_block, block_i], dtype)
@@ -197,31 +200,38 @@ def sparse_attention_fwd_kernel(
             is_kv_valid = T.alloc_shared([block_i], "bool", scope="shared")
             kv_indices = T.alloc_shared([block_i], "int32", scope="shared")
             quant_shared = T.alloc_shared([block_i, 4], "float32")
-            bar_kv_mask_ready = T.alloc_barrier(arrive_count=128)
-            bar_kv_mask_free = T.alloc_barrier(arrive_count=256)
-            bar_q = T.alloc_barrier(arrive_count=512)
+            # EC_007: alternate physical IDs without adding shared-memory stages.
+            bar_kv_mask_ready = T.alloc_barrier(arrive_count=[128, 128])
+            bar_kv_mask_free = T.alloc_barrier(arrive_count=[512, 512])
+            bar_q = T.alloc_barrier(arrive_count=[512, 512])
             # bar_q_free = T.alloc_barrier(arrive_count=256)
-            bar_indices_ready = T.alloc_barrier(arrive_count=128)
-            bar_kv0_ready = T.alloc_barrier(arrive_count=128)
-            bar_kv1_ready = T.alloc_barrier(arrive_count=128)
-            bar_kv0_lma_read_ready = T.alloc_barrier(arrive_count=256)
-            bar_kv1_lma_read_ready = T.alloc_barrier(arrive_count=256)
-            bar_kv0_quant_ready = T.alloc_barrier(arrive_count=256)
-            bar_kv1_quant_ready = T.alloc_barrier(arrive_count=256)
-            bar_kv0_free = T.alloc_barrier(arrive_count=256)
-            bar_kv1_free = T.alloc_barrier(arrive_count=256)
-            bar_vl0_ready = T.alloc_barrier(arrive_count=256)
-            bar_vl1_ready = T.alloc_barrier(arrive_count=256)
-            bar_vr0_ready = T.alloc_barrier(arrive_count=256)
-            bar_vr1_ready = T.alloc_barrier(arrive_count=256)
+            bar_indices_ready = T.alloc_barrier(arrive_count=[128, 128])
+            bar_kv0_ready = T.alloc_barrier(arrive_count=[128, 128])
+            bar_kv1_ready = T.alloc_barrier(arrive_count=[128, 128])
+            bar_kv0_quant_ready = T.alloc_barrier(arrive_count=[256, 256])
+            bar_kv1_quant_ready = T.alloc_barrier(arrive_count=[256, 256])
+            bar_kv0_free = T.alloc_barrier(arrive_count=[256, 256])
+            bar_kv1_free = T.alloc_barrier(arrive_count=[256, 256])
+            bar_vl0_ready = T.alloc_barrier(arrive_count=[256, 256])
+            bar_vl1_ready = T.alloc_barrier(arrive_count=[256, 256])
+            bar_vr0_ready = T.alloc_barrier(arrive_count=[256, 256])
+            bar_vr1_ready = T.alloc_barrier(arrive_count=[256, 256])
             # bar_vr0_free = T.alloc_barrier(arrive_count=256)
             # bar_vr1_free = T.alloc_barrier(arrive_count=256)
-            bar_vl0_free = T.alloc_barrier(arrive_count=256)
-            bar_vl1_free = T.alloc_barrier(arrive_count=256)
-            # bar_p_free = T.alloc_barrier(arrive_count=256)
-            bar_p_ready = T.alloc_barrier(arrive_count=256)
-            bar_final = T.alloc_barrier(arrive_count=256)
+            bar_vl0_free = T.alloc_barrier(arrive_count=[256, 256])
+            bar_vl1_free = T.alloc_barrier(arrive_count=[256, 256])
+            # bar_pv_free = T.alloc_barrier(arrive_count=256)
+            # Both PV consumers release shared P/alpha/V before the next iteration.
+            # Both PV readers release P/alpha and both V buffers together.
+            # C0 acquires this return before their next shared-memory writes.
+            bar_pv_free = T.alloc_barrier(arrive_count=[512, 512])
+            # QK has finished when C0 publishes P. The same notification returns
+            # dequantized KV ownership to C1 (and the C0 helpers) before their next iteration.
+            bar_p_ready_kv_free = T.alloc_barrier(arrive_count=[256, 256])
+            bar_final = T.alloc_barrier(arrive_count=[256, 256])
+            bar_final_free = T.alloc_barrier(arrive_count=[256, 256])
             # bar_final_free = T.alloc_barrier(arrive_count=256)
+            bar_producer_sync = T.alloc_barrier(arrive_count=[128, 128])
             T.sync_threads()
 
             begin_idx = T.alloc_var(T.int32)
@@ -229,13 +239,27 @@ def sparse_attention_fwd_kernel(
             end_idx = T.alloc_var(T.int32)
             sched_end_block_idx = T.alloc_var(T.int32)
             begin_n_split_idx = T.alloc_var(T.int32)
-            phase_count = T.alloc_local([1], T.int32)
-            T.fill(phase_count, 0)
+            # Keep the KV stage and phase across all scheduled tasks.
+            stage = T.alloc_local([1], T.int32)
+            phase = T.alloc_local([1], T.int32)
+            prev_stage = T.alloc_local([1], T.int32)
+            prev_phase = T.alloc_local([1], T.int32)
+            stage[0] = 0
+            phase[0] = 0
+            prev_stage[0] = 1
+            prev_phase[0] = 1
+            # Keep independent metadata fields out of a single long-lived
+            # register tuple across the persistent task loop.
             begin_idx = tile_scheduler_metadata[bz, 0]
+            T.sched_boundary()
             sched_begin_block_idx = tile_scheduler_metadata[bz, 1]
+            T.sched_boundary()
             end_idx = tile_scheduler_metadata[bz, 2]
+            T.sched_boundary()
             sched_end_block_idx = tile_scheduler_metadata[bz, 3]
+            T.sched_boundary()
             begin_n_split_idx = tile_scheduler_metadata[bz, 4]
+            T.sched_boundary()
 
             kv_robust_desc = T.make_robust_desc(
                 T.address_of(kv[0, 0, 0]),
@@ -251,6 +275,21 @@ def sparse_attention_fwd_kernel(
             )
             h1 = h0 + heads_per_block
             tid = T.get_thread_binding()
+            # Task barriers advance independently of the KV iteration state.
+            task_stage = T.alloc_var(T.int32)
+            task_phase = T.alloc_var(T.int32)
+            task_stage = 0
+            task_phase = 0
+            # Heads are fixed for this CTA. Retain sink values instead of an
+            # address that would otherwise stay live until final writeback.
+            sink_local = T.alloc_fragment([heads_per_block], accum_dtype)
+            if has_attn_sink:
+                if tid < 256:
+                    for h_i in T.Parallel(heads_per_block):
+                        if h0 + h_i < num_heads:
+                            sink_local[h_i] = attn_sink[h0 + h_i]
+                        else:
+                            sink_local[h_i] = 0.0
             for b_i in range(begin_idx, end_idx + 1, 1):
                 T.call_extern("void", "__musa_loop_transparent_outermost")
                 start_block_idx = T.alloc_var(T.int32)
@@ -276,23 +315,23 @@ def sparse_attention_fwd_kernel(
                     T.tma_copy(
                         q[b_i, s_i, h0:h1, 0 : dim_qk // 2],
                         q_shared_l,
-                        barrier=bar_q,
+                        barrier=bar_q[task_stage],
                     )
                     T.tma_copy(
                         q[b_i, s_i, h0:h1, dim_qk // 2 : dim_qk],
                         q_shared_r,
-                        barrier=bar_q,
+                        barrier=bar_q[task_stage],
                     )
-                    T.tma_copy(
-                        q[b_i, s_i, h0:h1, dim_qk:],
-                        q_tail_shared,
-                        barrier=bar_q,
-                    )
+                    if tail_dim > 0:
+                        T.tma_copy(
+                            q[b_i, s_i, h0:h1, dim_qk:],
+                            q_tail_shared,
+                            barrier=bar_q[task_stage],
+                        )
 
-                    T.ptx_commit_group()
-                    T.ptx_wait_group(0)
-                    T.barrier_arrive(bar_q)
-                    T.barrier_wait(bar_q, (b_i - begin_idx) & 1)
+                    # Q uses TME only; completion belongs to bar_q, not LDLMS.
+                    T.barrier_arrive(bar_q[task_stage])
+                    T.barrier_wait(bar_q[task_stage], task_phase)
                 if tid < 256:
                     sumexp = T.alloc_fragment([heads_per_block], accum_dtype)
                     sumexp_i = T.alloc_fragment([heads_per_block], accum_dtype)
@@ -320,7 +359,10 @@ def sparse_attention_fwd_kernel(
                     T.fill(acc_o_l_0, 0)
                     T.fill(acc_o_l_1, 0)
                     for i_i in range(start_block_idx, end_block_idx):
-                        T.barrier_wait(bar_kv0_ready, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_kv0_ready[stage[0]],
+                            phase[0],
+                        )
                         T.copy(quant_shared[c0_ldg_ty, 0:2], quant_local_l[0, :])
                         T.copy(quant_shared[c0_ldg_ty + 32, 0:2], quant_local_l[1, :])
                         T.annotate_layout(
@@ -403,16 +445,22 @@ def sparse_attention_fwd_kernel(
                                     ] = kv_reg_l[r * 32 + (u + 2) * 8 + v]
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_kv0_quant_ready)
-                        T.barrier_wait(bar_kv_mask_ready, (phase_count[0] & 1))
+                        T.barrier_arrive(bar_kv0_quant_ready[stage[0]])
+                        T.barrier_wait(
+                            bar_kv_mask_ready[stage[0]],
+                            phase[0],
+                        )
                         for h_i, bi_i in T.Parallel(heads_per_block, block_i):
                             acc_s[h_i, bi_i] = T.if_then_else(
                                 is_kv_valid[bi_i % 8 * 8 + bi_i // 8], 0, -(2**30)
                             )
                         T.lma_wait()
-                        T.barrier_arrive(bar_kv_mask_free)
+                        T.barrier_arrive(bar_kv_mask_free[stage[0]])
 
-                        T.barrier_wait(bar_kv0_quant_ready, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_kv0_quant_ready[stage[0]],
+                            phase[0],
+                        )
                         T.gemm(
                             q_shared_l[:, :],
                             kv_shared_l[:, :],
@@ -423,9 +471,12 @@ def sparse_attention_fwd_kernel(
                         )
                         T.warpgroup_commit_batch()
                         T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_kv0_free)
+                        T.barrier_arrive(bar_kv0_free[stage[0]])
 
-                        T.barrier_wait(bar_kv1_quant_ready, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_kv1_quant_ready[stage[0]],
+                            phase[0],
+                        )
                         T.annotate_layout(
                             {
                                 kv_shared_r[
@@ -447,30 +498,35 @@ def sparse_attention_fwd_kernel(
                         )
                         T.warpgroup_commit_batch()
                         T.warpgroup_wait(0)
-                        T.annotate_layout(
-                            {
-                                k_tail_shared[
-                                    :, :
-                                ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                    k_tail_shared[:, :], k_major=True
-                                )
-                            },
-                            allow_reannotation=True,
-                            allow_buffer_region=True,
-                        )
-                        T.gemm(
-                            q_tail_shared,
-                            k_tail_shared[:, :],
-                            acc_s,
-                            transpose_B=True,
-                            policy=T.GemmWarpPolicy.FullRow,
-                            wg_wait=-1,
-                        )
-                        T.warpgroup_commit_batch()
-                        T.warpgroup_wait(0)
+                        if tail_dim > 0:
+                            T.annotate_layout(
+                                {
+                                    k_tail_shared[
+                                        :, :
+                                    ]: tilelang.layout.make_sqmma_swizzled_layout(
+                                        k_tail_shared[:, :], k_major=True
+                                    )
+                                },
+                                allow_reannotation=True,
+                                allow_buffer_region=True,
+                            )
+                            T.gemm(
+                                q_tail_shared,
+                                k_tail_shared[:, :],
+                                acc_s,
+                                transpose_B=True,
+                                policy=T.GemmWarpPolicy.FullRow,
+                                wg_wait=-1,
+                            )
+                            T.warpgroup_commit_batch()
+                            T.warpgroup_wait(0)
                         # T.barrier_arrive(bar_q_free)
-                        T.barrier_arrive(bar_kv1_free)
+                        T.barrier_arrive(bar_kv1_free[stage[0]])
 
+                        T.barrier_wait(
+                            bar_pv_free[prev_stage[0]],
+                            prev_phase[0],
+                        )
                         update_online_softmax(
                             acc_s,
                             acc_s_cast,
@@ -487,13 +543,16 @@ def sparse_attention_fwd_kernel(
                         )
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_p_ready)
+                        T.barrier_arrive(bar_p_ready_kv_free[stage[0]])
                         stage_value_shared(
                             v_shared_0, kv_reg_l, c0_ldg_ty, c0_ldg_tx, 0
                         )
                         T.lma_wait()
-                        T.barrier_arrive(bar_vl0_ready)
-                        T.barrier_wait(bar_vl0_ready, (phase_count[0] & 1))
+                        T.barrier_arrive(bar_vl0_ready[stage[0]])
+                        T.barrier_wait(
+                            bar_vl0_ready[stage[0]],
+                            phase[0],
+                        )
 
                         T.gemm(
                             scores_shared,
@@ -508,11 +567,14 @@ def sparse_attention_fwd_kernel(
                         )
 
                         T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_vl0_free)
+                        T.barrier_arrive(bar_vl0_free[stage[0]])
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_vl1_ready)
-                        T.barrier_wait(bar_vl1_ready, (phase_count[0] & 1))
+                        T.barrier_arrive(bar_vl1_ready[stage[0]])
+                        T.barrier_wait(
+                            bar_vl1_ready[stage[0]],
+                            phase[0],
+                        )
 
                         T.gemm(
                             scores_shared,
@@ -524,8 +586,12 @@ def sparse_attention_fwd_kernel(
                         )
                         T.warpgroup_commit_batch()
                         T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_vl1_free)
-                        phase_count[0] = phase_count[0] ^ 1
+                        T.barrier_arrive(bar_vl1_free[stage[0]])
+                        T.barrier_arrive(bar_pv_free[stage[0]])
+                        prev_stage[0] = stage[0]
+                        prev_phase[0] = phase[0]
+                        phase[0] = phase[0] ^ stage[0]
+                        stage[0] = stage[0] ^ 1
                     finalize_left(
                         b_i,
                         s_i,
@@ -545,10 +611,12 @@ def sparse_attention_fwd_kernel(
                         glse,
                         n_split_idx,
                         num_splits,
-                        attn_sink,
+                        sink_local,
                         bar_final,
+                        task_stage,
                         sm_scale,
                     )
+                    T.barrier_wait(bar_final_free[task_stage], task_phase)
                 elif tid >= 256 and tid < 512:
                     acc_o_r_0 = T.alloc_fragment(
                         [heads_per_block, dim_qk // 4], accum_dtype
@@ -566,7 +634,10 @@ def sparse_attention_fwd_kernel(
                     c1_ldg_tx = (tid - 256) % 8
                     c1_ldg_ty = (tid - 256) // 8
                     for i_i in range(start_block_idx, end_block_idx):
-                        T.barrier_wait(bar_kv1_ready, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_kv1_ready[stage[0]],
+                            phase[0],
+                        )
                         T.copy(quant_shared[c1_ldg_ty, 2:4], quant_local_r[0, :])
                         T.copy(quant_shared[c1_ldg_ty + 32, 2:4], quant_local_r[1, :])
 
@@ -649,20 +720,30 @@ def sparse_attention_fwd_kernel(
                                     ] = kv_reg_r[r * 32 + (u + 2) * 8 + v]
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_kv1_quant_ready)
+                        T.barrier_arrive(bar_kv1_quant_ready[stage[0]])
+                        T.barrier_arrive(bar_kv_mask_free[stage[0]])
 
-                        T.barrier_wait(bar_vl0_free, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_vl0_free[stage[0]],
+                            phase[0],
+                        )
 
                         stage_value_shared(
                             v_shared_0, kv_reg_r, c1_ldg_ty, c1_ldg_tx, 0
                         )
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_vr0_ready)
-                        T.barrier_wait(bar_vr0_ready, (phase_count[0] & 1))
+                        T.barrier_arrive(bar_vr0_ready[stage[0]])
+                        T.barrier_wait(
+                            bar_vr0_ready[stage[0]],
+                            phase[0],
+                        )
 
                         # compute v4-v7
-                        T.barrier_wait(bar_p_ready, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_p_ready_kv_free[stage[0]],
+                            phase[0],
+                        )
                         for h_i, d_i in T.Parallel(heads_per_block, dim_qk // 4):
                             acc_o_r_0[h_i, d_i] *= alpha_shared[h_i]
                             acc_o_r_1[h_i, d_i] *= alpha_shared[h_i]
@@ -677,7 +758,10 @@ def sparse_attention_fwd_kernel(
                         )
                         T.warpgroup_commit_batch()
 
-                        T.barrier_wait(bar_vl1_free, (phase_count[0] & 1))
+                        T.barrier_wait(
+                            bar_vl1_free[stage[0]],
+                            phase[0],
+                        )
 
                         stage_value_shared(
                             v_shared_1, kv_reg_r, c1_ldg_ty, c1_ldg_tx, 2
@@ -685,8 +769,11 @@ def sparse_attention_fwd_kernel(
                         T.lma_wait()
                         T.warpgroup_wait(0)
                         # T.barrier_arrive(bar_vr0_free)
-                        T.barrier_arrive(bar_vr1_ready)
-                        T.barrier_wait(bar_vr1_ready, (phase_count[0] & 1))
+                        T.barrier_arrive(bar_vr1_ready[stage[0]])
+                        T.barrier_wait(
+                            bar_vr1_ready[stage[0]],
+                            phase[0],
+                        )
 
                         # compute v4-v7
                         T.gemm(
@@ -698,9 +785,13 @@ def sparse_attention_fwd_kernel(
                         )
                         T.warpgroup_commit_batch()
                         T.warpgroup_wait(0)
-                        # T.barrier_arrive(bar_p_free)
+                        # T.barrier_arrive(bar_pv_free)
                         # T.barrier_arrive(bar_vr1_free)
-                        phase_count[0] = phase_count[0] ^ 1
+                        T.barrier_arrive(bar_pv_free[stage[0]])
+                        prev_stage[0] = stage[0]
+                        prev_phase[0] = phase[0]
+                        phase[0] = phase[0] ^ stage[0]
+                        stage[0] = stage[0] ^ 1
                     finalize_right(
                         b_i,
                         s_i,
@@ -716,8 +807,10 @@ def sparse_attention_fwd_kernel(
                         n_split_idx,
                         num_splits,
                         bar_final,
-                        (b_i - begin_idx) & 1,
+                        task_stage,
+                        task_phase,
                     )
+                    T.barrier_arrive(bar_final_free[task_stage])
                 elif tid >= 512:
                     kperm_mask_local = T.alloc_local([4], "bool")
                     kperm_indices_local = T.alloc_local([4], "int32")
@@ -741,14 +834,18 @@ def sparse_attention_fwd_kernel(
                             seq_len_kv,
                             producer_ldg_ty,
                             producer_ldg_tx,
-                            phase_count[0],
+                            prev_stage[0],
+                            prev_phase[0],
                             kperm_indices_local,
                             kperm_mask_local,
                             is_kv_valid,
                             kv_indices,
                             bar_kv_mask_free,
                         )
-                        T.barrier_wait(bar_kv0_free, (phase_count[0] & 1) ^ 1)
+                        T.barrier_wait(
+                            bar_kv0_free[prev_stage[0]],
+                            prev_phase[0],
+                        )
                         T.annotate_layout(
                             {
                                 kv_shared_l[
@@ -779,9 +876,12 @@ def sparse_attention_fwd_kernel(
                                     )
 
                         T.lma_wait()
-                        T.barrier_arrive(bar_kv_mask_ready)
-                        T.barrier_arrive(bar_indices_ready)
-                        T.barrier_wait(bar_indices_ready, (phase_count[0] & 1))
+                        T.barrier_arrive(bar_kv_mask_ready[stage[0]])
+                        T.barrier_arrive(bar_indices_ready[stage[0]])
+                        T.barrier_wait(
+                            bar_indices_ready[stage[0]],
+                            phase[0],
+                        )
 
                         for c in T.vectorized(2):
                             T.copy(
@@ -791,42 +891,48 @@ def sparse_attention_fwd_kernel(
                                     128 + ldg_scale_tx * 2 + c,
                                 ],
                                 quant_shared[ldg_scale_ty, ldg_scale_tx * 2 + c],
+                                force_async_copy=True,
                                 src_robust_desc=kv_robust_desc,
                             )
-                        T.ptx_commit_group()
-                        T.ptx_wait_group(0)
-                        T.barrier_arrive(bar_kv0_ready)
+                        # Group 0 owns the left KV panel and quantization scales.
+                        T.async_copy_commit_group(0)
+                        T.async_copy_wait_group(0)
+                        T.barrier_arrive(bar_kv0_ready[stage[0]])
 
-                        T.barrier_wait(bar_kv1_free, (phase_count[0] & 1) ^ 1)
-
-                        # load k rope
-                        T.annotate_layout(
-                            {
-                                k_tail_shared[
-                                    :, :
-                                ]: tilelang.layout.make_sqmma_swizzled_layout(
-                                    k_tail_shared[:, :], k_major=True
-                                )
-                            },
-                            allow_reannotation=True,
-                            allow_buffer_region=True,
+                        T.barrier_wait(
+                            bar_kv1_free[prev_stage[0]],
+                            prev_phase[0],
                         )
-                        for r in T.unroll(4):
-                            for v in T.vectorized(8):
-                                pass
-                                T.copy(
-                                    k_pe[
-                                        kperm_indices_local[r],
-                                        g_i,
-                                        dim_qk // 2 + 8 + producer_ldg_tx * 8 + v,
-                                    ],
+
+                        if tail_dim > 0:
+                            # load k rope
+                            T.annotate_layout(
+                                {
                                     k_tail_shared[
-                                        r * 16 + producer_ldg_ty,
-                                        producer_ldg_tx * 8 + v,
-                                    ],
-                                    force_async_copy=True,
-                                    src_robust_desc=kv_robust_desc,
-                                )
+                                        :, :
+                                    ]: tilelang.layout.make_sqmma_swizzled_layout(
+                                        k_tail_shared[:, :], k_major=True
+                                    )
+                                },
+                                allow_reannotation=True,
+                                allow_buffer_region=True,
+                            )
+                            for r in T.unroll(4):
+                                for v in T.vectorized(8):
+                                    pass
+                                    T.copy(
+                                        k_pe[
+                                            kperm_indices_local[r],
+                                            g_i,
+                                            dim_qk // 2 + 8 + producer_ldg_tx * 8 + v,
+                                        ],
+                                        k_tail_shared[
+                                            r * 16 + producer_ldg_ty,
+                                            producer_ldg_tx * 8 + v,
+                                        ],
+                                        force_async_copy=True,
+                                        src_robust_desc=kv_robust_desc,
+                                    )
 
                         # load k4-k7
                         # T.annotate_layout(
@@ -864,11 +970,22 @@ def sparse_attention_fwd_kernel(
                                         force_async_copy=True,
                                         src_robust_desc=kv_robust_desc,
                                     )
-                        T.ptx_commit_group()
-                        T.ptx_wait_group(0)
-                        T.barrier_arrive(bar_kv1_ready)
-                        T.sync_threads(1, 128)
-                        phase_count[0] = phase_count[0] ^ 1
+                        # Group 1 owns the right KV panel and optional RoPE tail. Both
+                        # groups are drained before the next producer iteration.
+                        T.async_copy_commit_group(1)
+                        T.async_copy_wait_group(1)
+                        T.barrier_arrive(bar_kv1_ready[stage[0]])
+                        T.barrier_arrive(bar_producer_sync[stage[0]])
+                        T.barrier_wait(
+                            bar_producer_sync[stage[0]],
+                            phase[0],
+                        )
+                        prev_stage[0] = stage[0]
+                        prev_phase[0] = phase[0]
+                        phase[0] = phase[0] ^ stage[0]
+                        stage[0] = stage[0] ^ 1
+                task_phase = task_phase ^ task_stage
+                task_stage = task_stage ^ 1
 
     dsa_combine = make_scheduled_decode_combine(
         batch=batch,
@@ -1257,9 +1374,10 @@ def tilelang_flashmla_interface(
     #         - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
     # assert dim_plus_tail_dim == 576, "you should assign dim otherwise"
     dim = d_v
-    dim_bytes = 656
-    assert kv_shape[-1] == dim_bytes
     tail_dim = dim_plus_tail_dim - dim
+    assert tail_dim in (0, 64)
+    dim_bytes = 528 + 2 * tail_dim
+    assert kv_shape[-1] == dim_bytes
     _, _, _, topk = indices_shape
     assert indices_shape == (b, seq_len, kv_group, topk)
     assert topk % 64 == 0, "topk must be a multiple of 64"

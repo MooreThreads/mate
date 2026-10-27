@@ -354,6 +354,7 @@ def _dry_run_fmha_forward_backward(
     raise_complete_if_dry_run()
 
 
+@pytest.mark.mate_dry_run
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize(
     "seq_lens",
@@ -530,6 +531,7 @@ def test_varlen_fast_attn(
     )
 
 
+@pytest.mark.mate_dry_run
 @supported_musa_compute_capability([31])
 @pytest.mark.parametrize("seq_lens", [[(511, 511)], [(63, 63)]])
 @pytest.mark.parametrize("num_heads", [(6, 1), (6, 6)])
@@ -679,3 +681,526 @@ def test_bshd_fast_attn(
         ref_result=_detach_result(ref_output, dq_t, dk_t, dv_t),
         pt_result=_detach_result(pt_output, dq_pt, dk_pt, dv_pt),
     )
+
+
+@pytest.mark.parametrize(
+    "dims_causal", [(128, False), (128, True), (192, False), (192, True)]
+)
+@pytest.mark.parametrize(
+    "dtype,kv_heads,layout,lengths",
+    [
+        (dtype, kv_heads, layout, (129, 385))
+        for dtype in (torch.float16, torch.bfloat16)
+        for kv_heads in (2, 4)
+        for layout in ("dense", "singleton", "packed")
+    ]
+    + [
+        (dtype, kv_heads, layout, (2, 5))
+        for dtype in (torch.float16, torch.bfloat16)
+        for kv_heads in (2, 4)
+        for layout in ("dense", "singleton")
+    ]
+    + [
+        (dtype, kv_heads, layout, lengths)
+        for lengths in ((129, 65), (65, 129))
+        for dtype, kv_heads, layout in (
+            (torch.float16, 2, "dense"),
+            (torch.bfloat16, 4, "singleton"),
+        )
+    ],
+)
+@supported_musa_compute_capability([31])
+def test_asm_persistent_backward_routing(
+    monkeypatch, dtype, dims_causal, kv_heads, layout, lengths
+):
+    import mate.jit.mubin.flash_attention_bwd as api
+
+    original = api.get_flash_attention_bwd_mubin_launch_plan
+    selected = []
+
+    def plan(*args, **kwargs):
+        selected.append(kwargs.get("is_persistence", False))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api, "get_flash_attention_bwd_mubin_launch_plan", plan)
+    torch.manual_seed(47)
+    dim, causal = dims_causal
+    sq, sk = lengths
+    heads = 4
+    batch = (
+        1
+        if layout == "singleton"
+        else max(
+            5,
+            torch.musa.get_device_properties(0).multi_processor_count
+            // (heads * ((sk + 127) // 128))
+            + 1,
+        )
+    )
+    q, k, v = [
+        torch.randn(shape, device="musa", dtype=dtype).requires_grad_()
+        for shape in (
+            (batch, sq, heads, dim),
+            (batch, sk, kv_heads, dim),
+            (batch, sk, kv_heads, 128),
+        )
+    ]
+    kwargs = {}
+    if layout != "dense":
+        q, k, v = [t.detach().flatten(0, 1).requires_grad_() for t in (q, k, v)]
+        kwargs = dict(
+            cu_seqlens_q=torch.arange(batch + 1, device="musa", dtype=torch.int32) * sq,
+            cu_seqlens_k=torch.arange(batch + 1, device="musa", dtype=torch.int32) * sk,
+            max_seqlen_q=sq + 17,
+            max_seqlen_k=sk + 19,
+        )
+    out = flash_attn_varlen_func(
+        q, k, v, causal=causal, backend="mubin", bwd_backend="mubin", **kwargs
+    )
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    assert selected == [layout != "packed"]
+    ref = [t.detach().float().cpu().requires_grad_() for t in (q, k, v)]
+    qr, kr, vr = [t.reshape(batch, -1, *t.shape[-2:]) for t in ref]
+    ref_out = torch.stack(
+        [
+            _asm_reference(qr[b], kr[b], vr[b], dim**-0.5, causal)[0]
+            for b in range(batch)
+        ]
+    )
+    ref_out.backward(grad.float().cpu().reshape_as(ref_out))
+    atol = 0.04 if dtype == torch.bfloat16 else 0.006
+    for actual, expected in zip((q, k, v), ref):
+        torch.testing.assert_close(
+            actual.grad.float().cpu(), expected.grad, atol=atol, rtol=atol
+        )
+
+
+def _asm_reference(q, k, v, scale, causal):
+    groups = q.shape[-2] // k.shape[-2]
+    k = k.repeat_interleave(groups, dim=-2)
+    v = v.repeat_interleave(groups, dim=-2)
+    scores = torch.einsum("qhd,khd->hqk", q, k) * scale
+    if causal:
+        mask = (
+            torch.arange(q.shape[0])[:, None] + k.shape[0] - q.shape[0]
+            < torch.arange(k.shape[0])[None, :]
+        )
+        scores = scores.masked_fill(mask[None], -float("inf"))
+    # Avoid NaN softmax derivatives for lower-right causal rows with no keys.
+    empty_rows = torch.isneginf(scores).all(-1, keepdim=True)
+    probs = scores.masked_fill(empty_rows, 0).softmax(-1).masked_fill(empty_rows, 0)
+    return torch.einsum("hqk,khd->qhd", probs, v), scores.amax((1, 2))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(64, 64), (128, 128), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("head_counts", [(4, 2), (2, 2)])
+@pytest.mark.parametrize("long_sequence", [False, True])
+@pytest.mark.mate_dry_run
+@supported_musa_compute_capability([31])
+def test_asm_max_logits_and_backward(
+    dtype, dims, causal, packed, head_counts, long_sequence
+):
+    if torch.musa.get_device_capability() != (3, 1):
+        pytest.skip("MP31 ASM")
+    torch.manual_seed(42)
+    qlens, klens = ([37, 83], [19, 97]) if packed else ([65, 65], [79, 79])
+    if long_sequence:
+        qlens, klens = ([257, 389], [513, 193]) if packed else ([257, 257], [389, 389])
+    dim, vdim = dims
+    heads, kv_heads = head_counts
+    shapes = (
+        (sum(qlens), heads, dim),
+        (sum(klens), kv_heads, dim),
+        (sum(klens), kv_heads, vdim),
+    )
+    tensors = [torch.randn(shape, device="musa", dtype=dtype) for shape in shapes]
+    if not packed:
+        tensors = [t.view(2, -1, *t.shape[-2:]) for t in tensors]
+    q, k, v = [t.requires_grad_() for t in tensors]
+    scale = dim**-0.5
+    kwargs = {}
+    if packed:
+        kwargs = dict(
+            cu_seqlens_q=torch.tensor(
+                [0, qlens[0], sum(qlens)], device="musa", dtype=torch.int32
+            ),
+            cu_seqlens_k=torch.tensor(
+                [0, klens[0], sum(klens)], device="musa", dtype=torch.int32
+            ),
+            max_seqlen_q=max(qlens),
+            max_seqlen_k=max(klens),
+        )
+    out, lse, maximum = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        softmax_scale=scale,
+        backend="mubin",
+        bwd_backend="mubin",
+        return_max_logits=True,
+        return_softmax_lse=True,
+        **kwargs,
+    )
+    assert maximum.shape == (heads,)
+    assert maximum.dtype == torch.float32
+    assert not maximum.requires_grad
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    from mate.execution_context import raise_complete_if_dry_run
+
+    raise_complete_if_dry_run()
+    reference = [t.detach().float().cpu().requires_grad_() for t in (q, k, v)]
+    ref_q, ref_k, ref_v = [t.reshape(-1, *t.shape[-2:]) for t in reference]
+    ref_out, ref_max = [], []
+    q0, k0 = 0, 0
+    for nq, nk in zip(qlens, klens):
+        o, row_maximum = _asm_reference(
+            ref_q[q0 : q0 + nq], ref_k[k0 : k0 + nk], ref_v[k0 : k0 + nk], scale, causal
+        )
+        ref_out.append(o)
+        ref_max.append(row_maximum)
+        q0, k0 = q0 + nq, k0 + nk
+    ref_out = torch.cat(ref_out).reshape(*q.shape[:-1], vdim)
+    ref_max = torch.stack(ref_max).amax(0)
+    torch.testing.assert_close(maximum.cpu(), ref_max.detach(), atol=2e-4, rtol=2e-4)
+    atol = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(
+        out.float().cpu(), ref_out.detach(), atol=atol, rtol=atol
+    )
+    ref_out.backward(grad.float().cpu())
+    for actual, expected in zip((q, k, v), reference):
+        torch.testing.assert_close(
+            actual.grad.float().cpu(), expected.grad, atol=atol, rtol=atol
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_heads", [2, 4])
+@pytest.mark.mate_dry_run
+@supported_musa_compute_capability([31])
+def test_asm_backward_with_mutlass_varlen_lse(dtype, dims, causal, kv_heads):
+    # Separate batch lengths and upper bounds distinguish compact [H,total_q]
+    # addressing from the imported ASM's batch/head pitch based on max_seqlen.
+    torch.manual_seed(73)
+    qlens, klens = [37, 83, 65], [19, 97, 71]
+    dim, vdim = dims
+    heads = 4
+    q = torch.randn(
+        (sum(qlens), heads, dim), device="musa", dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        (sum(klens), kv_heads, dim), device="musa", dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        (sum(klens), kv_heads, vdim), device="musa", dtype=dtype, requires_grad=True
+    )
+    cu_q = torch.tensor([0, 37, 120, 185], device="musa", dtype=torch.int32)
+    cu_k = torch.tensor([0, 19, 116, 187], device="musa", dtype=torch.int32)
+    scale = dim**-0.5
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=113,
+        max_seqlen_k=129,
+        softmax_scale=scale,
+        causal=causal,
+        backend="mutlass",
+        bwd_backend="mubin",
+        return_softmax_lse=True,
+    )
+    assert lse.shape == (heads, sum(qlens))
+    assert lse.dtype == torch.float32
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    from mate.execution_context import raise_complete_if_dry_run
+
+    raise_complete_if_dry_run()
+    reference = [t.detach().float().cpu().requires_grad_() for t in (q, k, v)]
+    ref_q, ref_k, ref_v = reference
+    ref_out, ref_lse = [], []
+    q0, k0 = 0, 0
+    for nq, nk in zip(qlens, klens):
+        qb, kb, vb = ref_q[q0 : q0 + nq], ref_k[k0 : k0 + nk], ref_v[k0 : k0 + nk]
+        batch_out, _ = _asm_reference(qb, kb, vb, scale, causal)
+        ref_out.append(batch_out)
+        scores = (
+            torch.einsum(
+                "qhd,khd->hqk", qb, kb.repeat_interleave(heads // kv_heads, dim=1)
+            )
+            * scale
+        )
+        if causal:
+            mask = torch.arange(nq)[:, None] + nk - nq < torch.arange(nk)[None, :]
+            scores = scores.masked_fill(mask[None], -float("inf"))
+        ref_lse.append(scores.logsumexp(-1))
+        q0, k0 = q0 + nq, k0 + nk
+    ref_out = torch.cat(ref_out)
+    ref_lse = torch.cat(ref_lse, dim=1).detach()
+    finite_rows = torch.isfinite(ref_lse)
+    atol = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(
+        lse.cpu()[finite_rows], ref_lse[finite_rows], atol=atol, rtol=atol
+    )
+    torch.testing.assert_close(
+        out.float().cpu(), ref_out.detach(), atol=atol, rtol=atol
+    )
+    ref_out.backward(grad.float().cpu())
+    for actual, expected in zip((q, k, v), reference):
+        torch.testing.assert_close(
+            actual.grad.float().cpu(), expected.grad, atol=atol, rtol=atol
+        )
+
+
+@supported_musa_compute_capability([31])
+def test_asm_auto_backend_zero_scale(monkeypatch):
+    from mate.flash_attention import backward
+    from mate import mha_interface
+
+    launches = []
+    original = backward._mubin_backward
+
+    def asm_backward(*args, **kwargs):
+        launches.append(True)
+        return original(*args, **kwargs)
+
+    def unexpected_mutlass(*args, **kwargs):
+        pytest.fail("auto should select an available ASM max-logits variant")
+
+    monkeypatch.setattr(backward, "_mubin_backward", asm_backward)
+    monkeypatch.setattr(mha_interface, "_flash_attn_forward", unexpected_mutlass)
+    q = torch.randn(
+        (1, 9, 4, 64), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        (1, 3, 2, 64), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    out, maximum = flash_attn_varlen_func(
+        q, k, v, causal=True, softmax_scale=0.0, return_max_logits=True
+    )
+    out.sum().backward()
+    assert launches == [True]
+    assert torch.count_nonzero(maximum) == 0
+    assert torch.count_nonzero(q.grad) == 0
+    assert torch.count_nonzero(k.grad) == 0
+    ref_q, ref_k, ref_v = [
+        t.detach()[0].float().cpu().requires_grad_() for t in (q, k, v)
+    ]
+    ref_out, _ = _asm_reference(ref_q, ref_k, ref_v, 0.0, True)
+    ref_out.sum().backward()
+    torch.testing.assert_close(
+        out[0].float().cpu(), ref_out.detach(), atol=3e-3, rtol=3e-3
+    )
+    torch.testing.assert_close(
+        v.grad[0].float().cpu(), ref_v.grad, atol=3e-3, rtol=3e-3
+    )
+
+
+@supported_musa_compute_capability([31])
+def test_backward_dispatch_fallback_and_strict(monkeypatch):
+    from mate.flash_attention import backward
+    from mate.flash_attention.tilelang import flash_attention_varlen_bwd as tilelang
+
+    q = torch.empty((1, 16, 2, 256), device="musa", dtype=torch.float16)
+    lse = torch.empty((1, 2, 16), device="musa", dtype=torch.float32)
+    args = (q, q, q, q, q, lse, None, None)
+    sentinel = object()
+    monkeypatch.setattr(
+        tilelang, "flashattn_varlen_bwd_interface", lambda *args, **kwargs: sentinel
+    )
+    assert backward.flashattn_varlen_bwd_interface(*args) is sentinel
+    with pytest.raises(ValueError, match="supports D"):
+        backward.flashattn_varlen_bwd_interface(*args, backend="mubin")
+    supported = q[..., :128].contiguous()
+    supported_args = (supported,) * 5 + (lse, None, None)
+    monkeypatch.setattr(backward, "_mubin_backward", lambda *args, **kwargs: sentinel)
+    assert backward.flashattn_varlen_bwd_interface(*supported_args) is sentinel
+    assert (
+        backward.flashattn_varlen_bwd_interface(*supported_args, deterministic=True)
+        is sentinel
+    )
+    with pytest.raises(ValueError, match="deterministic"):
+        backward.flashattn_varlen_bwd_interface(
+            *supported_args, backend="mubin", deterministic=True
+        )
+    from mate import artifacts
+
+    def unavailable_target(*args, **kwargs):
+        raise ValueError("no published target")
+
+    monkeypatch.setattr(artifacts.ArtifactPath, "for_module", unavailable_target)
+    assert backward.flashattn_varlen_bwd_interface(*supported_args) is sentinel
+    with pytest.raises(ValueError, match="published and pinned"):
+        backward.flashattn_varlen_bwd_interface(*supported_args, backend="mubin")
+
+
+@pytest.mark.parametrize("reason", ["deterministic", "missing_artifacts"])
+@supported_musa_compute_capability([31])
+def test_auto_backward_tilelang_gradients(monkeypatch, reason):
+    from mate import artifacts
+    from mate.flash_attention import backward
+
+    torch.manual_seed(123)
+    q = torch.randn(
+        (1, 65, 4, 64), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        (1, 79, 2, 64), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn_like(k, requires_grad=True)
+
+    def unexpected_asm(*args, **kwargs):
+        pytest.fail("unsupported or unpublished ASM must fall back to TileLang")
+
+    monkeypatch.setattr(backward, "_mubin_backward", unexpected_asm)
+    if reason == "missing_artifacts":
+        original_path = artifacts.ArtifactPath.for_module
+
+        def get_path(family):
+            if family == "flash_attention_bwd":
+                raise ValueError("no published target")
+            return original_path(family)
+
+        monkeypatch.setattr(artifacts.ArtifactPath, "for_module", get_path)
+    out = flash_attn_varlen_func(
+        q, k, v, backend="mubin", deterministic=reason == "deterministic"
+    )
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref = [t.detach()[0].float().cpu().requires_grad_() for t in (q, k, v)]
+    ref_out, _ = _asm_reference(*ref, 64**-0.5, False)
+    ref_out.backward(grad[0].float().cpu())
+    for actual, expected in zip((q, k, v), ref):
+        torch.testing.assert_close(
+            actual.grad[0].float().cpu(), expected.grad, atol=3e-3, rtol=3e-3
+        )
+
+
+@pytest.mark.parametrize(
+    "feature",
+    [
+        None,
+        "qv",
+        "page_table",
+        "learnable_sink",
+        "attention_chunk",
+        "cp_world_size",
+        "q_descale",
+        "k_descale",
+        "v_descale",
+    ],
+)
+@supported_musa_compute_capability([31])
+def test_backward_feature_dispatch_contract(monkeypatch, feature):
+    from mate import mha_interface
+    from mate.flash_attention import backward
+
+    selected = []
+
+    def forward(q, **kwargs):
+        lse = torch.zeros((q.shape[0], q.shape[2], q.shape[1]), device=q.device)
+        return torch.zeros_like(q), lse
+
+    def bwd(q, k, v, *args, **kwargs):
+        selected.append(kwargs["backend"])
+        return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+
+    monkeypatch.setattr(mha_interface, "_flash_attn_forward", forward)
+    monkeypatch.setattr(backward, "flashattn_varlen_bwd_interface", bwd)
+    q = torch.randn(
+        (1, 17, 2, 64), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    options = {
+        "qv": torch.zeros_like(q),
+        "page_table": torch.zeros((1, 1), device=q.device, dtype=torch.int32),
+        "learnable_sink": torch.zeros(2, device=q.device),
+        "attention_chunk": 8,
+        "cp_world_size": 2,
+        "q_descale": torch.ones(1, device=q.device),
+        "k_descale": torch.ones(1, device=q.device),
+        "v_descale": torch.ones(1, device=q.device),
+    }
+    kwargs = {} if feature is None else {feature: options[feature]}
+    out = flash_attn_varlen_func(q, q, q, backend="mutlass", **kwargs)
+    out.sum().backward()
+    assert selected == ["auto" if feature is None else "tilelang"]
+    out = flash_attn_varlen_func(
+        q, q, q, backend="mutlass", bwd_backend="mubin", **kwargs
+    )
+    if feature is None:
+        out.sum().backward()
+        assert selected == ["auto", "mubin"]
+    else:
+        with pytest.raises(ValueError, match="MUBIN backward does not support"):
+            out.sum().backward()
+        assert selected == ["tilelang"]
+    # Inference does not enter backward or enforce its feature restrictions.
+    plain = q.detach()
+    flash_attn_varlen_func(
+        plain, plain, plain, backend="mutlass", bwd_backend="mubin", **kwargs
+    )
+
+
+@pytest.mark.parametrize("dims", [(8, 8), (120, 120), (192, 128)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.mate_dry_run
+@supported_musa_compute_capability([31])
+def test_asm_empty_packed_sequences(dims, causal):
+    # One batch has no queries; another has no keys. Include a normal batch.
+    dim, vdim = dims
+    q = torch.randn(
+        (72, 4, dim), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        (110, 2, dim), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn(
+        (110, 2, vdim), device="musa", dtype=torch.float16, requires_grad=True
+    )
+    cu_q = torch.tensor([0, 0, 7, 72], device="musa", dtype=torch.int32)
+    cu_k = torch.tensor([0, 13, 13, 110], device="musa", dtype=torch.int32)
+    out, maximum = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=65,
+        max_seqlen_k=97,
+        causal=causal,
+        backend="mubin",
+        bwd_backend="mubin",
+        return_max_logits=True,
+    )
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    from mate.execution_context import raise_complete_if_dry_run
+
+    raise_complete_if_dry_run()
+    assert torch.count_nonzero(out[:7]) == 0
+    assert torch.count_nonzero(q.grad[:7]) == 0
+    assert torch.count_nonzero(k.grad[:13]) == 0
+    assert torch.count_nonzero(v.grad[:13]) == 0
+    ref_q, ref_k, ref_v = [
+        t.detach().float().cpu().requires_grad_() for t in (q[7:], k[13:], v[13:])
+    ]
+    ref_out, ref_max = _asm_reference(ref_q, ref_k, ref_v, dim**-0.5, causal)
+    ref_out.backward(grad[7:].float().cpu())
+    torch.testing.assert_close(maximum.cpu(), ref_max.detach(), atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(
+        out[7:].float().cpu(), ref_out.detach(), atol=3e-3, rtol=3e-3
+    )
+    for actual, expected in zip(
+        (q.grad[7:], k.grad[13:], v.grad[13:]), (ref_q.grad, ref_k.grad, ref_v.grad)
+    ):
+        torch.testing.assert_close(actual.float().cpu(), expected, atol=3e-3, rtol=3e-3)

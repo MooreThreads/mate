@@ -11,10 +11,17 @@ from ._flash_attention_bwd_common import (
     _tilelang_dtype_nbytes,
 )
 
+_SPLIT_DKDV_PASS_CONFIGS = dict(JIT_PASS_CONFIGS)
+if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FRAGMENT_VECTORIZE"):
+    # Keep fragment lowering: this kernel's scalar fallback fails D256 dK on MTCC 5.2.
+    _SPLIT_DKDV_PASS_CONFIGS[tilelang.PassConfigKey.TL_DISABLE_FRAGMENT_VECTORIZE] = (
+        False
+    )
+
 
 @tilelang.jit(
     out_idx=[],
-    pass_configs=JIT_PASS_CONFIGS,
+    pass_configs=_SPLIT_DKDV_PASS_CONFIGS,
     verbose=True,
     compile_flags=JIT_COMPILE_FLAGS,
 )
@@ -396,29 +403,74 @@ def flashattn_bwd_ws_split_dkdv(
             Pt_shared = T.alloc_shared([block_M, block_N], dtype)
             dSt_shared = T.alloc_shared([block_M, block_N], dtype)
 
+            # EC_007: reused barriers alternate IDs; phase advances every two uses.
+            # Single-use K/Q setup barriers do not need a ring.
             bar_kt = T.alloc_barrier(arrive_count=512)
             bar_vt = T.alloc_barrier(arrive_count=512)
-            bar_qa0_ready = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_qa1_ready = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_qb0_ready = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_qb1_ready = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_doa0_ready = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_doa1_ready = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_dob0_ready = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_dob1_ready = T.alloc_barrier(arrive_count=consumer0_threads)
+            bar_qa0_ready = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_qa1_ready = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_qb0_ready = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_qb1_ready = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_doa0_ready = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_doa1_ready = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_dob0_ready = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_dob1_ready = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
 
-            bar_qa0_free = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_qa1_free = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_qb0_free = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_qb1_free = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_doa0_free = T.alloc_barrier(arrive_count=producer_threads)
-            bar_doa1_free = T.alloc_barrier(arrive_count=producer_threads)
-            bar_dob0_free = T.alloc_barrier(arrive_count=producer_threads)
-            bar_dob1_free = T.alloc_barrier(arrive_count=producer_threads)
-            bar_p_ready = T.alloc_barrier(arrive_count=producer_threads)
-            bar_p_free = T.alloc_barrier(arrive_count=consumer1_threads)
-            bar_dst_ready = T.alloc_barrier(arrive_count=producer_threads)
-            bar_dst_free = T.alloc_barrier(arrive_count=consumer0_threads)
+            bar_qa0_free = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_qa1_free = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_qb0_free = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_qb1_free = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_doa0_free = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_doa1_free = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_dob0_free = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_dob1_free = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_p_ready = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_p_free = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+            bar_dst_ready = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_dst_free = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+
+            # Immutable startup buffers: full notifications above, final release below.
+            bar_setup_free = T.alloc_barrier(arrive_count=producer_threads)
 
             T.sync_threads()
             if is_varlen:
@@ -518,8 +570,8 @@ def flashattn_bwd_ws_split_dkdv(
                             force_async_copy=True,
                             src_robust_desc=k_robust_desc,
                         )
-                    T.ptx_commit_group()
-                    # T.ptx_wait_group(0)
+                    # Groups [0, 1, 2, 3] own Kt0, Kt1, Vt0 and Vt1, respectively.
+                    T.async_copy_commit_group(0)
                     for i, j in T.Parallel(block_N, dim // 2):
                         T.copy(
                             kv_elem(
@@ -534,8 +586,7 @@ def flashattn_bwd_ws_split_dkdv(
                             force_async_copy=True,
                             src_robust_desc=k_robust_desc,
                         )
-                    T.ptx_commit_group()
-                    # T.ptx_wait_group(0)
+                    T.async_copy_commit_group(1)
                     for i, j in T.Parallel(block_N, dim // 2):
                         T.copy(
                             kv_elem(
@@ -550,8 +601,7 @@ def flashattn_bwd_ws_split_dkdv(
                             force_async_copy=True,
                             src_robust_desc=v_robust_desc,
                         )
-                    T.ptx_commit_group()
-                    # T.ptx_wait_group(0)
+                    T.async_copy_commit_group(2)
                     for i, j in T.Parallel(block_N, dim // 2):
                         T.copy(
                             kv_elem(
@@ -566,15 +616,25 @@ def flashattn_bwd_ws_split_dkdv(
                             force_async_copy=True,
                             src_robust_desc=v_robust_desc,
                         )
-                    T.ptx_commit_group()
-                    T.ptx_wait_group(0)
+                    T.async_copy_commit_group(3)
+                    # Old FIFO wait(0) drained every committed tile, not just group 0.
+                    T.async_copy_wait_group(0)
+                    T.async_copy_wait_group(1)
+                    T.async_copy_wait_group(2)
+                    T.async_copy_wait_group(3)
                     T.barrier_arrive(bar_kt)
                     T.barrier_arrive(bar_vt)
 
                 if tid >= producer_start:
                     # tme load k
+                    stage_producer = T.alloc_var(T.int32)
                     phase_producer = T.alloc_var(T.int32)
+                    prev_stage_producer = T.alloc_var(T.int32)
+                    prev_phase_producer = T.alloc_var(T.int32)
+                    stage_producer = 0
                     phase_producer = 0
+                    prev_stage_producer = 1
+                    prev_phase_producer = 1
                     accs_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                     dp_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                     if has_softcap:
@@ -587,7 +647,10 @@ def flashattn_bwd_ws_split_dkdv(
                     T.barrier_wait(bar_kt, 0)
                     T.barrier_wait(bar_vt, 0)
                     for q_start in range(q_loop_start, q_loop_end, block_M):
-                        if not has_window_left:
+                        # Keep runtime head dimensions opaque in all roles.
+                        # With rotating barriers, transparent scheduling here
+                        # produces incorrect FP16 causal dK/dV for padded heads.
+                        if not has_window_left and use_static_dims:
                             T.call_extern("void", "__musa_loop_transparent_outermost")
                         for i in T.Parallel(block_M):
                             T.copy(
@@ -650,7 +713,10 @@ def flashattn_bwd_ws_split_dkdv(
                                 delta_buffer[i] = T.if_then_else(
                                     q_start + i < end_seq_q, delta_buffer[i], 0.0
                                 )
-                        T.barrier_wait(bar_qa0_ready, phase_producer)
+                        T.barrier_wait(
+                            bar_qa0_ready[stage_producer],
+                            phase_producer,
+                        )
                         _annotate_sqmma(Qa_shared_0, k_major=True)
                         T.gemm(
                             Qa_shared_0,
@@ -662,7 +728,10 @@ def flashattn_bwd_ws_split_dkdv(
                         )
                         T.warpgroup_commit_batch()
 
-                        T.barrier_wait(bar_qa1_ready, phase_producer)
+                        T.barrier_wait(
+                            bar_qa1_ready[stage_producer],
+                            phase_producer,
+                        )
                         _annotate_sqmma(Qa_shared_1, k_major=True)
                         T.gemm(
                             Qa_shared_1,
@@ -674,16 +743,19 @@ def flashattn_bwd_ws_split_dkdv(
                         )
                         T.warpgroup_commit_batch()
                         T.warpgroup_wait(1)
-                        T.barrier_arrive(bar_doa0_free)
+                        T.barrier_arrive(bar_doa0_free[stage_producer])
 
                         for i in T.Parallel(block_M):
                             lse_buffer[i] = lse_buffer[i] * log2e
                         for i in T.Parallel(block_M):
                             delta_buffer[i] = delta_buffer[i] * smscale
                         T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_doa1_free)
+                        T.barrier_arrive(bar_doa1_free[stage_producer])
 
-                        T.barrier_wait(bar_doa0_ready, phase_producer)
+                        T.barrier_wait(
+                            bar_doa0_ready[stage_producer],
+                            phase_producer,
+                        )
                         _annotate_sqmma(dOa_shared_0, k_major=True)
                         T.gemm(
                             dOa_shared_0,
@@ -696,7 +768,10 @@ def flashattn_bwd_ws_split_dkdv(
                         )
                         T.warpgroup_commit_batch()
                         if has_softcap:
-                            T.barrier_wait(bar_doa1_ready, phase_producer)
+                            T.barrier_wait(
+                                bar_doa1_ready[stage_producer],
+                                phase_producer,
+                            )
                             _annotate_sqmma(dOa_shared_1, k_major=True)
                             T.gemm(
                                 dOa_shared_1,
@@ -708,7 +783,7 @@ def flashattn_bwd_ws_split_dkdv(
                             )
                             T.warpgroup_commit_batch()
                             T.warpgroup_wait(0)
-                            T.barrier_arrive(bar_dob0_free)
+                            T.barrier_arrive(bar_dob0_free[stage_producer])
                             for i, j in T.Parallel(block_M, block_N):
                                 softcap_tanh = T.tanh(
                                     accs_accum[i, j] * smscale / softcap
@@ -769,7 +844,10 @@ def flashattn_bwd_ws_split_dkdv(
                             for i, j in T.Parallel(block_M, block_N):
                                 accs_accum[i, j] = T.exp2(accs_accum[i, j])
 
-                            T.barrier_wait(bar_doa1_ready, phase_producer)
+                            T.barrier_wait(
+                                bar_doa1_ready[stage_producer],
+                                phase_producer,
+                            )
                             _annotate_sqmma(dOa_shared_1, k_major=True)
                             T.gemm(
                                 dOa_shared_1,
@@ -781,17 +859,20 @@ def flashattn_bwd_ws_split_dkdv(
                             )
                             T.warpgroup_commit_batch()
                             T.warpgroup_wait(1)
-                            T.barrier_arrive(bar_dob0_free)
+                            T.barrier_arrive(bar_dob0_free[stage_producer])
 
                         T.copy(accs_accum, accs_cast)
-                        T.barrier_wait(bar_p_free, phase_producer ^ 1)
+                        T.barrier_wait(
+                            bar_p_free[prev_stage_producer],
+                            prev_phase_producer,
+                        )
                         for i, t, l in T.Parallel(block_M, 8, L):
                             Pt_shared[i, t * L + l] = accs_cast[i, l * 8 + t]
                         T.lma_wait()
-                        T.barrier_arrive(bar_p_ready)
+                        T.barrier_arrive(bar_p_ready[stage_producer])
                         if not has_softcap:
                             T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_dob1_free)
+                        T.barrier_arrive(bar_dob1_free[stage_producer])
 
                         for i, j in T.Parallel(block_M, block_N):
                             dp_accum[i, j] = dp_accum[i, j] * smscale - delta_buffer[i]
@@ -801,67 +882,98 @@ def flashattn_bwd_ws_split_dkdv(
                             for i, j in T.Parallel(block_M, block_N):
                                 dp_accum[i, j] = dp_accum[i, j] * softcap_deriv[i, j]
                         T.copy(dp_accum, accs_cast)
-                        T.barrier_wait(bar_dst_free, phase_producer ^ 1)
+                        T.barrier_wait(
+                            bar_dst_free[prev_stage_producer],
+                            prev_phase_producer,
+                        )
                         for i, t, l in T.Parallel(block_M, 8, L):
                             dSt_shared[i, t * L + l] = accs_cast[i, l * 8 + t]
                         T.lma_wait()
-                        T.barrier_arrive(bar_dst_ready)
+                        T.barrier_arrive(bar_dst_ready[stage_producer])
 
-                        phase_producer = phase_producer ^ 1
+                        prev_stage_producer = stage_producer
+                        prev_phase_producer = phase_producer
+                        phase_producer = phase_producer ^ stage_producer
+                        stage_producer = stage_producer ^ 1
+                    T.barrier_arrive(bar_setup_free)
 
                 elif tid >= consumer1_start:
                     # P*dO -> dV. dQ is handled by a separate split-DQ kernel.
                     # load Q_a Q_b
+                    stage_consumer1 = T.alloc_var(T.int32)
                     phase_consumer1 = T.alloc_var(T.int32)
+                    prev_stage_consumer1 = T.alloc_var(T.int32)
+                    prev_phase_consumer1 = T.alloc_var(T.int32)
+                    stage_consumer1 = 0
                     phase_consumer1 = 0
+                    prev_stage_consumer1 = 1
+                    prev_phase_consumer1 = 1
                     dv_accum_0 = T.alloc_fragment([block_N, dim // 2], accum_dtype)
                     dv_accum_1 = T.alloc_fragment([block_N, dim // 2], accum_dtype)
                     dv_cast = T.alloc_fragment([block_N, dim // 2], dtype)
                     T.fill(dv_accum_0, 0.0)
                     T.fill(dv_accum_1, 0.0)
                     for q_start in range(q_loop_start, q_loop_end, block_M):
-                        if not has_window_left:
+                        if not has_window_left and use_static_dims:
                             T.call_extern("void", "__musa_loop_transparent_outermost")
-                        T.barrier_wait(bar_qa0_free, phase_consumer1 ^ 1)
+                        T.barrier_wait(
+                            bar_qa0_free[prev_stage_consumer1],
+                            prev_phase_consumer1,
+                        )
                         _annotate_sqmma(Qa_shared_0, k_major=True)
                         T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, 0),
                             Qa_shared_0,
-                            barrier=bar_qa0_ready,
+                            barrier=bar_qa0_ready[stage_consumer1],
                         )
-                        T.barrier_arrive(bar_qa0_ready)
+                        T.barrier_arrive(bar_qa0_ready[stage_consumer1])
 
-                        T.barrier_wait(bar_qa1_free, phase_consumer1 ^ 1)
+                        T.barrier_wait(
+                            bar_qa1_free[prev_stage_consumer1],
+                            prev_phase_consumer1,
+                        )
                         _annotate_sqmma(Qa_shared_1, k_major=True)
                         T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, dim // 2),
                             Qa_shared_1,
-                            barrier=bar_qa1_ready,
+                            barrier=bar_qa1_ready[stage_consumer1],
                         )
-                        T.barrier_arrive(bar_qa1_ready)
+                        T.barrier_arrive(bar_qa1_ready[stage_consumer1])
 
-                        T.barrier_wait(bar_doa0_free, phase_consumer1)
+                        T.barrier_wait(
+                            bar_doa0_free[stage_consumer1],
+                            phase_consumer1,
+                        )
                         _annotate_sqmma(dOa_shared_0, k_major=True)
                         T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, 0),
                             dOa_shared_0,
-                            barrier=bar_doa0_ready,
+                            barrier=bar_doa0_ready[stage_consumer1],
                         )
-                        T.barrier_arrive(bar_doa0_ready)
+                        T.barrier_arrive(bar_doa0_ready[stage_consumer1])
 
-                        T.barrier_wait(bar_doa1_free, phase_consumer1)
+                        T.barrier_wait(
+                            bar_doa1_free[stage_consumer1],
+                            phase_consumer1,
+                        )
                         _annotate_sqmma(dOa_shared_1, k_major=True)
                         T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, dim // 2),
                             dOa_shared_1,
-                            barrier=bar_doa1_ready,
+                            barrier=bar_doa1_ready[stage_consumer1],
                         )
-                        T.barrier_arrive(bar_doa1_ready)
+                        T.barrier_arrive(bar_doa1_ready[stage_consumer1])
 
                         # is_last_q_tile = (q_start+block_M) >= end_seq_q
-                        T.barrier_wait(bar_p_ready, phase_consumer1)
+                        T.barrier_wait(
+                            bar_p_ready[stage_consumer1],
+                            phase_consumer1,
+                        )
 
-                        T.barrier_wait(bar_dob0_ready, phase_consumer1)
+                        T.barrier_wait(
+                            bar_dob0_ready[stage_consumer1],
+                            phase_consumer1,
+                        )
                         _annotate_sqmma(Pt_shared, k_major=False, continuity=block_N)
                         _annotate_sqmma(
                             dOb_shared_0, k_major=False, continuity=dim // 4
@@ -876,7 +988,10 @@ def flashattn_bwd_ws_split_dkdv(
                         )
                         T.warpgroup_commit_batch()
 
-                        T.barrier_wait(bar_dob1_ready, phase_consumer1)
+                        T.barrier_wait(
+                            bar_dob1_ready[stage_consumer1],
+                            phase_consumer1,
+                        )
                         _annotate_sqmma(
                             dOb_shared_1, k_major=False, continuity=dim // 4
                         )
@@ -891,11 +1006,14 @@ def flashattn_bwd_ws_split_dkdv(
                         T.warpgroup_commit_batch()
 
                         T.warpgroup_wait(1)
-                        T.barrier_arrive(bar_qb0_free)
+                        T.barrier_arrive(bar_qb0_free[stage_consumer1])
                         T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_qb1_free)
-                        T.barrier_arrive(bar_p_free)
-                        phase_consumer1 = phase_consumer1 ^ 1
+                        T.barrier_arrive(bar_qb1_free[stage_consumer1])
+                        T.barrier_arrive(bar_p_free[stage_consumer1])
+                        prev_stage_consumer1 = stage_consumer1
+                        prev_phase_consumer1 = phase_consumer1
+                        phase_consumer1 = phase_consumer1 ^ stage_consumer1
+                        stage_consumer1 = stage_consumer1 ^ 1
 
                     store_kv_grad(
                         dV,
@@ -923,12 +1041,15 @@ def flashattn_bwd_ws_split_dkdv(
                         dim // 2,
                         dv_dim,
                     )
+                    T.barrier_wait(bar_setup_free, 0)
 
                 else:
                     # Qa * Kt -> s
                     # dOb * Vt -> dp
                     # dst * Qb -> dK
+                    stage_consumer0 = T.alloc_var(T.int32)
                     phase_consumer0 = T.alloc_var(T.int32)
+                    stage_consumer0 = 0
                     phase_consumer0 = 0
                     dk_accum_0 = T.alloc_fragment([block_N, dim // 2], accum_dtype)
                     dk_accum_1 = T.alloc_fragment([block_N, dim // 2], accum_dtype)
@@ -943,48 +1064,66 @@ def flashattn_bwd_ws_split_dkdv(
                     # Keep the dK loop opaque. Marking it transparent on MTGPU
                     # changes scheduling and corrupts dV in the sibling role.
                     for q_start in range(q_loop_start, q_loop_end, block_M):
-                        T.barrier_wait(bar_dob0_free, phase_consumer0)
+                        T.barrier_wait(
+                            bar_dob0_free[stage_consumer0],
+                            phase_consumer0,
+                        )
                         _annotate_sqmma(
                             dOb_shared_0, k_major=False, continuity=dim // 4
                         )
                         T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, 0),
                             dOb_shared_0,
-                            barrier=bar_dob0_ready,
+                            barrier=bar_dob0_ready[stage_consumer0],
                         )
-                        T.barrier_arrive(bar_dob0_ready)
+                        T.barrier_arrive(bar_dob0_ready[stage_consumer0])
 
-                        T.barrier_wait(bar_dob1_free, phase_consumer0)
+                        T.barrier_wait(
+                            bar_dob1_free[stage_consumer0],
+                            phase_consumer0,
+                        )
                         _annotate_sqmma(
                             dOb_shared_1, k_major=False, continuity=dim // 4
                         )
                         T.tma_copy(
                             q_block(dO, bz, q_start, begin_seq_q, by, dim // 2),
                             dOb_shared_1,
-                            barrier=bar_dob1_ready,
+                            barrier=bar_dob1_ready[stage_consumer0],
                         )
-                        T.barrier_arrive(bar_dob1_ready)
+                        T.barrier_arrive(bar_dob1_ready[stage_consumer0])
 
-                        T.barrier_wait(bar_qb0_free, phase_consumer0)
+                        T.barrier_wait(
+                            bar_qb0_free[stage_consumer0],
+                            phase_consumer0,
+                        )
                         _annotate_sqmma(Qb_shared_0, k_major=False, continuity=dim // 4)
                         T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, 0),
                             Qb_shared_0,
-                            barrier=bar_qb0_ready,
+                            barrier=bar_qb0_ready[stage_consumer0],
                         )
-                        T.barrier_arrive(bar_qb0_ready)
+                        T.barrier_arrive(bar_qb0_ready[stage_consumer0])
 
-                        T.barrier_wait(bar_qb1_free, phase_consumer0)
+                        T.barrier_wait(
+                            bar_qb1_free[stage_consumer0],
+                            phase_consumer0,
+                        )
                         _annotate_sqmma(Qb_shared_1, k_major=False, continuity=dim // 4)
                         T.tma_copy(
                             q_block(Q, bz, q_start, begin_seq_q, by, dim // 2),
                             Qb_shared_1,
-                            barrier=bar_qb1_ready,
+                            barrier=bar_qb1_ready[stage_consumer0],
                         )
-                        T.barrier_arrive(bar_qb1_ready)
+                        T.barrier_arrive(bar_qb1_ready[stage_consumer0])
 
-                        T.barrier_wait(bar_dst_ready, phase_consumer0)
-                        T.barrier_wait(bar_qb0_ready, phase_consumer0)
+                        T.barrier_wait(
+                            bar_dst_ready[stage_consumer0],
+                            phase_consumer0,
+                        )
+                        T.barrier_wait(
+                            bar_qb0_ready[stage_consumer0],
+                            phase_consumer0,
+                        )
                         _annotate_sqmma(dSt_shared, k_major=False, continuity=block_N)
                         _annotate_sqmma(Qb_shared_0, k_major=False, continuity=dim // 4)
                         T.gemm(
@@ -997,7 +1136,10 @@ def flashattn_bwd_ws_split_dkdv(
                         )
                         T.warpgroup_commit_batch()
 
-                        T.barrier_wait(bar_qb1_ready, phase_consumer0)
+                        T.barrier_wait(
+                            bar_qb1_ready[stage_consumer0],
+                            phase_consumer0,
+                        )
                         _annotate_sqmma(dSt_shared, k_major=False, continuity=block_N)
                         _annotate_sqmma(Qb_shared_1, k_major=False, continuity=dim // 4)
                         T.gemm(
@@ -1011,12 +1153,13 @@ def flashattn_bwd_ws_split_dkdv(
                         T.warpgroup_commit_batch()
 
                         T.warpgroup_wait(1)
-                        T.barrier_arrive(bar_qa0_free)
+                        T.barrier_arrive(bar_qa0_free[stage_consumer0])
                         T.warpgroup_wait(0)
-                        T.barrier_arrive(bar_qa1_free)
-                        T.barrier_arrive(bar_dst_free)
+                        T.barrier_arrive(bar_qa1_free[stage_consumer0])
+                        T.barrier_arrive(bar_dst_free[stage_consumer0])
 
-                        phase_consumer0 = phase_consumer0 ^ 1
+                        phase_consumer0 = phase_consumer0 ^ stage_consumer0
+                        stage_consumer0 = stage_consumer0 ^ 1
 
                     store_kv_grad(
                         dK,
@@ -1044,6 +1187,7 @@ def flashattn_bwd_ws_split_dkdv(
                         dim // 2,
                         dk_dim,
                     )
+                    T.barrier_wait(bar_setup_free, 0)
 
     # if heads_kv == heads_q -> output dk dv,
     # if heads_kv != heads_q -> output dk_accum dv_accum， -> reduce to dk dv

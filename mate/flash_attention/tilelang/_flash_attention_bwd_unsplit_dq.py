@@ -229,21 +229,39 @@ def flashattn_bwd_ws_unsplit_dq(
             delta_robust_desc = T.make_robust_desc(
                 T.address_of(Delta[0, 0]), (total_seq_q * heads_q * 4)
             )
-            bar_producer_protect = T.alloc_barrier(arrive_count=producer_threads)
-            bar_consumer0_protect = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_consumer1_protect = T.alloc_barrier(arrive_count=consumer1_threads)
+            # EC_007: reused barriers alternate IDs; phase advances every two uses.
+            # Single-use K/Q setup barriers do not need a ring.
             bar_q_ready = T.alloc_barrier(arrive_count=producer_threads)
             bar_do_ready = T.alloc_barrier(arrive_count=producer_threads)
-            bar_kt0_ready = T.alloc_barrier(arrive_count=producer_threads)
-            bar_vt0_ready = T.alloc_barrier(arrive_count=producer_threads)
-            bar_k0_ready = T.alloc_barrier(arrive_count=producer_threads)
+            bar_kt0_ready = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_vt0_ready = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
+            bar_k0_ready = T.alloc_barrier(
+                arrive_count=[producer_threads, producer_threads]
+            )
 
-            bar_kt0_free = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_vt0_free = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_k0_free = T.alloc_barrier(arrive_count=consumer1_threads)
+            bar_kt0_free = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_vt0_free = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_k0_free = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
 
-            bar_ds_ready = T.alloc_barrier(arrive_count=consumer0_threads)
-            bar_ds_free = T.alloc_barrier(arrive_count=consumer1_threads)
+            bar_ds_ready = T.alloc_barrier(
+                arrive_count=[consumer0_threads, consumer0_threads]
+            )
+            bar_ds_free = T.alloc_barrier(
+                arrive_count=[consumer1_threads, consumer1_threads]
+            )
+
+            # Immutable startup buffers: full notifications above, final release below.
+            bar_setup_free = T.alloc_barrier(arrive_count=consumer0_threads)
 
             T.sync_threads()
 
@@ -318,8 +336,14 @@ def flashattn_bwd_ws_unsplit_dq(
             tid = T.get_thread_binding()
 
             if tid < producer_threads:
+                stage_producer = T.alloc_var(T.int32)
                 phase_producer = T.alloc_var(T.int32)
+                prev_stage_producer = T.alloc_var(T.int32)
+                prev_phase_producer = T.alloc_var(T.int32)
+                stage_producer = 0
                 phase_producer = 0
+                prev_stage_producer = 1
+                prev_phase_producer = 1
                 T.tma_copy(
                     q_block(Q, bz, block_q_start, begin_seq_q, by),
                     Qa_shared_0,
@@ -335,25 +359,32 @@ def flashattn_bwd_ws_unsplit_dq(
                 T.barrier_arrive(bar_do_ready)
 
                 for kv_start in range(kv_loop_start, kv_loop_end, block_N):
-                    T.barrier_arrive(bar_producer_protect)
-
-                    T.barrier_wait(bar_kt0_free, phase_producer ^ 1)
+                    T.barrier_wait(
+                        bar_kt0_free[prev_stage_producer],
+                        prev_phase_producer,
+                    )
                     T.tma_copy(
                         kv_block(K, bz, kv_start, begin_seq_kv, kv_group),
                         Kt_shared_0,
-                        barrier=bar_kt0_ready,
+                        barrier=bar_kt0_ready[stage_producer],
                     )
-                    T.barrier_arrive(bar_kt0_ready)
+                    T.barrier_arrive(bar_kt0_ready[stage_producer])
 
-                    T.barrier_wait(bar_vt0_free, phase_producer ^ 1)
+                    T.barrier_wait(
+                        bar_vt0_free[prev_stage_producer],
+                        prev_phase_producer,
+                    )
                     T.tma_copy(
                         kv_block(V, bz, kv_start, begin_seq_kv, kv_group),
                         Vt_shared_0,
-                        barrier=bar_vt0_ready,
+                        barrier=bar_vt0_ready[stage_producer],
                     )
-                    T.barrier_arrive(bar_vt0_ready)
+                    T.barrier_arrive(bar_vt0_ready[stage_producer])
 
-                    T.barrier_wait(bar_k0_free, phase_producer ^ 1)
+                    T.barrier_wait(
+                        bar_k0_free[prev_stage_producer],
+                        prev_phase_producer,
+                    )
                     for i, j in T.Parallel(block_N, dim):
                         T.copy(
                             kv_elem(
@@ -368,17 +399,26 @@ def flashattn_bwd_ws_unsplit_dq(
                             force_async_copy=True,
                             src_robust_desc=k_robust_desc,
                         )
-                    T.ptx_commit_group()
-                    T.ptx_wait_group(0)
-                    T.barrier_arrive(bar_k0_ready)
+                    # Group 0 owns the K tile; drain it before publishing ready.
+                    T.async_copy_commit_group(0)
+                    T.async_copy_wait_group(0)
+                    T.barrier_arrive(bar_k0_ready[stage_producer])
 
-                    T.barrier_wait(bar_producer_protect, phase_producer)
-
-                    phase_producer = phase_producer ^ 1
+                    prev_stage_producer = stage_producer
+                    prev_phase_producer = phase_producer
+                    phase_producer = phase_producer ^ stage_producer
+                    stage_producer = stage_producer ^ 1
+                T.barrier_wait(bar_setup_free, 0)
 
             elif tid < producer_threads + consumer0_threads:
+                stage_consumer0 = T.alloc_var(T.int32)
                 phase_consumer0 = T.alloc_var(T.int32)
+                prev_stage_consumer0 = T.alloc_var(T.int32)
+                prev_phase_consumer0 = T.alloc_var(T.int32)
+                stage_consumer0 = 0
                 phase_consumer0 = 0
+                prev_stage_consumer0 = 1
+                prev_phase_consumer0 = 1
                 accs_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                 dp_accum = T.alloc_fragment([block_M, block_N], accum_dtype)
                 if has_softcap:
@@ -417,8 +457,6 @@ def flashattn_bwd_ws_unsplit_dq(
                 T.barrier_wait(bar_q_ready, 0)
                 T.barrier_wait(bar_do_ready, 0)
                 for kv_start in range(kv_loop_start, kv_loop_end, block_N):
-                    T.barrier_arrive(bar_consumer0_protect)
-
                     if (kv_start + block_N) > end_seq_kv:
                         for i, j in T.Parallel(block_M, block_N):
                             accs_accum[i, j] = T.if_then_else(
@@ -451,7 +489,10 @@ def flashattn_bwd_ws_unsplit_dq(
                                 valid, accs_accum[i, j], float("-inf")
                             )
 
-                    T.barrier_wait(bar_kt0_ready, phase_consumer0)
+                    T.barrier_wait(
+                        bar_kt0_ready[stage_consumer0],
+                        phase_consumer0,
+                    )
                     T.gemm(
                         Qa_shared_0,
                         Kt_shared_0,
@@ -461,9 +502,12 @@ def flashattn_bwd_ws_unsplit_dq(
                         policy=T.GemmWarpPolicy.FullRow,
                     )
                     T.wait_wgmma(0)
-                    T.barrier_arrive(bar_kt0_free)
+                    T.barrier_arrive(bar_kt0_free[stage_consumer0])
 
-                    T.barrier_wait(bar_vt0_ready, phase_consumer0)
+                    T.barrier_wait(
+                        bar_vt0_ready[stage_consumer0],
+                        phase_consumer0,
+                    )
                     _annotate_sqmma(Vt_shared_0, k_major=True)
                     T.gemm(
                         dOa_shared_0,
@@ -529,7 +573,7 @@ def flashattn_bwd_ws_unsplit_dq(
                         for i, j in T.Parallel(block_M, block_N):
                             accs_accum[i, j] = T.exp2(accs_accum[i, j])
                     T.wait_wgmma(0)
-                    T.barrier_arrive(bar_vt0_free)
+                    T.barrier_arrive(bar_vt0_free[stage_consumer0])
 
                     for i, j in T.Parallel(block_M, block_N):
                         dp_accum[i, j] = dp_accum[i, j] * smscale - delta_buffer[i]
@@ -541,25 +585,37 @@ def flashattn_bwd_ws_unsplit_dq(
 
                     # store ds
                     T.copy(dp_accum, accs_cast)
-                    T.barrier_wait(bar_ds_free, phase_consumer0 ^ 1)
+                    T.barrier_wait(
+                        bar_ds_free[prev_stage_consumer0],
+                        prev_phase_consumer0,
+                    )
                     for i, t, l in T.Parallel(block_M, 8, L):
                         ds_shared[i, t * L + l] = accs_cast[i, l * 8 + t]
                     T.lma_wait()
-                    T.barrier_arrive(bar_ds_ready)
-                    T.barrier_wait(bar_consumer0_protect, phase_consumer0)
-                    phase_consumer0 = phase_consumer0 ^ 1
+                    T.barrier_arrive(bar_ds_ready[stage_consumer0])
+                    prev_stage_consumer0 = stage_consumer0
+                    prev_phase_consumer0 = phase_consumer0
+                    phase_consumer0 = phase_consumer0 ^ stage_consumer0
+                    stage_consumer0 = stage_consumer0 ^ 1
+                T.barrier_arrive(bar_setup_free)
 
             else:
+                stage_consumer1 = T.alloc_var(T.int32)
                 phase_consumer1 = T.alloc_var(T.int32)
+                stage_consumer1 = 0
                 phase_consumer1 = 0
                 accum_dq0 = T.alloc_fragment([block_M, dim], accum_dtype)
                 dq_cast0 = T.alloc_fragment([block_M, dim], dtype)
                 T.fill(accum_dq0, 0.0)
                 for kv_start in range(kv_loop_start, kv_loop_end, block_N):
-                    T.barrier_arrive(bar_consumer1_protect)
-
-                    T.barrier_wait(bar_k0_ready, phase_consumer1)
-                    T.barrier_wait(bar_ds_ready, phase_consumer1)
+                    T.barrier_wait(
+                        bar_k0_ready[stage_consumer1],
+                        phase_consumer1,
+                    )
+                    T.barrier_wait(
+                        bar_ds_ready[stage_consumer1],
+                        phase_consumer1,
+                    )
                     T.gemm(
                         ds_shared,
                         K_shared_0,
@@ -569,10 +625,10 @@ def flashattn_bwd_ws_unsplit_dq(
                         policy=T.GemmWarpPolicy.FullCol,
                     )
                     T.wait_wgmma(0)
-                    T.barrier_arrive(bar_ds_free)
-                    T.barrier_arrive(bar_k0_free)
-                    T.barrier_wait(bar_consumer1_protect, phase_consumer1)
-                    phase_consumer1 = phase_consumer1 ^ 1
+                    T.barrier_arrive(bar_ds_free[stage_consumer1])
+                    T.barrier_arrive(bar_k0_free[stage_consumer1])
+                    phase_consumer1 = phase_consumer1 ^ stage_consumer1
+                    stage_consumer1 = stage_consumer1 ^ 1
 
                 T.copy(accum_dq0, dq_cast0)
                 for i, j in T.Parallel(block_M, dim):
