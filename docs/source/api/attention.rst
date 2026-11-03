@@ -93,6 +93,23 @@ contain ``NaN``. Keep the KV inputs contiguous or clear the padding.
 .. autofunction:: flash_attn_with_kvcache
 .. autofunction:: get_scheduler_metadata
 .. autofunction:: flash_attn_varlen_func
+.. autofunction:: fmha_backward
+
+Standalone backward follows the FA3 C++ ``mha_bwd`` parameter order. Gradient
+buffers are optional independently; provided buffers are returned by identity.
+``backend="auto"`` currently selects TileLang. Aligned TileLang outputs are
+written directly, including strided views; head-dimension padding may require
+temporary storage. The caller must keep gradient buffers disjoint from inputs
+and from each other.
+
+.. code-block:: python
+
+   dq, dk, dv, softmax_d = mate.fmha_backward(
+       dout, q, k, v, out, softmax_lse, dq, dk, dv,
+       softmax_scale=q.shape[-1] ** -0.5,
+       window_size_left=127, window_size_right=0,
+       backend="tilelang",
+   )
 
 
 MLA

@@ -770,21 +770,28 @@ def attention_ref(
     if v_descale is not None:
         v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
-    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
-    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+    # Keep KV heads shared across their query groups. Materializing repeated
+    # K/V can exhaust device memory even for short decode queries.
+    q_grouped = rearrange(q, "b t (h g) d -> b t h g d", h=k.shape[2])
     d = q.shape[-1]
     dv = v.shape[-1]
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(dv if only_qv else d if qv is None else d + dv)
     if only_qv:
         assert qv is not None
-        scores = torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
+        qv_grouped = rearrange(qv, "b t (h g) d -> b t h g d", h=v.shape[2])
+        scores = torch.einsum("bthgd,bshd->bhgts", qv_grouped * softmax_scale, v)
     elif not reorder_ops:
-        scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
+        scores = torch.einsum("bthgd,bshd->bhgts", q_grouped * softmax_scale, k)
     else:
-        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+        scores = torch.einsum("bthgd,bshd->bhgts", q_grouped, k * softmax_scale)
+    scores = rearrange(scores, "b h g t s -> b (h g) t s")
     if qv is not None and not only_qv:
-        scores = scores + torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
+        qv_grouped = rearrange(qv, "b t (h g) d -> b t h g d", h=v.shape[2])
+        scores = scores + rearrange(
+            torch.einsum("bthgd,bshd->bhgts", qv_grouped * softmax_scale, v),
+            "b h g t s -> b (h g) t s",
+        )
     if softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:
@@ -853,7 +860,13 @@ def attention_ref(
         attention_drop = attention
     if intermediate_dtype is not None:
         attention_drop = attention_drop.to(intermediate_dtype).to(attention_drop.dtype)
-    output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
+    attention_grouped = rearrange(
+        attention_drop, "b (h g) t s -> b h g t s", h=v.shape[2]
+    )
+    output = rearrange(
+        torch.einsum("bhgts,bshd->bthgd", attention_grouped, v * dropout_scaling),
+        "b t h g d -> b t (h g) d",
+    )
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
 

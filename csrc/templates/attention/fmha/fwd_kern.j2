@@ -57,10 +57,8 @@ ffi::Array<ffi::Any> {{ func_name }} (
   int const cp_world_size,
   int const cp_rank,
   ffi::Optional<ffi::TensorView> cp_tot_seqused_k,
+  ffi::Optional<ffi::TensorView> max_logits,
   bool const dry_run
-  {% if has_max_logits %},
-  ffi::TensorView max_logits
-  {% endif %}
 ) {
   // FMHA config
   constexpr bool HasQv = {{ 'true' if has_qv else 'false' }};
@@ -330,15 +328,22 @@ ffi::Array<ffi::Any> {{ func_name }} (
 
     .is_fp8 = std::is_same_v<Element, mutlass::float_e4m3_t> || std::is_same_v<Element, mutlass::float_e5m2_t>,
   };
-  if (params.num_splits <= 0) {
-    params.num_splits = mate::attention::fmha::get_num_splits(params, TileM, TileN, false);
-    // std::cout << "Fwd heristic sets num_splits=" << params.num_splits << std::endl;
+  if constexpr (IsSplit) {
+    if (params.num_splits <= 0) {
+      params.num_splits = mate::attention::fmha::get_num_splits(params, TileM, TileN, false);
+      // std::cout << "Fwd heristic sets num_splits=" << params.num_splits << std::endl;
+    }
+  } else {
+    params.num_splits = 1;
   }
   // std::cout << "Fwd final sets num_splits=" << params.num_splits << std::endl;
 
+  ffi::Tensor o_accum;
+  ffi::Tensor lse_accum;
+  ffi::Tensor max_logits_accum;
   if constexpr (IsSplit) {
     // SplitKV Tensors
-    ffi::Tensor o_accum = ffi::Tensor::FromEnvAlloc(
+    o_accum = ffi::Tensor::FromEnvAlloc(
       TVMFFIEnvTensorAlloc,
       tvm::ffi::Shape({
           HasCuseqlensQ ? 1 : batch_size,
@@ -347,7 +352,7 @@ ffi::Array<ffi::Any> {{ func_name }} (
           HasCuseqlensQ ? total_q : seqlen_q,
           headdim_v
       }), DLDataType{kDLFloat, 32, 1}, q.device());
-    ffi::Tensor lse_accum = ffi::Tensor::FromEnvAlloc(
+    lse_accum = ffi::Tensor::FromEnvAlloc(
       TVMFFIEnvTensorAlloc,
       tvm::ffi::Shape({
           HasCuseqlensQ ? 1 : batch_size,
@@ -355,14 +360,14 @@ ffi::Array<ffi::Any> {{ func_name }} (
           params.num_splits,
           HasCuseqlensQ ? total_q : seqlen_q
       }), DLDataType{kDLFloat, 32, 1}, q.device());
-    {% if has_max_logits %}
-    ffi::Tensor max_logits_accum = ffi::Tensor::FromEnvAlloc(
-      TVMFFIEnvTensorAlloc, lse_accum.shape(), DLDataType{kDLFloat, 32, 1}, q.device());
-    {% endif %}
+    if constexpr (HasMaxLogits) {
+      max_logits_accum = ffi::Tensor::FromEnvAlloc(
+        TVMFFIEnvTensorAlloc, lse_accum.shape(), DLDataType{kDLFloat, 32, 1}, q.device());
+    }
   }
 
   if (dry_run) {
-    return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum{% if has_max_logits %}, max_logits_accum{% endif %}}, params.num_splits};
+    return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum, max_logits_accum}, params.num_splits};
   }
 
   metadata_ptr = HasMetadata ? static_cast<int32_t*>(metadata.value().data_ptr()) : nullptr;
@@ -399,15 +404,17 @@ ffi::Array<ffi::Any> {{ func_name }} (
   // musaMemset(o_accum.data_ptr(), 0x0, 4*o_accum.numel());
   // musaMemset(lse_accum.data_ptr(), 0x0, 4*lse_accum.numel());
 
-  params.oaccum_ptr = static_cast<ElementPartial*>(o_accum.data_ptr());
-  params.softmax_lseaccum_ptr = static_cast<ElementPartial*>(lse_accum.data_ptr());
-  params.oaccum_split_stride = o_accum.stride(2);
-  params.oaccum_batch_stride = HasCuseqlensQ ? 0 : o_accum.stride(0);
-  params.oaccum_row_stride = o_accum.stride(-2);
-  params.oaccum_head_stride = o_accum.stride(1);
-  params.lseaccum_split_stride = lse_accum.stride(2);
-  params.lseaccum_batch_stride = HasCuseqlensQ ? 0 : lse_accum.stride(0);
-  params.lseaccum_head_stride = lse_accum.stride(1);
+  if constexpr (IsSplit) {
+    params.oaccum_ptr = static_cast<ElementPartial*>(o_accum.data_ptr());
+    params.softmax_lseaccum_ptr = static_cast<ElementPartial*>(lse_accum.data_ptr());
+    params.oaccum_split_stride = o_accum.stride(2);
+    params.oaccum_batch_stride = HasCuseqlensQ ? 0 : o_accum.stride(0);
+    params.oaccum_row_stride = o_accum.stride(-2);
+    params.oaccum_head_stride = o_accum.stride(1);
+    params.lseaccum_split_stride = lse_accum.stride(2);
+    params.lseaccum_batch_stride = HasCuseqlensQ ? 0 : lse_accum.stride(0);
+    params.lseaccum_head_stride = lse_accum.stride(1);
+  }
 
   // std::cout << params << std::endl;
 
@@ -502,10 +509,9 @@ ffi::Array<ffi::Any> {{ func_name }} (
     .stride_LSE = {_1{}, params.lse_head_stride, HasCuseqlensQ ? 0 : params.lse_batch_stride, 0},
     .ptr_LSE_partial = static_cast<ElementPartial*>(params.softmax_lseaccum_ptr),
     .stride_LSE_partial = {_1{}, params.lseaccum_head_stride, HasCuseqlensQ ? 0 : params.lseaccum_batch_stride, params.lseaccum_split_stride},
-    {% if has_max_logits %}
-    .ptr_max_logits = static_cast<float*>(max_logits.data_ptr()),
-    .ptr_max_logits_partial = static_cast<float*>(max_logits_accum.data_ptr()),
-    {% endif %}
+
+    .ptr_max_logits = HasMaxLogits ? static_cast<float*>(max_logits.value().data_ptr()) : nullptr,
+    .ptr_max_logits_partial = (IsSplit && HasMaxLogits) ? static_cast<float*>(max_logits_accum.data_ptr()) : nullptr,
 
     .nheads_kv = params.h_k,
     .cu_seqlens = static_cast<uint32_t const*>(params.cu_seqlens_q),
@@ -544,5 +550,5 @@ ffi::Array<ffi::Any> {{ func_name }} (
   mutlass::device_kernel<Kernel><<<grid_dim, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(kernel_params);
   MATE_CHECK_MUSA_KERNEL_LAUNCH();
 
-  return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum{% if has_max_logits %}, max_logits_accum{% endif %}}, params.num_splits};
+  return ffi::Array<ffi::Any>{ffi::Array<ffi::Tensor>{o_accum, lse_accum, max_logits_accum}, params.num_splits};
 }

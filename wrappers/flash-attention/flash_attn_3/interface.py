@@ -6,6 +6,7 @@ from mate.mha_interface import (
     _flash_attn_forward as mate_flash_attn_forward,
     flash_attn_combine as mate_flash_attn_combine,
     flash_attn_varlen_func as mate_flash_attn_varlen_func,
+    fmha_backward as mate_fmha_backward,
     flash_attn_with_kvcache as mate_flash_attn_with_kvcache,
     get_scheduler_metadata as mate_get_scheduler_metadata,
 )
@@ -104,6 +105,64 @@ def _flash_attn_forward(
             sm_margin=sm_margin,
         )
     )
+
+
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    sequed_q: Optional[torch.Tensor] = None,
+    sequed_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+) -> torch.Tensor:
+    """FA3 backward argument/mutation contract over MATE's independent API.
+
+    Write the supplied dQ/dK/dV buffers using saved O and natural-log LSE.
+    Keep the upstream spelling ``sequed_q/k``. The returned FP32 softmax
+    derivative sum has logical LSE layout (B,H,S or H,T); CUDA kernel-specific
+    scratch padding is intentionally not part of the MUSA return contract.
+    """
+    _, _, _, softmax_d = mate_fmha_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_q=sequed_q,
+        seqused_k=sequed_k,
+        softmax_scale=softmax_scale,
+        is_causal=is_causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        softcap=softcap,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+    )
+    return softmax_d
 
 
 def flash_attn_combine(

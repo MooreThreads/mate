@@ -850,6 +850,23 @@ _MAXSCORE_WORKLOADS = [
         preallocated_max_score=True,
         seed=307,
     ),
+    # Exercise repeated K barrier-ring wraps on the paged BF16 path.
+    *[
+        MsaWorkload(
+            api=MsaApi.MAXSCORE,
+            num_q_heads=2,
+            num_kv_heads=2,
+            q_lengths=(513, 65),
+            kv_lengths=(8193, 1025),
+            kv_layout=MsaKvLayout.PAGED,
+            page_mode="reverse",
+            dtype=torch.bfloat16,
+            causal=causal,
+            preallocated_max_score=True,
+            seed=4217,
+        )
+        for causal in (False, True)
+    ],
 ]
 if _HAS_FP8_E4M3:
     _MAXSCORE_WORKLOADS.extend(
@@ -1353,15 +1370,17 @@ def test_msa_maxscore_runtime_offset_kv_tail() -> None:
 
 
 @supported_musa_compute_capability([31])
+@pytest.mark.parametrize("num_q_heads", [1, 2])
 @torch.inference_mode()
-def test_msa_maxscore_reuses_schedule_across_k_barrier_wraps() -> None:
+def test_msa_maxscore_reuses_schedule_across_k_barrier_wraps(num_q_heads: int) -> None:
     from mate.jit import msa_ops
 
     device = torch.device("musa")
     page_size = 128
     num_pages = 1024
-    q_len = 512
-    q = torch.ones((q_len, 1, 128), dtype=torch.bfloat16, device=device)
+    num_mps = msa_ops.resolve_num_mps(device, None)
+    q_len = 512 if num_q_heads == 1 else max(512, num_mps * 64)
+    q = torch.ones((q_len, num_q_heads, 128), dtype=torch.bfloat16, device=device)
     page_values = (((torch.arange(num_pages) % 32) + 1).float() / 32).to(
         device=device, dtype=torch.bfloat16
     )
@@ -1372,9 +1391,11 @@ def test_msa_maxscore_reuses_schedule_across_k_barrier_wraps() -> None:
     page_table = torch.arange(
         num_pages - 1, -1, -1, dtype=torch.int32, device=device
     ).unsqueeze(0)
-    schedule = torch.empty(
-        (msa_ops.resolve_num_mps(device, None), 2), dtype=torch.int32, device=device
-    )
+    # The GQA case has enough Q work to keep the schedule's K partition count
+    # at one. One schedule row then forces a CTA to reuse both pipelines
+    # across multiple Q works as well as all 1024 K pages.
+    schedule_rows = num_mps if num_q_heads == 1 else 1
+    schedule = torch.empty((schedule_rows, 2), dtype=torch.int32, device=device)
 
     outputs = [
         msa_ops._msa_maxscore(

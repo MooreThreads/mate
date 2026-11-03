@@ -1167,13 +1167,11 @@ def _fmha_fwd(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        max_logits,
         skip_kernel_launch_if_dry_run(),
     )
-    if return_max_logits:
-        ffi_arguments += (max_logits,)
     accums, num_splits = fmha_fwd_impl(*ffi_arguments)
-    o_accum, lse_accum = accums[:2]
-    max_logits_accum = accums[2] if return_max_logits else None
+    o_accum, lse_accum, max_logits_accum = accums
 
     _fmha_fwd_combine(
         out,

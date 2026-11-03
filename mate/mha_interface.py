@@ -828,6 +828,120 @@ def flash_attn_varlen_func(
 
 
 @mate_api
+def fmha_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+    *,
+    backend: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute attention gradients from saved forward output and natural-log LSE.
+
+    Parameters
+    ----------
+    q, k, v : Tensor
+        Dense BSHD tensors or packed THD tensors, as for
+        :func:`flash_attn_varlen_func`. Only supplied gradient buffers are written.
+    out, dout : Tensor
+        Saved forward output and its gradient, in the same layout as Q.
+    softmax_lse : Tensor
+        FP32 natural-log LSE: (B, H, S) for dense, (H, T) for packed Q.
+        O/LSE must come from forward with the same scale, mask and softcap;
+        they are logical values and are not tied to a particular backend.
+    cu_seqlens_q, cu_seqlens_k : Tensor, optional
+        INT32 cumulative lengths for packed Q/KV. Supply both or neither.
+    max_seqlen_q, max_seqlen_k : int, optional
+        Maximum sequence lengths. Required for packed inputs; inferred for dense.
+    seqused_q, seqused_k : Tensor, optional
+        Per-sequence used lengths, subject to backend support.
+    softmax_scale : float, optional
+        Scale applied to QK; defaults to 1/sqrt(Q head dimension).
+    is_causal : bool
+        Apply bottom-right causal masking.
+    window_size_left, window_size_right : int
+        Inclusive left/right offsets around the bottom-right diagonal;
+        -1 means unbounded on that side.
+    softcap : float
+        Forward logit softcap; zero disables it.
+    deterministic : bool
+        Request deterministic gradients; unsupported backends reject it.
+    backend : str
+        ``auto`` currently selects ``tilelang``. Explicit selection never
+        falls back.
+    sm_margin : int
+        Reserved compute units for backend scheduling. TileLang ignores this hint.
+    dq, dk, dv : Tensor, optional
+        Caller-owned gradient buffers matching each input's shape, dtype and
+        device. Their strides may differ. Supplied buffers are written in place
+        and returned by identity; omitted buffers are allocated by the backend.
+        Buffers must not overlap inputs or each other. TileLang requires unit
+        inner stride and, for aligned head dimensions, outer strides divisible
+        by 8. Aligned outputs are written directly; head-dimension padding may
+        require temporary storage.
+
+    Returns
+    -------
+    tuple[Tensor, Tensor, Tensor, Tensor]
+        dQ, dK, dV and FP32 softmax_d in logical LSE layout, with unused query
+        rows zeroed. This explicit backward does not recompute forward or support
+        higher-order gradients. Backend shape/architecture restrictions
+        propagate as errors. This release provides the MP31 TileLang backend.
+    """
+    if backend == "auto":
+        backend = "tilelang"
+    if backend == "tilelang":
+        from .flash_attention.tilelang.flash_attention_varlen_bwd import (  # type: ignore[attr-defined]
+            flashattn_varlen_bwd_interface,
+        )
+
+        # sm_margin is a scheduling hint; TileLang currently ignores it.
+        return flashattn_varlen_bwd_interface(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            dout=dout,
+            softmax_lse=softmax_lse,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            smscale=softmax_scale,
+            is_causal=is_causal,
+            window_size=(window_size_left, window_size_right),
+            softcap=softcap,
+            deterministic=deterministic,
+            is_bhsd=False,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            return_softmax_d=True,
+        )
+    raise ValueError(f"Unknown attention backward backend: {backend}")
+
+
+@mate_api
 def flash_attn_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,

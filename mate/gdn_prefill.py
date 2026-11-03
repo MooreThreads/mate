@@ -24,6 +24,8 @@ def chunk_gated_delta_rule(
     is_log_space: bool = True,
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
+    state_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -75,7 +77,22 @@ def chunk_gated_delta_rule(
         output_state (Optional[torch.Tensor]):
             Pre-allocated output state tensor of shape
             ``[num_seqs, num_sab_heads, head_size, head_size]``, float32.
-            Required if ``output_final_state=True``. Default: ``None``.
+            May be a non-overlapping strided view with strides independent of
+            ``initial_state``; with ``state_indices`` this is an explicit output
+            pool and is required when ``output_final_state=True``.
+            Default: ``None``.
+        state_indices (Optional[torch.Tensor]):
+            Shared input/output pool slot mapping of shape ``[num_seqs]``,
+            int32 or int64 on the input device; strided views are supported.
+            None uses sequence-order states. Negative entries are padding and
+            never touch either pool; slot zero is a valid slot. Non-negative
+            indices must be in bounds of every pool accessed, and active output
+            slots must be unique.
+        has_initial_state (Optional[torch.Tensor]):
+            Boolean tensor of shape ``[num_seqs]`` on the input device. False
+            starts that sequence from zero without reading or clearing its input
+            slot, but still writes its final state. Requires ``initial_state``.
+            Default: ``None``.
 
     Returns:
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -139,7 +156,11 @@ def chunk_gated_delta_rule(
             raise ValueError(
                 "q must be a 3D tensor with shape [S, N, D] when using `cu_seqlens`."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+        if (
+            state_indices is None
+            and initial_state is not None
+            and initial_state.shape[0] != len(cu_seqlens) - 1
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
@@ -181,6 +202,8 @@ def chunk_gated_delta_rule(
         output_o=True,
         cu_seqlens=cu_seqlens,
         is_log_space=is_log_space,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
     )
     o = o.to(q.dtype)
     if squeeze_varlen_output:

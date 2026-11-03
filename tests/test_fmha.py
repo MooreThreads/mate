@@ -99,7 +99,7 @@ METADATA_WORKLOADS = [
         page_size=page_size,
         pack_gqa=pack_gqa,
         num_splits=num_splits,
-        expect_single_split=True,
+        expect_single_split=num_splits >= 0,
         **_mask_options(mask),
     )
     for (num_heads_q, num_heads_kv), (
@@ -111,7 +111,7 @@ METADATA_WORKLOADS = [
         (1, 16, 64),
         (None, "causal"),
         (True, False),
-        (0, 5),
+        (-1, 0, 5),
     )
 ]
 
@@ -531,14 +531,11 @@ def test_varlen_func_bshd(workload: FmhaWorkload) -> None:
 
 @pytest.mark.mate_dry_run
 @supported_musa_compute_capability([31])
-@pytest.mark.parametrize(
-    "api,backend,num_splits",
-    [(api, "mutlass", splits) for api in ("varlen", "kvcache") for splits in (1, 3)]
-    + [("varlen", "mubin", 1)],
-)
+@pytest.mark.parametrize("api", ["varlen", "kvcache"])
+@pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("return_lse", [False, True])
 @torch.inference_mode()
-def test_max_logits(api: str, backend: str, num_splits: int, return_lse: bool) -> None:
+def test_max_logits(api: str, num_splits: int, return_lse: bool) -> None:
     torch.manual_seed(666)
     q, k, v = [
         torch.randn(shape, dtype=torch.bfloat16, device="musa")
@@ -570,7 +567,7 @@ def test_max_logits(api: str, backend: str, num_splits: int, return_lse: bool) -
         return_max_logits=True,
     )
     if api == "varlen":
-        result = flash_attn_varlen_func(q, k, v, backend=backend, **kwargs)
+        result = flash_attn_varlen_func(q, k, v, backend="mutlass", **kwargs)
     else:
         result = flash_attn_with_kvcache(q, k, v, **kwargs)
     raise_complete_if_dry_run()

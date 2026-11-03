@@ -63,6 +63,20 @@ On the currently supported MATE path:
 - `intermediate_states_buffer`: same dtype as `state`
 - `output`: optional, supports `float16` / `bfloat16` / `float32`
 
+### Packed State Cache Layouts
+
+Decode and MTP access padded state pools directly when each `[HV, V, K]`
+block is contiguous, the block stride is at least `HV * V * K`, and the
+view's base address and block stride in bytes are multiples of 16. Other
+non-contiguous state layouts retain the contiguous-copy fallback.
+
+For example, a float32 state with shape `[pool_size, 12, 128, 128]` and
+strides `(200448, 16384, 128, 1)` can be a view into interleaved
+`[conv_i | ssm_i | pad]` pages. The kernels use the actual block stride,
+update only selected SSM slots, and leave conv data and padding untouched.
+The view's storage offset is already included in its tensor data pointer.
+No cache-wide packing or copy-back is needed for this layout.
+
 ## Prefill
 
 ### Prefill At a Glance
@@ -80,6 +94,8 @@ On the currently supported MATE path:
 | Output Heads | ✅ Supported | `head_o = max(num_q_heads, num_v_heads)` |
 | QK L2 Norm Option | ✅ Supported | `use_qk_l2norm_in_kernel=True` normalizes Q and K in place with a standalone TileLang kernel before KKT/prefill |
 | Strided Q/K/V | ✅ Supported | Split-QKV views are supported when the last dimension is contiguous (`stride(-1) == 1`) |
+| Strided State | ✅ MP31 | `initial_state` and `output_state` retain their own strides, including padded conv/SSM cache pages |
+| State Pool Mapping | ✅ MP31 | Optional `state_indices` selects input/output pool slots; `has_initial_state` controls initialization per sequence |
 
 ### Prefill Shape Rules
 
@@ -112,6 +128,62 @@ For both modes:
   normalization, KKT, or fused prefill kernels. When requested, the final
   state equals `initial_state`, or is zero when no initial state is supplied;
   a preallocated `output_state` is populated in place.
+- Initial and final state views may have different strides and nonzero storage
+  offsets. State is read/written directly without packing; output state must
+  not overlap itself. Without `state_indices`, states are indexed by sequence
+  number. With indices, their first dimension is the pool size and may differ
+  from the sequence count.
+- Contiguous initial and final states retain the dense-state kernel path.
+- Packed pools with dense state blocks specialize the inner strides and bind
+  only their independent page strides dynamically.
+
+### Direct State Pool Prefill
+
+`state_indices` is an optional int32/int64 tensor of shape `[B]`, where
+`B = len(cu_seqlens) - 1` for varlen inputs. It maps sequence order to the same
+slot number in the input and output pools. The pools may have different sizes,
+strides, and storage offsets; every nonnegative index must be in bounds of each
+pool accessed. Active output slots must be unique. Exact in-place use of the same
+pool is supported; partially overlapping input/output views are rejected.
+
+`has_initial_state` is an optional bool tensor of shape `[B]`. False initializes
+that sequence to zero in the kernel without reading or clearing the input slot,
+but still writes its final state. It requires an `initial_state` tensor. Both
+metadata tensors may be strided views. None preserves the previous identity
+mapping and all-initial/all-zero behavior.
+
+```python
+output, final_pool = mate.gdn_prefill.chunk_gated_delta_rule(
+    q=q, k=k, v=v, g=g, beta=beta,
+    initial_state=ssm_pool,
+    output_state=ssm_pool,
+    output_final_state=True,
+    cu_seqlens=prefill_query_start_loc,
+    state_indices=prefill_state_indices,
+    has_initial_state=prefill_has_initial_state,
+)
+assert final_pool is ssm_pool
+```
+
+Indexed final-state output requires an explicit `output_state` pool, avoiding an
+implicit pool-sized allocation. The returned state is that whole pool, not a
+gathered batch of states. With `output_final_state=False`, the input pool remains
+read-only and no output pool is required. Empty sequences pass through their
+selected initial state, or write zero if they have no history.
+
+Negative indices are padding and never touch either pool. Slot zero is valid,
+matching the decode API; an integration whose null slot is zero must translate it
+to a negative index. These inputs remove the need for caller-side SSM gather,
+temporary-state zeroing, and final-state scatter only when the caller actually
+passes the pools directly. They do not remove cache-manager migrations or
+implement speculative rollback/block-table semantics.
+
+Partially overlapping `initial_state` / `output_state` views are rejected at the
+entry; exact in-place reuse of one view stays supported. Non-negative indices are
+trusted to be in bounds, because validating them would read device memory and
+break graph capture. Set `MATE_GDN_DEBUG_STATE_VALIDATION=1` to enable a
+host-side bound check for debugging; it synchronizes, so keep it off in
+production and outside captured regions.
 
 ### Minimal Dense Prefill Example
 

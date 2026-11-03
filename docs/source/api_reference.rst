@@ -34,6 +34,7 @@ metadata, and MLA-related :doc:`attention <api/attention>` paths.
 
 - ``mate.flash_attn_combine``
 - ``mate.flash_attn_varlen_func``
+- ``mate.fmha_backward``
 - ``mate.flash_attn_with_kvcache``
 - ``mate.get_scheduler_metadata``
 - ``mate.get_mla_metadata``

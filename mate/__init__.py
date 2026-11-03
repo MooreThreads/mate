@@ -46,6 +46,7 @@ _LAZY_SUBMODULES = {
 _LAZY_ATTR_MODULES = {
     "flash_attn_combine": "mha_interface",
     "flash_attn_varlen_func": "mha_interface",
+    "fmha_backward": "mha_interface",
     "flash_attn_with_kvcache": "mha_interface",
     "get_scheduler_metadata": "mha_interface",
     "get_mla_metadata": "flashmla",
@@ -83,6 +84,7 @@ __all__ = [
     "deep_gemm",
     "flash_attn_combine",
     "flash_attn_varlen_func",
+    "fmha_backward",
     "flash_attn_with_kvcache",
     "flash_mla_with_kvcache",
     "flashmla",

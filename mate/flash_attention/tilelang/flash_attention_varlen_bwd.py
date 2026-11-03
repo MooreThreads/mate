@@ -7,6 +7,8 @@ from ...execution_context import skip_kernel_launch_if_dry_run
 from ...jit.cpp_ext import get_mcc_version
 from ._flash_attention_bwd_common import (
     _check_attention_strides,
+    _check_gradient_output,
+    _finish_gradient,
     _contiguous_cosize_bytes,
     _jit_for_index_type_promotion,
     _needs_index_type_promotion,
@@ -446,7 +448,15 @@ def flashattn_varlen_bwd_interface(
     dtype=None,
     is_bhsd=False,
     deterministic=False,
+    dq=None,
+    dk=None,
+    dv=None,
+    return_softmax_d=False,
 ):
+    for name, output, source in (("dq", dq, q), ("dk", dk, k), ("dv", dv, v)):
+        _check_gradient_output(name, output, source)
+    dq_out, dk_out, dv_out = dq, dk, dv
+
     is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
     if is_varlen and (cu_seqlens_q is None or cu_seqlens_k is None):
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be provided together")
@@ -526,7 +536,13 @@ def flashattn_varlen_bwd_interface(
     # descriptors cannot represent zero-sized global tensors, so do not launch
     # any backward kernels for these inputs.
     if total_seq_q == 0 or total_seq_kv == 0:
-        return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        gradients = tuple(
+            (torch.zeros_like(source) if output is None else output.zero_())
+            for output, source in ((dq_out, q), (dk_out, k), (dv_out, v))
+        )
+        if return_softmax_d:
+            return (*gradients, torch.zeros_like(softmax_lse, dtype=torch.float32))
+        return gradients
 
     runtime_qk_dim = ceil_div(actual_qk_dim, 8) * 8
     runtime_v_dim = ceil_div(actual_v_dim, 8) * 8
@@ -607,7 +623,10 @@ def flashattn_varlen_bwd_interface(
         _, _, block_M, block_N = _separate_blocks(plan)
     else:
         block_M, block_N = _unified_blocks(plan)
-    recompute_delta = _should_recompute_delta(plan, max_seqlen_k, block_N)
+    # The standalone FA3 API exposes delta, so materialize it once and reuse it.
+    recompute_delta = not return_softmax_d and _should_recompute_delta(
+        plan, max_seqlen_k, block_N
+    )
     max_seq_q_padded = ceil_div(max_seqlen_q, block_M) * block_M
     dq_work_shape = (
         (total_seq_q, heads_q, work_qk_dim)
@@ -655,6 +674,9 @@ def flashattn_varlen_bwd_interface(
                 _contiguous_cosize_bytes(dv_work_shape, torch.float32),
             )
         )
+    kernel_arg_byte_spans.extend(
+        _tensor_cosize_bytes(t) for t in (dq_out, dk_out, dv_out) if t is not None
+    )
     enable_index_type_promotion = _needs_index_type_promotion(*kernel_arg_byte_spans)
 
     delta = torch.empty((total_seq_q, heads_q), device=q.device, dtype=torch.float32)
@@ -674,7 +696,11 @@ def flashattn_varlen_bwd_interface(
             use_strided_tensors=True,
         )
 
-    dq_work = torch.empty(dq_work_shape, dtype=q.dtype, device=q.device)
+    dq_work = (
+        dq_out
+        if dq_out is not None and not needs_qk_pad
+        else torch.empty(dq_work_shape, dtype=q.dtype, device=q.device)
+    )
     dQ_accum = None
     if not use_separate:
         dQ_accum = torch.empty(
@@ -684,11 +710,11 @@ def flashattn_varlen_bwd_interface(
         )
     if heads_q_eq_heads_kv:
         if work_qk_dim == actual_qk_dim:
-            dK_accum = torch.empty_like(k)
+            dK_accum = dk_out if dk_out is not None else torch.empty_like(k)
         else:
             dK_accum = torch.empty(dk_work_shape, dtype=k.dtype, device=k.device)
         if work_v_dim == actual_v_dim:
-            dV_accum = torch.empty_like(v)
+            dV_accum = dv_out if dv_out is not None else torch.empty_like(v)
         else:
             dV_accum = torch.empty(dv_work_shape, dtype=v.dtype, device=v.device)
     else:
@@ -755,9 +781,23 @@ def flashattn_varlen_bwd_interface(
     singleton_k_dv_kernel = None
     dk_work = None
     dv_work = None
+    direct_kv = (
+        (dk_out is not None or dv_out is not None)
+        and not needs_qk_pad
+        and not needs_v_pad
+    )
     if not heads_q_eq_heads_kv:
-        dk_work = torch.empty(dk_work_shape, dtype=torch.float32, device=q.device)
-        dv_work = torch.empty(dv_work_shape, dtype=torch.float32, device=q.device)
+        kv_output_dtype = q.dtype if direct_kv else torch.float32
+        dk_work = (
+            dk_out
+            if direct_kv and dk_out is not None
+            else torch.empty(dk_work_shape, dtype=kv_output_dtype, device=q.device)
+        )
+        dv_work = (
+            dv_out
+            if direct_kv and dv_out is not None
+            else torch.empty(dv_work_shape, dtype=kv_output_dtype, device=q.device)
+        )
         reduce_kv_grads = _jit_for_index_type_promotion(
             reduce_kv_grads_ws, enable_index_type_promotion
         )
@@ -768,6 +808,7 @@ def flashattn_varlen_bwd_interface(
             is_bhsd=is_bhsd,
             use_strided_tensors=True,
             use_static_dims=use_static_dims,
+            output_dtype=kernel_dtype if direct_kv else "float",
         )
     elif max_seqlen_k <= 1:
         singleton_k_dv = _jit_for_index_type_promotion(
@@ -785,8 +826,17 @@ def flashattn_varlen_bwd_interface(
         )
 
     if skip_kernel_launch_if_dry_run():
-        return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        gradients = tuple(
+            torch.empty_like(source) if output is None else output
+            for output, source in ((dq_out, q), (dk_out, k), (dv_out, v))
+        )
+        if return_softmax_d:
+            return (*gradients, torch.empty_like(softmax_lse, dtype=torch.float32))
+        return gradients
 
+    if return_softmax_d and has_seqused_q:
+        # The delta kernel only writes valid query rows.
+        delta.zero_()
     if compute_delta_kernel is not None:
         compute_delta_kernel(
             out_flat,
@@ -881,7 +931,15 @@ def flashattn_varlen_bwd_interface(
     if max_seqlen_k <= 1:
         dq.zero_()
         dk.zero_()
-    return dq, dk, dv
+    gradients = (
+        _finish_gradient(dq_out, dq),
+        _finish_gradient(dk_out, dk),
+        _finish_gradient(dv_out, dv),
+    )
+    if return_softmax_d:
+        softmax_d = delta.view(*out.shape[:-1]).transpose(-2, -1).contiguous()
+        return (*gradients, softmax_d)
+    return gradients
 
 
 __all__ = [

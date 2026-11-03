@@ -151,6 +151,7 @@ def _build_decode_fp32_vk_kernel_factory(
 
     batch = T.dynamic("batch")
     pool_size = T.dynamic("pool_size")
+    state_stride_b = T.dynamic("state_stride_b", "int64")
     q_stride_b = T.dynamic("q_stride_b")
     q_stride_h = T.dynamic("q_stride_h")
     q_stride_k = T.dynamic("q_stride_k")
@@ -182,6 +183,7 @@ def _build_decode_fp32_vk_kernel_factory(
     b_strides = (b_stride_b, b_stride_h)
     o_strides = (o_stride_b, o_stride_h, o_stride_v)
     state_indices_strides = (state_indices_stride_b,)
+    state_strides = (state_stride_b, dim_v * dim_k, dim_k, 1)
 
     @tilelang.jit(
         pass_configs={
@@ -228,7 +230,9 @@ def _build_decode_fp32_vk_kernel_factory(
             state_indices: T.StridedTensor(
                 state_indices_shape, state_indices_strides, "int32"
             ),
-            state: T.Tensor([pool_size, head, dim_v, dim_k], state_dtype),
+            state: T.StridedTensor(
+                (pool_size, head, dim_v, dim_k), state_strides, state_dtype
+            ),
             o: T.StridedTensor(o_shape, o_strides, output_dtype),
         ):
             with T.Kernel(

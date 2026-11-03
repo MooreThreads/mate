@@ -929,20 +929,16 @@ class FmhaOperator(Operator):
             raise ValueError("append-KV verification requires expected caches")
         k_actual = self._logical_cache(
             inputs.k_cache.to(inputs.workload.reference_dtype), inputs.page_table
-        )
+        )[:, : inputs.workload.seqlen_k]
         v_actual = self._logical_cache(
             inputs.v_cache.to(inputs.workload.reference_dtype), inputs.page_table
-        )
+        )[:, : inputs.workload.seqlen_k]
+        # Match reference construction: trim unused pages before selecting batches.
+        # This also avoids retaining a large padded batch stride in comparisons.
         if inputs.cache_batch_idx is not None:
             indices = inputs.cache_batch_idx.long()
             k_actual = k_actual[indices]
             v_actual = v_actual[indices]
-        k_actual = k_actual[:, : inputs.workload.seqlen_k].to(
-            inputs.workload.reference_dtype
-        )
-        v_actual = v_actual[:, : inputs.workload.seqlen_k].to(
-            inputs.workload.reference_dtype
-        )
         if inputs.workload.dtype in _FP8_DTYPES:
             torch.testing.assert_close(
                 v_actual, reference.expected_v_cache, atol=1e-3, rtol=1e-3

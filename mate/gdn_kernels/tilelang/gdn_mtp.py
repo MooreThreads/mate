@@ -151,6 +151,7 @@ def _get_mtp_fp32_vk_smem_kernel(
 
     batch = T.dynamic("batch")
     pool_size = T.dynamic("pool_size")
+    state_stride_b = T.dynamic("state_stride_b", "int64")
     intermediate_pool_size = T.dynamic("intermediate_pool_size")
     intermediate_steps = T.dynamic("intermediate_steps")
     q_stride_b = T.dynamic("q_stride_b")
@@ -189,6 +190,7 @@ def _get_mtp_fp32_vk_smem_kernel(
     a_strides = (a_stride_b, a_stride_t, a_stride_h)
     b_strides = (b_stride_b, b_stride_t, b_stride_h)
     state_indices_strides = (state_indices_stride_b,)
+    state_strides = (state_stride_b, dim_v * dim_k, dim_k, 1)
     output_strides = (o_stride_b, o_stride_t, o_stride_h, o_stride_v)
     intermediate_shape = (
         [intermediate_pool_size, intermediate_steps, head, dim_v, dim_k]
@@ -234,8 +236,8 @@ def _get_mtp_fp32_vk_smem_kernel(
             dt_bias: T.Tensor([head], dt_bias_vec_dtype),
             b: T.StridedTensor(gate_shape, b_strides, gate_batch_dtype),
             scale_value: T.float32,
-            initial_state: T.Tensor(
-                [pool_size, head, dim_v, dim_k], state_storage_dtype
+            initial_state: T.StridedTensor(
+                (pool_size, head, dim_v, dim_k), state_strides, state_storage_dtype
             ),
             state_indices: T.StridedTensor(
                 state_indices_shape, state_indices_strides, index_dtype

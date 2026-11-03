@@ -18,6 +18,19 @@ _SUPPORTED_OUTPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_DT_BIAS_DTYPES = (torch.float32, torch.bfloat16)
 
 
+def _can_use_state_without_copy(state: torch.Tensor) -> bool:
+    if state.is_contiguous():
+        return True
+    _, heads, dim_v, dim_k = state.shape
+    # TME requires dense state blocks and 16-byte-aligned page addresses.
+    return (
+        state.stride()[1:] == (dim_v * dim_k, dim_k, 1)
+        and state.stride(0) >= heads * dim_v * dim_k
+        and state.stride(0) * state.element_size() % 16 == 0
+        and state.data_ptr() % 16 == 0
+    )
+
+
 def _check_same_device(reference: torch.Tensor, **tensors: torch.Tensor) -> None:
     for name, tensor in tensors.items():
         if tensor.device != reference.device:
@@ -209,8 +222,8 @@ def _gated_delta_rule_decode_pretranspose_impl(
             device=q.device,
         )
 
-    state_is_contiguous = state.is_contiguous()
-    state_kernel = state if state_is_contiguous else state.contiguous()
+    state_needs_copy = not _can_use_state_without_copy(state)
+    state_kernel = state.contiguous() if state_needs_copy else state
 
     gdn_decode_tilelang.run_gated_delta_rule_decode_vk_fp32(
         q=q,
@@ -227,7 +240,7 @@ def _gated_delta_rule_decode_pretranspose_impl(
         use_qk_l2norm=use_qk_l2norm,
     )
 
-    if not state_is_contiguous:
+    if state_needs_copy:
         state.copy_(state_kernel)
 
     return output, state
@@ -321,8 +334,8 @@ def _gated_delta_rule_mtp_vk_fp32_impl(
         if not intermediate_states_buffer.is_contiguous():
             raise ValueError("intermediate_states_buffer must be contiguous.")
 
-    state_is_contiguous = state.is_contiguous()
-    state_kernel = state if state_is_contiguous else state.contiguous()
+    state_needs_copy = not _can_use_state_without_copy(state)
+    state_kernel = state.contiguous() if state_needs_copy else state
 
     scale_value = head_dim_k**-0.5 if scale is None else float(scale)
     gdn_mtp_tilelang.run_gated_delta_rule_mtp_vk_fp32(
@@ -342,9 +355,7 @@ def _gated_delta_rule_mtp_vk_fp32_impl(
         use_qk_l2norm=use_qk_l2norm,
     )
 
-    # Match FlashInfer wrapper behavior: update a contiguous working buffer in
-    # the kernel, then let PyTorch copy it back into the original strided state.
-    if not disable_state_update and not state_is_contiguous:
+    if not disable_state_update and state_needs_copy:
         state.copy_(state_kernel)
 
     return output, state
@@ -385,6 +396,9 @@ def gated_delta_rule_decode(
         state (torch.Tensor):
             State ``[B_or_pool, HV, V, K]`` if ``state_layout="VK"``, else
             ``[B_or_pool, HV, K, V]`` if ``state_layout="KV"``.
+            VK state blocks may be separated by padding, as in a packed
+            conv/SSM cache. Dense blocks with 16-byte-aligned page addresses
+            are accessed directly; other layouts use a contiguous working copy.
         A_log (torch.Tensor):
             Log decay of shape ``[HV]``. Must be float32.
         a (torch.Tensor):

@@ -217,18 +217,12 @@ want direct MATE Python APIs without a wrapper package.
    python -m pip install mate \
      --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
-Optional TileLang and TVM-FFI extensions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+TileLang and optional TVM-FFI extensions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Install the TileLang extra for operators that use the TileLang-backed path:
-
-.. code-block:: bash
-
-   python -m pip install "mate[tilelang]" \
-     --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
-
-For MATE 0.2.8, this extra uses the ``tilelang-musa==0.1.12`` dependency line
-from the MUSA package source.
+TileLang MUSA is a required dependency of MATE. Installing MATE directly or
+through a wrapper installs ``tilelang-musa==0.1.12+musa.5``; no TileLang extra
+is needed.
 
 Install the optional TVM-FFI extension packages when your integration needs
 their additional cross-language or DLPack path:

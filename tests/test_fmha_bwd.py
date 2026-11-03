@@ -4,7 +4,7 @@
 import pytest
 import torch
 import torch_musa  # noqa: F401
-from mate import flash_attn_varlen_func
+from mate import flash_attn_varlen_func, fmha_backward
 from mate.execution_context import (
     is_dry_run_enabled,
     raise_complete_if_dry_run,
@@ -1204,3 +1204,62 @@ def test_asm_empty_packed_sequences(dims, causal):
         (q.grad[7:], k.grad[13:], v.grad[13:]), (ref_q.grad, ref_k.grad, ref_v.grad)
     ):
         torch.testing.assert_close(actual.float().cpu(), expected, atol=3e-3, rtol=3e-3)
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize(
+    "packed,dtype", [(False, torch.float16), (True, torch.bfloat16)]
+)
+def test_fmha_backward_interface(packed, dtype):
+    if is_dry_run_enabled():
+        pytest.skip("interface correctness requires real kernel execution")
+    torch.manual_seed(51)
+    q = torch.randn((1, 11, 2, 128), device="musa", dtype=dtype)
+    k = torch.randn((1, 17, 1, 128), device="musa", dtype=dtype)
+    v = torch.randn_like(k)
+    if packed:
+        q, k, v = (t.squeeze(0) for t in (q, k, v))
+    cu_q = torch.tensor([0, 11], dtype=torch.int32) if packed else None
+    cu_k = torch.tensor([0, 17], dtype=torch.int32) if packed else None
+    reference = [t.cpu().float().requires_grad_(True) for t in (q, k, v)]
+    out_ref, lse_ref = ref_attn(
+        *reference,
+        cu_q,
+        cu_k,
+        11,
+        17,
+        is_causal=True,
+        is_varlen=packed,
+        scale=128**-0.5,
+    )
+    out = out_ref.detach().to(device=q.device, dtype=dtype)
+    lse = lse_ref.detach().to(q.device).contiguous()
+    dout = torch.randn_like(out)
+    buffers = [copy_to_strided_last_dim(torch.empty_like(t)) for t in (q, k, v)]
+    if packed:
+        buffers[0] = buffers[2] = None
+    dq, dk, dv, softmax_d = fmha_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        *buffers,
+        cu_seqlens_q=cu_q.to(q.device) if packed else None,
+        cu_seqlens_k=cu_k.to(q.device) if packed else None,
+        max_seqlen_q=11 if packed else None,
+        max_seqlen_k=17 if packed else None,
+        is_causal=True,
+        sm_margin=7,
+        backend="tilelang" if packed else "auto",
+    )
+    out_ref.backward(dout.cpu().float())
+    for actual, expected, buffer in zip((dq, dk, dv), reference, buffers):
+        if buffer is not None:
+            assert actual is buffer
+        torch.testing.assert_close(
+            actual.cpu().float(), expected.grad, atol=0.035, rtol=0.035
+        )
+    expected_delta = (out.float() * dout.float()).sum(-1).transpose(-2, -1).contiguous()
+    torch.testing.assert_close(softmax_d, expected_delta, atol=1e-5, rtol=1e-5)

@@ -4,7 +4,6 @@
 #include <mutlass/mutlass.h>
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <mute/algorithm/prefetch.hpp>
@@ -141,29 +140,12 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
       take<0, 2>(SmemLayoutK{})));
   using PagedKvManager = mate::attention::msa::KVManager<IsPagedKV, PageSize, PageTableMode>;
 
-  // A metadata-scheduled persistent CTA may consume hundreds of K pages for
-  // multiple Q works. Keep the one-stage K shared-memory pipeline, but rotate
-  // its async barrier pairs to extend the lifetime between physical-barrier
-  // reuse. PH1 also shares the deschedule mask between the two phases of one
-  // physical async barrier. Rendezvous all K consumers on a phase-specific
-  // barrier before the K ring wraps so a late waiter from the prior phase
-  // cannot reschedule a waiter from the next phase.
-  static constexpr bool UseKPipelinePhaseGuard  = IsPagedKV && is_same_v<Element, mutlass::bfloat16_t>;
-  static constexpr int  NumKPipelinePhaseGuards = UseKPipelinePhaseGuard ? 2 : 0;
-  static constexpr int  MaxKBarPerStageRatio    = UseKPipelinePhaseGuard ? 16 : 1;
-  using MainloopPipelineQ                       = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<QStages>;
-  static constexpr int KPipelineAdditionalBarriers =
-      static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount) +
-      static_cast<int>(MainloopPipelineQ::NumBarriers) + NumKPipelinePhaseGuards;
-  using KBarPerStageRatioHelper =
-      mutlass::Mp31PipelineWarpSpecializedBarrierRatio<MaxKBarPerStageRatio, KPipelineAdditionalBarriers, KStages>;
-  static constexpr int KBarPerStageRatio = KBarPerStageRatioHelper::value;
-  static_assert(KBarPerStageRatio > 0,
-                "MSA max-score K pipeline exceeds the MP31 async barrier budget even with one barrier pair per stage");
-  using MainloopPipelineK                = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<KStages, KBarPerStageRatio>;
+  // Rotate two async barrier pairs per shared-memory stage, matching master.
+  using MainloopPipelineQ                = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<QStages, 2>;
+  using MainloopPipelineK                = mutlass::Mp31PipelineTmeAsyncWarpSpecialized<KStages, 2>;
   static constexpr int AsyncBarrierCount = static_cast<int>(mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount) +
                                            static_cast<int>(MainloopPipelineQ::NumBarriers) +
-                                           static_cast<int>(MainloopPipelineK::NumBarriers) + NumKPipelinePhaseGuards;
+                                           static_cast<int>(MainloopPipelineK::NumBarriers);
   static_assert(AsyncBarrierCount <=
                     static_cast<int>(mutlass::arch::AsyncBarrier::HardwareMaxNumAsyncTransactionBarriers),
                 "MSA max-score async barrier configuration exceeds the MP31 hardware limit");
@@ -185,16 +167,7 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   struct MUTE_ALIGNAS(1) BarrierStorage {
     uint8_t pipeline_q[MainloopPipelineQ::NumBarriers];
     uint8_t pipeline_k[MainloopPipelineK::NumBarriers];
-    // These trailing IDs are allocated only when UseKPipelinePhaseGuard is
-    // true. Keeping the members present preserves compile-time offsets without
-    // changing the barrier count of FP8, FP16, or contiguous BF16 kernels.
-    uint8_t k_pipeline_phase_guard[2];
   };
-
-  static constexpr uint32_t KPipelinePhaseGuardBase = static_cast<uint32_t>(
-      offsetof(BarrierStorage, k_pipeline_phase_guard) + mutlass::arch::AsyncBarrier::ReservedAsyncBarrierCount);
-  static constexpr uint32_t KPipelinePhase0GuardId = KPipelinePhaseGuardBase;
-  static constexpr uint32_t KPipelinePhase1GuardId = KPipelinePhaseGuardBase + 1;
 
   struct Arguments {
     Element const* ptr_q;
@@ -278,12 +251,6 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
           q_write(mutlass::make_producer_start_state_warpspecialized<MainloopPipelineQ>()),
           k_read{},
           k_write(mutlass::make_producer_start_state_warpspecialized<MainloopPipelineK>()) {
-      if constexpr (UseKPipelinePhaseGuard) {
-        if (mutlass::canonical_warp_idx() == 0) {
-          mutlass::arch::AsyncBarrier::init(KPipelinePhase0GuardId, NumConsumerWarps, 0);
-          mutlass::arch::AsyncBarrier::init(KPipelinePhase1GuardId, NumConsumerWarps, 0);
-        }
-      }
     }
   };
 
@@ -478,12 +445,6 @@ struct Mp31MsaMaxScoreCollectiveTmeWarpSpecialized {
   }
 
   MUTLASS_DEVICE void wait_k(Pipeline& pipeline, int consumer_thread_idx) const {
-    if constexpr (UseKPipelinePhaseGuard) {
-      if (pipeline.k_read.barrier_index() == 0) {
-        uint32_t const guard_id = pipeline.k_read.phase() == 0 ? KPipelinePhase0GuardId : KPipelinePhase1GuardId;
-        mutlass::arch::AsyncBarrier::sync(guard_id);
-      }
-    }
     int lane_idx = consumer_thread_idx % NumThreadsPerWarp;
     if (lane_idx == 0) {
       pipeline.k.consumer_wait(pipeline.k_read);

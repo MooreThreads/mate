@@ -1,4 +1,9 @@
 import torch
+from mate.execution_context import skip_kernel_launch_if_dry_run
+from mate.gdn_kernels.tilelang.gdn_state import (
+    pass_through_prefill_states,
+    prepare_prefill_states,
+)
 from mate.utils import cosize
 import tilelang
 import tilelang.language as T
@@ -54,8 +59,14 @@ def tilelang_fused_chunk_gdn_prefill(
     store_final_state,
     is_varlen,
     is_log_space,
+    contiguous_states=False,
+    dense_state_blocks=False,
+    use_state_indices=False,
+    use_initial_state_mask=False,
+    state_indices_dtype=None,
 ):
     batch_size = T.dynamic("batch_size")
+    use_state_metadata = use_state_indices or use_initial_state_mask
     num_tokens = T.dynamic("num_tokens")
     raw_batch_size = T.dynamic("raw_batch_size")
     block_S = chunk_size
@@ -79,7 +90,21 @@ def tilelang_fused_chunk_gdn_prefill(
         b_shape = (batch_size, num_tokens, H)
     h0_shape = (raw_batch_size if is_varlen else batch_size, H, DK, DV)
     ht_shape = (raw_batch_size, H, DK, DV)
+    if use_state_indices:
+        h0_shape = (T.dynamic("h0_pool_size"), H, DK, DV)
+        ht_shape = (T.dynamic("ht_pool_size"), H, DK, DV)
     seqlens_shape = (raw_batch_size + 1,) if is_varlen else (batch_size + 1,)
+    state_batch_size = raw_batch_size if is_varlen else batch_size
+    indices_shape = (state_batch_size,) if use_state_indices else seqlens_shape
+    mask_shape = (state_batch_size,) if use_initial_state_mask else seqlens_shape
+    indices_strides = (
+        (T.dynamic("indices_stride", "int64"),) if use_state_indices else (1,)
+    )
+    mask_strides = (
+        (T.dynamic("mask_stride", "int64"),) if use_initial_state_mask else (1,)
+    )
+    indices_dtype = state_indices_dtype if use_state_indices else seqlen_dtype
+    mask_dtype = "bool" if use_initial_state_mask else seqlen_dtype
 
     q_stride_b = T.dynamic("q_stride_b")
     q_stride_t = T.dynamic("q_stride_t")
@@ -93,6 +118,25 @@ def tilelang_fused_chunk_gdn_prefill(
     q_strides = (q_stride_b, q_stride_t, q_stride_h, 1)
     k_strides = (k_stride_b, k_stride_t, k_stride_h, 1)
     v_strides = (v_stride_b, v_stride_t, v_stride_h, 1)
+    dense_state_strides = (H * DK * DV, DK * DV, DV, 1)
+    h0_strides = (
+        dense_state_strides
+        if contiguous_states
+        else (
+            (T.dynamic("h0_stride_0", "int64"), *dense_state_strides[1:])
+            if dense_state_blocks
+            else tuple(T.dynamic(f"h0_stride_{i}", "int64") for i in range(4))
+        )
+    )
+    ht_strides = (
+        dense_state_strides
+        if contiguous_states
+        else (
+            (T.dynamic("ht_stride_0", "int64"), *dense_state_strides[1:])
+            if dense_state_blocks
+            else tuple(T.dynamic(f"ht_stride_{i}", "int64") for i in range(4))
+        )
+    )
 
     @T.macro
     def producer_phase(i):
@@ -139,10 +183,12 @@ def tilelang_fused_chunk_gdn_prefill(
         a: T.Tensor(a_shape, dtype=qkva_dtype),
         g: T.Tensor(g_shape, dtype=g_dtype),
         b: T.Tensor(b_shape, dtype=b_dtype),
-        h0: T.Tensor(h0_shape, dtype=h0_dtype),
+        h0: T.StridedTensor(h0_shape, h0_strides, h0_dtype),
         cu_seqlens: T.Tensor(seqlens_shape, dtype=seqlen_dtype),
         o: T.Tensor(o_shape, dtype=o_dtype),
-        ht: T.Tensor(ht_shape, dtype=ht_dtype),
+        ht: T.StridedTensor(ht_shape, ht_strides, ht_dtype),
+        state_indices: T.StridedTensor(indices_shape, indices_strides, indices_dtype),
+        has_initial_state: T.StridedTensor(mask_shape, mask_strides, mask_dtype),
     ):
         launch_batch_size = raw_batch_size if is_varlen else batch_size
         with T.Kernel(launch_batch_size * H, threads=1024) as (bbh,):
@@ -156,6 +202,22 @@ def tilelang_fused_chunk_gdn_prefill(
             batch_idx = 0 if is_varlen else bb
             seq_start_idx = cu_seqlens[bb] if is_varlen else 0
             seq_end_idx = cu_seqlens[bb + 1] if is_varlen else num_tokens
+
+            state_slot = T.alloc_var("int64")
+            valid_state = T.alloc_var("bool")
+            read_initial_state = T.alloc_var("bool")
+            if use_state_indices:
+                state_slot = T.cast(state_indices[bb], "int64")
+                valid_state = state_slot >= 0
+                state_slot = T.max(state_slot, 0)
+            else:
+                state_slot = T.cast(bb, "int64")
+                valid_state = True
+            read_initial_state = False
+            if use_initial_state:
+                read_initial_state = valid_state
+                if use_initial_state_mask:
+                    read_initial_state = valid_state and has_initial_state[bb]
 
             seq_len = T.alloc_var("int32")
             seq_len = seq_end_idx - seq_start_idx
@@ -324,14 +386,22 @@ def tilelang_fused_chunk_gdn_prefill(
                     for j_s, j_v in T.Parallel(block_S, DV):
                         if j_s < valid_seqs:
                             o[batch_idx, store_left + j_s, bh, inv_perm_dv(j_v)] = (
-                                o_fragment[j_s, j_v]
+                                T.if_then_else(valid_state, o_fragment[j_s, j_v], 0.0)
+                                if use_state_indices
+                                else o_fragment[j_s, j_v]
                             )
 
             with T.ws(2, 3, 4, 5):
                 # Initialize S
-                if use_initial_state:
+                # Preserve the original compile-time branch without metadata.
+                if read_initial_state if use_state_metadata else use_initial_state:
                     for j_k, j_v in T.Parallel(DV, DK):
-                        h_fragment[j_k, j_v] = h0[bb, bh, inv_perm_dv(j_v), j_k]
+                        h_fragment[j_k, j_v] = h0[
+                            state_slot if use_state_indices else T.cast(bb, "int64"),
+                            bh,
+                            inv_perm_dv(j_v),
+                            j_k,
+                        ]
                 else:
                     for j_k, j_v in T.Parallel(DK, DV):
                         h_fragment[j_k, j_v] = 0.0
@@ -344,6 +414,8 @@ def tilelang_fused_chunk_gdn_prefill(
                     for j_k, j_v in T.Parallel(DK, DV):
                         h_shared[j_k, j_v] = h_fragment[j_k, j_v]
                     T.lma_wait()
+                    # Rendezvous all four state writers before publishing the tile.
+                    T.sync_threads(2, 512)
                     T.barrier_arrive(h_is_ready)
 
                     T.barrier_wait(q_is_ready[i_s % 2], consumer_phase(i_s))
@@ -377,8 +449,11 @@ def tilelang_fused_chunk_gdn_prefill(
                         g_fragment[j_s, j_t] = (
                             g_shared[i_s % 2, j_s] - g_shared[i_s % 2, j_t]
                         )
-                    # Prefix-scan rounding cannot determine causality. Preserve
-                    # tiny positive differences as no decay, but mask padding NaNs.
+                    # Causality comes from token order. The cumsum is a tree scan and is
+                    # not monotone in fp32: with log g == 0 the upper triangle is exactly
+                    # 0 (future tokens leak in) and with |log g| < ulp the lower triangle
+                    # can round to a tiny positive value. Clamp (0, 1) to 0 and keep NaN
+                    # from -inf padding lanes mapping to -inf.
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         g_fragment[j_s, j_t] = T.if_then_else(
                             j_t <= j_s,
@@ -445,8 +520,16 @@ def tilelang_fused_chunk_gdn_prefill(
                     T.barrier_arrive(vd_is_free)
                 # Store final S
                 if store_final_state:
-                    for j_k, j_v in T.Parallel(DV, DK):
-                        ht[bb, bh, inv_perm_dv(j_v), j_k] = h_fragment[j_k, j_v]
+                    if valid_state if use_state_indices else True:
+                        for j_k, j_v in T.Parallel(DV, DK):
+                            ht[
+                                state_slot
+                                if use_state_indices
+                                else T.cast(bb, "int64"),
+                                bh,
+                                inv_perm_dv(j_v),
+                                j_k,
+                            ] = h_fragment[j_k, j_v]
 
             with T.ws(6):
                 if tx < 800:
@@ -556,8 +639,9 @@ def tilelang_fused_chunk_gdn_prefill(
                                 g_shared[i_s % 2, valid_seqs - 1]
                                 - g_shared[i_s % 2, j_s]
                             )
-                        # Keep valid rounded-positive differences without
-                        # turning padding NaN/+inf into a unit state weight.
+                        # Same rounding issue as the causal mask: a valid token must not be
+                        # dropped from the state because of a tiny positive difference;
+                        # padding lanes (NaN / +inf) still map to -inf.
                         for j_s in T.Parallel(block_S):
                             g_exp_rev_shared[i_s % 2, j_s] = T.if_then_else(
                                 g_exp_rev_shared[i_s % 2, j_s] <= 0,
@@ -601,6 +685,10 @@ def tilelang_fused_chunk_gdn_prefill(
         f"_seq{_symbol_part(seqlen_dtype)}"
         f"_init{int(use_initial_state)}_final{int(store_final_state)}_var{int(is_varlen)}"
         f"_log{int(is_log_space)}"
+        f"_contig{int(contiguous_states)}"
+        f"_blocks{int(dense_state_blocks)}"
+        f"_idx{int(use_state_indices)}{_symbol_part(indices_dtype) if use_state_indices else ''}"
+        f"_mask{int(use_initial_state_mask)}"
     )
     return tilelang_fused_chunk_gdn_prefill_kernel.with_attr("global_symbol", symbol)
 
@@ -622,6 +710,8 @@ def fused_chunk_gdn_prefill(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     is_log_space: bool = True,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
 ):
     batch_size, num_tokens, Hg, K = k.shape
     _, _, H, V = v.shape
@@ -640,11 +730,16 @@ def fused_chunk_gdn_prefill(
         seqlen_dtype = cu_seqlens.dtype
         is_varlen = True
 
-    use_initial_state = initial_state is not None
-    if initial_state is None:
-        initial_state = torch.empty(
-            (real_batch_size, H, K, V), dtype=torch.float32, device=k.device
-        )
+    initial_state, final_state, use_initial_state = prepare_prefill_states(
+        initial_state,
+        output_state,
+        num_seqs=real_batch_size,
+        state_shape=(H, V, K),
+        device=k.device,
+        output_final_state=output_final_state,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
+    )
     h = None
 
     if output is None:
@@ -658,40 +753,32 @@ def fused_chunk_gdn_prefill(
             raise ValueError(f"Expected output device {v.device}, got {output.device}.")
         o = output
 
-    final_state_shape = (real_batch_size, H, K, V)
-    if output_state is None:
-        final_state = torch.empty(
-            final_state_shape, dtype=torch.float32, device=k.device
-        )
-    else:
-        if output_state.shape != final_state_shape:
-            raise ValueError(
-                f"Expected output_state shape {final_state_shape}, got {output_state.shape}."
-            )
-        if output_state.dtype != torch.float32:
-            raise ValueError(
-                f"Expected output_state dtype torch.float32, got {output_state.dtype}."
-            )
-        if output_state.device != k.device:
-            raise ValueError(
-                f"Expected output_state device {k.device}, got {output_state.device}."
-            )
-        final_state = output_state
-
     if num_tokens == 0:
-        # No chunks means the initial state passes through unchanged.
-        # Decide from the tensor shape without reading cu_seqlens on the host.
+        # No token means no chunk: the state passes through unchanged. This is
+        # decided from the tensor shape, without reading cu_seqlens on the host,
+        # and avoids launching kernels on empty tensors.
         if output_final_state:
-            if use_initial_state:
-                final_state.copy_(initial_state)
-            else:
-                final_state.zero_()
+            pass_through_prefill_states(
+                initial_state,
+                final_state,
+                cu_seqlens,
+                num_seqs=real_batch_size,
+                use_initial_state=use_initial_state,
+                state_indices=state_indices,
+                has_initial_state=has_initial_state,
+            )
         return (
             o if output_o else None,
             h if output_h else None,
             final_state if output_final_state else None,
         )
 
+    contiguous_states = initial_state.is_contiguous() and final_state.is_contiguous()
+    dense_state_blocks = (
+        not contiguous_states
+        and initial_state.stride()[1:] == (V * K, K, 1)
+        and final_state.stride()[1:] == (V * K, K, 1)
+    )
     tilelang_fused_chunk_gdn_prefill_kernel = tilelang_fused_chunk_gdn_prefill(
         H,
         Hg,
@@ -711,19 +798,30 @@ def fused_chunk_gdn_prefill(
         store_final_state=output_final_state,
         is_varlen=is_varlen,
         is_log_space=is_log_space,
+        contiguous_states=contiguous_states,
+        dense_state_blocks=dense_state_blocks,
+        use_state_indices=state_indices is not None,
+        use_initial_state_mask=has_initial_state is not None,
+        state_indices_dtype=state_indices.dtype if state_indices is not None else None,
     )
-    tilelang_fused_chunk_gdn_prefill_kernel(
-        q,
-        k,
-        v,
-        a,
-        g,
-        b,
-        initial_state,
-        cu_seqlens,
-        o,
-        final_state,
-    )
+    if not skip_kernel_launch_if_dry_run():
+        tilelang_fused_chunk_gdn_prefill_kernel(
+            q,
+            k,
+            v,
+            a,
+            g,
+            b,
+            initial_state,
+            cu_seqlens,
+            o,
+            final_state,
+            # Unused when the compile-time use_state_indices /
+            # use_initial_state_mask flags are off; a tensor of the same rank is
+            # passed only to match the fixed kernel signature.
+            state_indices if state_indices is not None else cu_seqlens,
+            has_initial_state if has_initial_state is not None else cu_seqlens,
+        )
 
     if not output_final_state:
         final_state = None

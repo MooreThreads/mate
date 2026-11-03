@@ -24,6 +24,7 @@ dependencies = [
     "jinja2",
     "packaging>=24",
     "requests",
+    "tilelang-musa==0.1.12+musa.5",
 ]
 
 [tool.setuptools.dynamic]
@@ -84,17 +85,13 @@ exclude=["mate-mubin*"]
 "mate.data.mutlass" = ["include/**", "experimental/**", "tools/**"]
 
 [project.optional-dependencies]
-# Full functionality including safetensors support and TileLang-backed ops
+# Full functionality including safetensors support
 all = [
     "safetensors>=0.4.0",
-    "tilelang-musa==0.1.12+musa.5",
 ]
 
 # CLI extension for full replay support (safetensors enables tensor dump/replay)
 cli = ["safetensors>=0.4.0"]
-
-# TileLang-backed operators such as FlashMLA / GDN
-tilelang = ["tilelang-musa==0.1.12+musa.5"]
 
 # Testing dependencies
 testing = [
@@ -116,7 +113,6 @@ dev = [
     "numpy",
     "safetensors>=0.4.0",
     "pytest>=7.0.0",
-    "tilelang-musa==0.1.12+musa.5",
     "triton",
 ]
 

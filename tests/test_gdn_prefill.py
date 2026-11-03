@@ -761,3 +761,114 @@ def test_gdn_prefill_zero_tokens(
     assert torch.equal(final_state, expected)
     if preallocated_state:
         assert final_state.data_ptr() == output_state.data_ptr()
+
+
+def test_gdn_prefill_state_pool_packed() -> None:
+    device = _get_runtime_device()
+    _manual_seed(1207, device)
+    batch, seq_len, heads, q_heads, dim = 3, 129, 12, 3, HEAD_SIZE
+    q = (
+        torch.randn(batch, seq_len, q_heads, dim, dtype=torch.float16, device=device)
+        * 0.1
+    )
+    k = torch.randn_like(q) * 0.1
+    v = torch.randn(batch, seq_len, heads, dim, dtype=q.dtype, device=device) * 0.1
+    g = -torch.rand(batch, seq_len, heads, device=device) * 0.01
+    beta = torch.rand_like(g)
+
+    page_elems = heads * dim * dim + 3840
+    pool_size = batch + 2
+    pages = torch.full((pool_size, page_elems), float("nan"), device=device)
+    state = pages.as_strided(
+        (pool_size, heads, dim, dim),
+        (page_elems, dim * dim, dim, 1),
+        storage_offset=256,
+    )
+    state[1:].normal_(std=0.05)
+
+    indices = torch.tensor([3, 1, 2], dtype=torch.int32, device=device)
+    mask = torch.tensor([True, False, True], device=device)
+    dense = state[indices].clone()
+    dense[~mask] = 0
+
+    ref_o, ref_state = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=dense,
+        output_final_state=True,
+    )
+    before = pages.clone()
+    out_o, final_pool = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        output_state=state,
+        output_final_state=True,
+        state_indices=indices,
+        has_initial_state=mask,
+    )
+    _synchronize(device)
+
+    assert final_pool is state
+    torch.testing.assert_close(out_o, ref_o, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(state[indices], ref_state, rtol=1e-2, atol=1.5e-3)
+
+    # Rows outside the mapping and the conv/padding gaps stay bit-identical.
+    untouched = torch.ones(pool_size, dtype=torch.bool, device=device)
+    untouched[indices] = False
+    torch.testing.assert_close(
+        pages[untouched], before[untouched], rtol=0, atol=0, equal_nan=True
+    )
+    for slot in indices.tolist():
+        torch.testing.assert_close(
+            pages[slot, :256], before[slot, :256], rtol=0, atol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            pages[slot, 256 + heads * dim * dim :],
+            before[slot, 256 + heads * dim * dim :],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing_output", "mask_without_initial", "overlap", "indices_shape"],
+)
+def test_gdn_prefill_state_pool_validation(invalid: str) -> None:
+    device = _get_runtime_device()
+    q = torch.empty(3, 0, 1, HEAD_SIZE, dtype=torch.float16, device=device)
+    g = torch.empty(3, 0, 1, device=device)
+    state = torch.empty(5, 1, HEAD_SIZE, HEAD_SIZE, device=device)
+    kwargs = dict(
+        q=q,
+        k=q,
+        v=q,
+        g=g,
+        beta=g,
+        initial_state=state,
+        output_state=state,
+        output_final_state=True,
+        state_indices=torch.tensor([4, 0, 2], dtype=torch.int32, device=device),
+        has_initial_state=torch.ones(3, dtype=torch.bool, device=device),
+    )
+    if invalid == "missing_output":
+        kwargs["output_state"] = None
+    elif invalid == "mask_without_initial":
+        kwargs["initial_state"] = None
+    elif invalid == "overlap":
+        kwargs["initial_state"] = state[:-1]
+        kwargs["output_state"] = state[1:]
+    elif invalid == "indices_shape":
+        kwargs["state_indices"] = torch.empty(3, 1, dtype=torch.int32, device=device)
+    with pytest.raises(
+        ValueError, match="state_indices|has_initial_state|initial_state|output_state"
+    ):
+        chunk_gated_delta_rule(**kwargs)

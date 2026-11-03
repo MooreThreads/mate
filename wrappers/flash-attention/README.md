@@ -104,7 +104,7 @@ The wrapper currently exposes:
 - `flash_attn_with_kvcache`: FlashAttention-compatible KV-cache entry, including paged KV cache use cases
 - `get_scheduler_metadata`: helper for split-KV scheduler metadata preparation
 
-### Low-level compatibility entry point
+### Low-level compatibility entry points
 
 The wrapper also exports `_flash_attn_forward` for integrations, such as ring
 attention, that call the FlashAttention-3 low-level forward interface directly.
@@ -200,3 +200,30 @@ pytest tests/test_flash_attn.py tests/test_interface_unit.py
 - Actual feature coverage is documented in
   `docs/source/wrappers/flash_attention_forward_compatibility.md`
 - For the authoritative operator behavior, refer to the corresponding MATE APIs under `mate.mha_interface`
+
+### Standalone backward
+
+TileLang is a required dependency of MATE, installed through `flash_attn_3`. The wrapper
+exports `_flash_attn_backward` with FA3's positional signature (including the
+upstream spelling `sequed_q/k`). It consumes saved forward O and natural-log
+LSE and writes caller-provided `dq`, `dk`, and `dv` buffers. It delegates to
+`mate.mha_interface.fmha_backward`; this independent MATE API owns
+backend selection, and `auto` currently chooses TileLang. Explicit unknown
+backends fail without fallback. Existing release autograd retains its MUBIN/TileLang
+dispatch independently of this standalone entry.
+
+The returned FP32 `softmax_d` contains `sum(O * dO, dim=-1)` in logical LSE layout:
+`(B,H,S)` or `(H,T)`, with unused Q rows zeroed. It does not reproduce CUDA
+implementation-specific scratch padding. TileLang accepts and ignores `sm_margin`.
+Kernel dtype, shape and architecture restrictions still apply: MP31 supports
+window backward; this release does not include the MP32 TileLang backward
+implementation. No forward recomputation is performed.
+
+The independent `mate.fmha_backward` follows the FA3 C++ `mha_bwd` argument
+order: `dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, ...`.
+Only `backend` is an extra keyword-only selector. Each output is optional:
+TileLang writes supplied aligned, strided buffers directly and allocates missing
+outputs. Unaligned head dimensions can require padded work storage. Returned
+MATE returns `(dq, dk, dv, softmax_d)`; gradients retain the identity of each
+supplied buffer. The backend returns its computed delta in logical LSE layout,
+and the wrapper returns that tensor directly without recomputing it.

@@ -1144,3 +1144,211 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_decode_packed_state_pages(
+    batch_size: int, monkeypatch, seed: int = _get_default_seed()
+) -> None:
+    pool_multiplier = 3
+    pool_size = batch_size * pool_multiplier
+    q, k, v, dense_pool, A_log, a, dt_bias, b_tensor = _make_decode_pool_inputs(
+        batch_size=batch_size,
+        pool_size=pool_size,
+        seed=seed,
+    )
+    _, HV, V, K = dense_pool.shape
+    page_elems = HV * V * K + 3840
+    pages = torch.full((pool_size, page_elems), float("nan"), device=q.device)
+    state = pages.as_strided(
+        (pool_size, HV, V, K),
+        (page_elems, V * K, K, 1),
+        storage_offset=256,
+    )
+    state.copy_(dense_pool)
+    before = pages.clone()
+    state_indices = (
+        torch.arange(batch_size, dtype=torch.int32, device=q.device) * pool_multiplier
+    )
+
+    calls = []
+    from mate.gdn_kernels.tilelang import gdn_decode as backend
+
+    original = backend.run_gated_delta_rule_decode_vk_fp32
+
+    def spy(**kwargs):
+        calls.append(kwargs["state"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(backend, "run_gated_delta_rule_decode_vk_fp32", spy)
+
+    def run(state_arg: torch.Tensor):
+        return mate.gated_delta_rule_decode(
+            q=q,
+            k=k,
+            v=v,
+            state=state_arg,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b_tensor,
+            state_layout="VK",
+            state_indices=state_indices,
+            scale=1.0,
+            use_qk_l2norm=True,
+        )
+
+    out, returned = run(state)
+    _synchronize_device(q.device.type)
+
+    # The kernel must receive the packed view itself, not a contiguous copy.
+    assert len(calls) == 1
+    assert calls[0] is state
+    assert calls[0].stride(0) == page_elems
+    assert returned.data_ptr() == state.data_ptr()
+
+    dense_out, dense_returned = run(dense_pool.clone())
+    _synchronize_device(q.device.type)
+    torch.testing.assert_close(out, dense_out, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(state, dense_returned, rtol=1e-5, atol=1e-5)
+
+    # Slots outside the mapping and the conv/padding gaps stay bit-identical.
+    touched = torch.zeros(pool_size, dtype=torch.bool, device=q.device)
+    touched[state_indices.long()] = True
+    torch.testing.assert_close(
+        pages[~touched], before[~touched], rtol=0, atol=0, equal_nan=True
+    )
+    for slot in state_indices.tolist():
+        torch.testing.assert_close(
+            pages[slot, :256], before[slot, :256], rtol=0, atol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            pages[slot, 256 + HV * V * K :],
+            before[slot, 256 + HV * V * K :],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+
+@supported_musa_compute_capability([31])
+@pytest.mark.parametrize("disable_state_update", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_decode_mtp_packed_state_pages(
+    batch_size: int,
+    disable_state_update: bool,
+    monkeypatch,
+    seed: int = _get_default_seed(),
+) -> None:
+    device = _get_runtime_device(allow_skip=True)
+    _manual_seed_device(seed, device.type)
+    heads, dim, seq_len = 12, 128, 3
+    pool_multiplier = 3
+    pool_size = batch_size * pool_multiplier
+
+    q = (
+        torch.randn(batch_size, seq_len, 3, dim, dtype=torch.bfloat16, device=device)
+        * 0.1
+    )
+    k = torch.nn.functional.normalize(torch.randn_like(q), dim=-1)
+    v = torch.randn(batch_size, seq_len, heads, dim, dtype=q.dtype, device=device) * 0.1
+    a = torch.randn(batch_size, seq_len, heads, dtype=q.dtype, device=device) * 0.1
+    b = torch.randn(batch_size, seq_len, heads, dtype=q.dtype, device=device) * 0.1
+    A_log = torch.randn(heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(heads, dtype=torch.float32, device=device) * 0.1
+
+    page_elems = heads * dim * dim + 3840
+    pages = torch.full((pool_size, page_elems), float("nan"), device=device)
+    state = pages.as_strided(
+        (pool_size, heads, dim, dim),
+        (page_elems, dim * dim, dim, 1),
+        storage_offset=256,
+    )
+    state.normal_(std=0.05)
+    dense_pool = state.clone()
+    before = pages.clone()
+    state_indices = (
+        torch.arange(batch_size, dtype=torch.int32, device=device) * pool_multiplier
+    )
+
+    def new_buffer() -> torch.Tensor:
+        return torch.full(
+            (batch_size, seq_len, heads, dim, dim),
+            float("nan"),
+            dtype=state.dtype,
+            device=device,
+        )
+
+    reference_cache = new_buffer()
+    packed_cache = new_buffer()
+    args = dict(
+        q=q,
+        k=k,
+        v=v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        state_layout="VK",
+        state_indices=state_indices,
+        scale=1.0,
+        use_qk_l2norm=True,
+        disable_state_update=disable_state_update,
+    )
+
+    ref_out, ref_state = mate.gated_delta_rule_decode(
+        **args,
+        state=dense_pool.clone(),
+        intermediate_states_buffer=reference_cache,
+    )
+
+    from mate.gdn_kernels.tilelang import gdn_mtp as mtp_backend
+
+    original = mtp_backend.run_gated_delta_rule_mtp_vk_fp32
+    calls = []
+
+    def spy(**kwargs):
+        calls.append(kwargs["state"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(mtp_backend, "run_gated_delta_rule_mtp_vk_fp32", spy)
+    out, returned = mate.gated_delta_rule_decode(
+        **args,
+        state=state,
+        intermediate_states_buffer=packed_cache,
+    )
+    _synchronize_device(q.device.type)
+
+    # The MTP kernel must receive the packed view itself, not a contiguous copy.
+    assert len(calls) == 1
+    assert calls[0] is state
+    assert calls[0].stride(0) == page_elems
+    assert returned.data_ptr() == state.data_ptr()
+
+    torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+    torch.testing.assert_close(
+        packed_cache, reference_cache, rtol=0, atol=0, equal_nan=True
+    )
+
+    if disable_state_update:
+        torch.testing.assert_close(state, dense_pool, rtol=0, atol=0)
+        torch.testing.assert_close(pages, before, rtol=0, atol=0, equal_nan=True)
+    else:
+        torch.testing.assert_close(state, ref_state, rtol=1e-5, atol=1e-5)
+        touched = torch.zeros(pool_size, dtype=torch.bool, device=device)
+        touched[state_indices.long()] = True
+        torch.testing.assert_close(
+            pages[~touched], before[~touched], rtol=0, atol=0, equal_nan=True
+        )
+        for slot in state_indices.tolist():
+            torch.testing.assert_close(
+                pages[slot, :256], before[slot, :256], rtol=0, atol=0, equal_nan=True
+            )
+            torch.testing.assert_close(
+                pages[slot, 256 + heads * dim * dim :],
+                before[slot, 256 + heads * dim * dim :],
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+            )

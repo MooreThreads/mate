@@ -78,6 +78,29 @@ def _check_attention_strides(name, tensor, multiple=8):
             )
 
 
+def _check_gradient_output(name, output, source):
+    if output is None:
+        return
+    if (
+        output.shape != source.shape
+        or output.dtype != source.dtype
+        or output.device != source.device
+    ):
+        raise ValueError(f"{name} must match its input shape, dtype and device")
+    # Aligned dimensions can be written directly by the strided kernels.
+    # Unaligned logical dimensions use padded work storage and a final copy.
+    _check_attention_strides(
+        name, output, multiple=8 if source.shape[-1] % 8 == 0 else 1
+    )
+
+
+def _finish_gradient(output, result):
+    if output is None or output is result:
+        return result
+    output.copy_(result)
+    return output
+
+
 def _tilelang_dtype_nbytes(dtype):
     if dtype in ("float16", "bfloat16"):
         return 2
