@@ -481,13 +481,7 @@ def gated_delta_rule_decode(
             f"VK layout supports bfloat16 or float32 state, got {state.dtype}"
         )
 
-    if T == 1:
-        if intermediate_states_buffer is not None:
-            raise NotImplementedError(
-                "VK T=1 does not support intermediate_states_buffer"
-            )
-        if disable_state_update:
-            raise NotImplementedError("VK T=1 does not support disable_state_update")
+    if T == 1 and intermediate_states_buffer is None and not disable_state_update:
         return _gated_delta_rule_decode_pretranspose_impl(
             q=q,
             k=k,
@@ -507,6 +501,8 @@ def gated_delta_rule_decode(
             output=output,
             use_qk_l2norm=use_qk_l2norm,
         )
+    # Speculative verification needs rollback semantics even for T=1.
+    # Reuse the MTP kernel instead of the in-place decode fast path.
 
     if K != 128 or V != 128:
         raise NotImplementedError(
