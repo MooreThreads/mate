@@ -12,6 +12,9 @@ from mate.jit.gemm.deep_gemm.gemm import (
     GEMM_TYPE_NORMAL,
     get_deep_gemm_gemm_module,
 )
+from mate.jit.gemm.dense_w4a16_gemm import (
+    dense_w4a16_gemm_mutlass,
+)
 from mate.jit.gemm.masked_moe_gemm_mixed_dtype import (
     masked_moe_gemm_mixed_dtype_mutlass,
 )
@@ -1475,3 +1478,70 @@ def bmm(
             fixed_scale_layout,
         )
     return out
+
+
+@mate_api
+def dense_w4a16_gemm(
+    input_a: torch.Tensor,
+    weight_b: torch.Tensor,
+    scale_b: torch.Tensor,
+    out: torch.Tensor,
+    zero_points: Optional[torch.Tensor] = None,
+    g_idx: Optional[torch.Tensor] = None,
+    num_mps: Optional[int] = None,
+    scale_b_padded: Optional[torch.Tensor] = None,
+    correction_operand: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Perform a dense GEMM between fp16 activations and signed INT4 weights.
+
+    The weights are quantized per K128 group, which is the group size the kernel tile carries, so K
+    must be a multiple of 256. The result is written into ``out`` and returned.
+
+    Parameters
+    ----------
+    input_a : Tensor
+        Activation tensor with shape ``(M, K)`` and dtype FP16.
+    weight_b : Tensor
+        Packed weight tensor with shape ``(N, ceil_div(K, 2))`` and dtype int8. Each byte holds the
+        two K-adjacent INT4 weights of one output column: the even K index in the low nibble and the
+        odd K index in the high nibble, each already stored as the signed INT4 value of the biased
+        dequantization ``weight = scale * (q + nibble_bias - zero_point)``.
+    scale_b : Tensor
+        Per-group weight scales with shape ``(N, ceil_div(K, 128))`` and dtype FP16.
+    out : Tensor
+        Preallocated output tensor with shape ``(M, N)`` and dtype FP16 or BF16.
+    zero_points : Optional[Tensor]
+        Per-group zero points with the same shape and dtype contract as ``scale_b``. Omit them for
+        symmetric checkpoints, whose zero point equals the nibble bias; supplying them selects the
+        asymmetric path, which adds the exact rank-1 correction of the offset.
+    g_idx : Optional[Tensor]
+        Act-order permutation descriptor. Only the identity ordering is supported; any other value
+        raises, because the permutation must be materialized into ``weight_b`` before the call.
+    num_mps : Optional[int]
+        Limit the number of multiprocessors the persistent grid may use. ``None`` uses the device
+        count.
+
+    Returns
+    -------
+    Tensor
+        The result tensor ``out``.
+
+    Raises
+    ------
+    ValueError
+        If a tensor shape, dtype or stride does not match the contract above.
+    NotImplementedError
+        If ``g_idx`` is not the identity permutation.
+    """
+    return dense_w4a16_gemm_mutlass(
+        input_a,
+        weight_b,
+        scale_b,
+        out,
+        zero_points,
+        g_idx,
+        num_mps,
+        scale_b_padded,
+        correction_operand,
+    )

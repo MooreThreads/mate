@@ -88,6 +88,7 @@ helpers.
 - ``mate.gemm.masked_moe_gemm_16bit``
 - ``mate.gemm.ragged_moe_gemm_mixed_dtype``
 - ``mate.gemm.masked_moe_gemm_mixed_dtype``
+- ``mate.gemm.dense_w4a16_gemm``
 - ``mate.gemm.bmm``
 - ``mate.deep_gemm.fp8_einsum``
 - ``mate.deep_gemm.fp8_mqa_logits``

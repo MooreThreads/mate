@@ -1,0 +1,235 @@
+#include <algorithm>
+#include <cstdint>
+
+#include <mutlass/device_kernel.h>
+#include <mutlass/half.h>
+#include <mutlass/kernel_hardware_info.h>
+#include <mutlass/mutlass.h>
+
+#include <mute/tensor.hpp>
+
+#include "mate/gemm/deep_gemm/gemm_type.hpp"
+#include "mate/gemm/deep_gemm/mp31_dense_w4a16_gemm.hpp"
+
+#include "dtype_utils.hpp"
+#include "op_utils.hpp"
+
+// The cross-split reduction. Written here rather than left to a framework sum because the whole point
+// of the split is a ~32 us kernel: two dispatcher-level tensor ops measured 28 us of wall time against
+// it, which is more than the kernel itself, while this one launch costs the launch alone.
+__global__ void {{ func_name }}_reduce_kernel(float const* __restrict__ partial,
+                                              int k_split,
+                                              int n,
+                                              int64_t split_stride,
+                                              int64_t partial_row_stride,
+                                              {{ element_d }}* __restrict__ d,
+                                              int64_t d_row_stride,
+                                              int64_t total) {
+  const int64_t stride = int64_t(gridDim.x) * int64_t(blockDim.x);
+  for (int64_t i = int64_t(blockIdx.x) * int64_t(blockDim.x) + int64_t(threadIdx.x); i < total;
+       i += stride) {
+    const int64_t row = i / n;
+    const int64_t col = i - row * n;
+    // One thread sums the splits of one output element in a fixed order, so the result is the same
+    // every run; no atomics, and no cross-CTA ordering to depend on.
+    float acc = 0.0f;
+    for (int s = 0; s < k_split; ++s) {
+      acc += partial[int64_t(s) * split_stride + row * partial_row_stride + col];
+    }
+    d[row * d_row_stride + col] = {{ element_d }}(acc);
+  }
+}
+
+// One launch of the reduction. Called directly from the GEMM entry point so a split costs one extra
+// kernel and no extra host dispatch: the whole-call overhead of a second framework-level tensor op was
+// larger than the kernel it was reducing.
+inline void {{ func_name }}_raise_reduce(float const* partial,
+                                         int          k_split,
+                                         int64_t      n,
+                                         int64_t      split_stride,
+                                         int64_t      partial_row_stride,
+                                         {{ element_d }}* d,
+                                         int64_t      d_row_stride,
+                                         int64_t      m,
+                                         DLDevice     device) {
+  if (m == 0 || n == 0 || k_split <= 1) {
+    return;
+  }
+  ffi::MUSADeviceGuard device_guard(device.device_id);
+  musaStream_t          stream  = get_stream(device);
+  const int64_t         total   = m * n;
+  const int             threads = 256;
+  const int64_t         blocks  = std::min<int64_t>((total + threads - 1) / threads, 4096);
+  {{ func_name }}_reduce_kernel<<<blocks, threads, 0, stream>>>(
+      partial, k_split, static_cast<int>(n), split_stride, partial_row_stride, d, d_row_stride, total);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+
+namespace {
+
+template <class T>
+struct KernelTag {
+  using Kernel = T;
+};
+
+}  // namespace
+
+void {{ func_name }}(
+    ffi::TensorView a,
+    ffi::TensorView b,
+    ffi::TensorView scale_b,
+    ffi::TensorView zero_b,
+    ffi::TensorView d,
+    ffi::TensorView partial,
+    int num_mps,
+    int k_split) {
+  using namespace mute;
+
+  using ElementA = {{ element_a }};
+  using ElementB = mute::int4_t;
+  using ElementScaleB = {{ element_scale_b }};
+  using ElementZeroB = {{ element_zero_b }};
+  using ElementRowSum = float;
+  using ElementD = {{ element_d }};
+  constexpr uint32_t kStages = {{ stages }};
+  constexpr bool kZeroPoints = {{ "true" if zero_points else "false" }};
+  using TileShape = mute::Shape<mute::Int<{{ tile_m }}>, mute::Int<{{ tile_n }}>, mute::Int<{{ tile_k }}>>;
+  // One kernel functor, two instantiations. `kSplit = true` carries the split range arithmetic and the
+  // fp32 partial epilogue; `kSplit = false` is the whole-K kernel with neither, which is what makes an
+  // unsplit launch cost what it always did. Both are compiled here and chosen once, on the host.
+  using Kernel = mate::gemm::dense_w4a16_gemm::Mp31DenseW4A16Gemm<
+      ElementA, ElementB, ElementScaleB, ElementZeroB, ElementRowSum, ElementD, TileShape, kStages,
+      kZeroPoints, false>;
+  using KernelSplit = mate::gemm::dense_w4a16_gemm::Mp31DenseW4A16Gemm<
+      ElementA, ElementB, ElementScaleB, ElementZeroB, ElementRowSum, ElementD, TileShape, kStages,
+      kZeroPoints, true>;
+
+  // The Normal schedule addresses a dense (M, N, K) problem with no leading group dimension, so every
+  // operand is rank 2 and its group stride is free.
+  constexpr auto kType = mate::deep_gemm::GemmType::Normal;
+  using TensorGroup = mate::deep_gemm::detail::GemmTensorGroupTraits<kType>;
+  static_assert(!TensorGroup::kA && !TensorGroup::kB && !TensorGroup::kD,
+                "The dense W4A16 kernel takes no grouped operand");
+
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(0);
+
+  TVM_FFI_ICHECK_EQ(b.size(1) * 2, k) << "the packed weight must hold two INT4 values per byte of K";
+  TVM_FFI_ICHECK_EQ(scale_b.size(0), n) << "scale_b must hold one row per output column";
+  TVM_FFI_ICHECK_EQ(scale_b.size(1), mutlass::ceil_div(int64_t(k), int64_t(128)))
+      << "scale_b must hold one scale per K128 weight group";
+  if constexpr (kZeroPoints) {
+    TVM_FFI_ICHECK_EQ(zero_b.size(0), n) << "zero_b must hold one row per output column";
+    TVM_FFI_ICHECK_EQ(zero_b.size(1), scale_b.size(1))
+        << "zero_b must hold one correction per K128 weight group";
+  }
+  TVM_FFI_ICHECK_EQ(d.size(0), m) << "d.shape[0] must match the M dimension of a";
+  TVM_FFI_ICHECK_EQ(d.size(1), n) << "d.shape[1] must match the N dimension of b";
+
+  if (m == 0 || n == 0 || k == 0) {
+    return;
+  }
+
+  check_mp31(a.device(), "{{ func_name }}");
+  ffi::MUSADeviceGuard device_guard(a.device().device_id);
+  const int mp_count       = mutlass::KernelHardwareInfo::query_device_multiprocessor_count();
+  const int launch_num_mps = num_mps > 0 ? std::min(num_mps, mp_count) : mp_count;
+  musaStream_t stream      = get_stream(a.device());
+
+  // A is (M, K) fp16, the packed weight is (N, K/2) int8 with two signed INT4 values per byte, and the
+  // logical K extent is recovered by the factor-of-two stride that addresses whole bytes.
+  auto stride_a = make_stride(a.stride(0), _1{}, m * k);
+  auto stride_b = make_stride(b.stride(0) * 2, _1{}, n * k);
+  auto stride_scale_b = make_stride(scale_b.stride(0), _1{}, n * scale_b.size(1));
+  auto stride_zero_b  = make_stride(zero_b.stride(0), _1{}, n * std::max<int64_t>(zero_b.size(1), 1));
+  auto stride_d       = make_stride(d.stride(0), _1{}, m * n);
+
+  // A split launch writes one fp32 partial accumulator per split instead of `d`, and the caller
+  // reduces them afterwards. The buffer is [k_split, m_pad, n] fp32 with the split axis outermost, so
+  // the split stride is its row-0 stride and the plane itself is addressed exactly like `d`.
+  const int ks = k_split > 0 ? k_split : 1;
+  float*    ptr_partial          = nullptr;
+  int64_t   partial_split_stride = 0;
+  if (ks > 1) {
+    TVM_FFI_ICHECK(dtype_equal(partial.dtype(), dl_float32))
+        << "a K-split launch needs an fp32 partial buffer, got a different dtype";
+    TVM_FFI_ICHECK_EQ(partial.size(0), int64_t(ks)) << "partial.shape[0] must be k_split";
+    TVM_FFI_ICHECK(partial.size(1) >= m && partial.size(2) == n)
+        << "partial must be [k_split, m_pad >= M, N]";
+    TVM_FFI_ICHECK_EQ(partial.stride(1), n) << "partial must be contiguous along N (row stride N)";
+    ptr_partial          = reinterpret_cast<float*>(partial.data_ptr());
+    partial_split_stride = partial.stride(0);
+  }
+
+  auto launch_kernel = [&](auto kernel_tag) {
+    using TaggedKernel = typename decltype(kernel_tag)::Kernel;
+    typename TaggedKernel::Arguments args{
+        .ptr_a        = reinterpret_cast<ElementA const*>(a.data_ptr()),
+        .ptr_b        = reinterpret_cast<ElementB const*>(b.data_ptr()),
+        .ptr_scale_b  = reinterpret_cast<ElementScaleB const*>(scale_b.data_ptr()),
+        .ptr_zero_b   = kZeroPoints ? reinterpret_cast<ElementZeroB const*>(zero_b.data_ptr()) : nullptr,
+        .ptr_d        = reinterpret_cast<ElementD*>(d.data_ptr()),
+        .stride_a     = stride_a,
+        .stride_b     = stride_b,
+        .stride_scale_b = stride_scale_b,
+        .stride_zero_b  = stride_zero_b,
+        .stride_d       = stride_d,
+        .ptr_partial          = ptr_partial,
+        .partial_split_stride = partial_split_stride,
+        .k_split              = ks,
+        .m            = static_cast<int>(m),
+        .n            = static_cast<int>(n),
+        .k            = static_cast<int>(k),
+        .num_mps      = launch_num_mps,
+    };
+
+    auto params = TaggedKernel::to_underlying_arguments(args);
+    dim3 grid   = TaggedKernel::get_grid_shape_persistent(params);
+    mutlass::device_kernel<TaggedKernel>
+        <<<grid, TaggedKernel::MaxThreadsPerBlock, TaggedKernel::SharedStorageSize, stream>>>(params);
+  };
+
+  if (ks > 1) {
+    launch_kernel(KernelTag<KernelSplit>{});
+    MATE_CHECK_MUSA_KERNEL_LAUNCH();
+
+    // The split lands in `partial`, so the same call has to hand back the summed result.
+    {{ func_name }}_raise_reduce(ptr_partial,
+                                ks,
+                                n,
+                                partial_split_stride,
+                                partial.stride(1),
+                                reinterpret_cast<ElementD*>(d.data_ptr()),
+                                d.stride(0),
+                                m,
+                                d.device());
+    return;
+  }
+  launch_kernel(KernelTag<Kernel>{});
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
+
+void {{ func_name }}_reduce(ffi::TensorView partial, ffi::TensorView d, int k_split) {
+  const int64_t m = d.size(0);
+  const int64_t n = d.size(1);
+  TVM_FFI_ICHECK(dtype_equal(partial.dtype(), dl_float32))
+      << "the partial buffer of a K-split launch must be fp32";
+  TVM_FFI_ICHECK_EQ(partial.size(0), int64_t(k_split)) << "partial.shape[0] must be k_split";
+  TVM_FFI_ICHECK(partial.size(1) >= m && partial.size(2) == n)
+      << "partial must be [k_split, m_pad >= M, N]";
+  TVM_FFI_ICHECK_EQ(partial.stride(2), 1) << "partial must be contiguous along N";
+  check_mp31(d.device(), "{{ func_name }}_reduce");
+  // tvm-ffi hands the device over as a heterogeneous DLDevice; the kernel's stream comes from it.
+  {{ func_name }}_raise_reduce(reinterpret_cast<float const*>(partial.data_ptr()),
+                              k_split,
+                              n,
+                              partial.stride(0),
+                              partial.stride(1),
+                              reinterpret_cast<{{ element_d }}*>(d.data_ptr()),
+                              d.stride(0),
+                              m,
+                              d.device());
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}_reduce, {{ func_name }}_reduce);

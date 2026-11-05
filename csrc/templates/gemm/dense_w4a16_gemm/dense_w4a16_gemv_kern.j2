@@ -1,0 +1,222 @@
+#include <musa_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+
+#include <mutlass/numeric_types.h>
+
+#include "op_utils.hpp"
+
+// Small-M W4A16: out[m, n] = sum_g scale[n, g] * sum_{k in g} a[m, k] * q[n, k]
+//                          + corr[n, g] * sum_{k in g} a[m, k]        (corr only with zero points)
+// q is the signed two's-complement nibble of weight_b, even k in the low nibble. Every weight byte is
+// read once and reused for all M rows of the activation.
+namespace {
+
+constexpr int kGroupK        = 128;
+constexpr int kChunkK        = 32;  // one 16-byte weight load: 32 nibbles
+constexpr int kMMax          = {{ m_max }};
+constexpr int kLanesPerRow   = {{ lanes_per_row }};
+constexpr int kRowsPerGroup  = {{ rows_per_group }};
+constexpr int kWarps         = {{ warps }};
+constexpr int kKSplit        = {{ k_split }};
+constexpr int kChunksPerLane = {{ chunks_per_lane }};
+constexpr int kGroupsPerWarp = 32 / kLanesPerRow;
+constexpr int kRowsPerBlock  = kRowsPerGroup * kGroupsPerWarp * (kWarps / kKSplit);
+constexpr bool kZeroPoints   = {{ "true" if zero_points else "false" }};
+constexpr bool kASmem        = {{ "true" if a_smem else "false" }};  // stage A in shared memory, or read it from L2
+using ElementA               = mutlass::half_t;
+using ElementScale           = mutlass::half_t;
+using ElementD               = {{ element_d }};
+
+static_assert(32 % kLanesPerRow == 0, "a row's lanes must tile a warp");
+static_assert(kWarps % kKSplit == 0, "the K split must divide the warps of a block");
+static_assert(kGroupK % kChunkK == 0, "a weight load must not straddle a scale group");
+
+// `biased` is the weight word XOR 0x88888888, so each nibble holds u = q + 8 in [0, 15]. OR-ing u into
+// the mantissa of 2^23 gives the float 2^23 + u exactly, and subtracting 2^23 + 8 leaves q: one
+// field extract, one OR and one subtract per weight instead of a sign-extend and an int-to-float.
+__device__ __forceinline__ float signed_nibble(uint32_t biased, int index) {
+  return __builtin_bit_cast(float, 0x4B000000u | ((biased >> (4 * index)) & 0xFu)) - 8388616.0f;
+}
+
+__device__ __forceinline__ uint32_t word_of(uint4 const& v, int q) {
+  return (q == 0 ? v.x : q == 1 ? v.y : q == 2 ? v.z : v.w) ^ 0x88888888u;
+}
+
+// A group of kLanesPerRow lanes computes kRowsPerGroup output columns together: each lane loads one
+// 16-byte activation vector per chunk from shared memory and reuses it for all of the group's rows,
+// with all weight loads of the row group issued before any is consumed. kKSplit warps split K and
+// combine through shared memory.
+__global__ void __launch_bounds__(kWarps * 32) w4a16_gemv_kernel(
+    ElementA const* __restrict__ a, int64_t lda,
+    uint8_t const* __restrict__ w, int64_t ldw,
+    ElementScale const* __restrict__ scale, int64_t lds,
+    ElementScale const* __restrict__ corr, int64_t ldc,
+    ElementD* __restrict__ out, int64_t ldo,
+    int m, int n, int k) {
+  extern __shared__ uint4 smem_a_vec[];  // (m, k) halves, row-major, 16-byte vectors
+  __shared__ float partial[kKSplit > 1 ? kWarps : 1][32][kRowsPerGroup][kMMax];
+  const int vecs_per_row = k / 8;
+  if constexpr (kASmem) {
+    for (int idx = int(threadIdx.x); idx < m * vecs_per_row; idx += kWarps * 32) {
+      const int row = idx / vecs_per_row;
+      const int col = idx - row * vecs_per_row;
+      smem_a_vec[idx] = *reinterpret_cast<uint4 const*>(a + int64_t(row) * lda + int64_t(col) * 8);
+    }
+    __syncthreads();
+  }
+
+  const int warp     = int(threadIdx.x) / 32;
+  const int lane     = int(threadIdx.x) % 32;
+  const int k_slice  = warp % kKSplit;
+  const int row_warp = warp / kKSplit;
+  const int group    = lane / kLanesPerRow;
+  const int sub      = lane % kLanesPerRow;
+  const int chunks   = k / kChunkK;
+  const int row0     = int(blockIdx.x) * kRowsPerBlock + (row_warp * kGroupsPerWarp + group) * kRowsPerGroup;
+
+  uint4 wv[kChunksPerLane][kRowsPerGroup];
+  float s[kChunksPerLane][kRowsPerGroup];
+  float z[kChunksPerLane][kRowsPerGroup];
+#pragma unroll
+  for (int u = 0; u < kChunksPerLane; ++u) {
+    const int c = (u * kKSplit + k_slice) * kLanesPerRow + sub;
+    const int g = (c * kChunkK) / kGroupK;
+#pragma unroll
+    for (int r = 0; r < kRowsPerGroup; ++r) {
+      const bool valid = c < chunks && row0 + r < n;
+      wv[u][r] = valid ? *reinterpret_cast<uint4 const*>(w + int64_t(row0 + r) * ldw + int64_t(c) * 16)
+                       : make_uint4(0u, 0u, 0u, 0u);
+      s[u][r]  = valid ? float(scale[int64_t(row0 + r) * lds + g]) : 0.f;
+      z[u][r]  = (kZeroPoints && valid) ? float(corr[int64_t(row0 + r) * ldc + g]) : 0.f;
+    }
+  }
+
+  float acc[kRowsPerGroup][kMMax];
+#pragma unroll
+  for (int r = 0; r < kRowsPerGroup; ++r)
+#pragma unroll
+    for (int i = 0; i < kMMax; ++i) acc[r][i] = 0.f;
+
+#pragma unroll
+  for (int u = 0; u < kChunksPerLane; ++u) {
+    const int c = (u * kKSplit + k_slice) * kLanesPerRow + sub;
+    if (c < chunks) {
+      uint32_t biased[kRowsPerGroup][4];
+#pragma unroll
+      for (int r = 0; r < kRowsPerGroup; ++r)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) biased[r][q] = word_of(wv[u][r], q);
+#pragma unroll
+      for (int i = 0; i < kMMax; ++i) {
+        if (i < m) {
+          float dot[kRowsPerGroup];
+#pragma unroll
+          for (int r = 0; r < kRowsPerGroup; ++r) dot[r] = 0.f;
+          float asum = 0.f;
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const uint4 av = kASmem ? smem_a_vec[i * vecs_per_row + c * 4 + q]
+                                    : *reinterpret_cast<uint4 const*>(a + int64_t(i) * lda + c * kChunkK + q * 8);
+            ElementA const* h = reinterpret_cast<ElementA const*>(&av);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              const float x = float(h[j]);
+              if constexpr (kZeroPoints) asum += x;
+#pragma unroll
+              for (int r = 0; r < kRowsPerGroup; ++r) dot[r] += x * signed_nibble(biased[r][q], j);
+            }
+          }
+#pragma unroll
+          for (int r = 0; r < kRowsPerGroup; ++r) acc[r][i] += s[u][r] * dot[r] + z[u][r] * asum;
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < kRowsPerGroup; ++r)
+#pragma unroll
+    for (int i = 0; i < kMMax; ++i)
+#pragma unroll
+      for (int off = kLanesPerRow / 2; off > 0; off >>= 1)
+        acc[r][i] += __shfl_xor_sync(0xffffffff, acc[r][i], off);
+
+  if constexpr (kKSplit > 1) {
+    if (sub == 0) {
+#pragma unroll
+      for (int r = 0; r < kRowsPerGroup; ++r)
+#pragma unroll
+        for (int i = 0; i < kMMax; ++i) partial[warp][group][r][i] = acc[r][i];
+    }
+    __syncthreads();
+    if (k_slice != 0 || sub != 0) return;
+#pragma unroll
+    for (int r = 0; r < kRowsPerGroup; ++r)
+#pragma unroll
+      for (int i = 0; i < kMMax; ++i) {
+        float v = 0.f;
+#pragma unroll
+        for (int s_idx = 0; s_idx < kKSplit; ++s_idx) v += partial[warp + s_idx][group][r][i];
+        acc[r][i] = v;
+      }
+  } else if (sub != 0) {
+    return;
+  }
+
+#pragma unroll
+  for (int r = 0; r < kRowsPerGroup; ++r)
+#pragma unroll
+    for (int i = 0; i < kMMax; ++i)
+      if (i < m && row0 + r < n) out[int64_t(i) * ldo + row0 + r] = ElementD(acc[r][i]);
+}
+
+}  // namespace
+
+void {{ func_name }}(
+    ffi::TensorView a,
+    ffi::TensorView b,
+    ffi::TensorView scale_b,
+    ffi::TensorView zero_b,
+    ffi::TensorView d) {
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(0);
+  TVM_FFI_ICHECK_EQ(b.size(1) * 2, k) << "the packed weight must hold two INT4 values per byte of K";
+  TVM_FFI_ICHECK_EQ(k % kGroupK, 0) << "K must be a whole number of 128-wide scale groups";
+  TVM_FFI_ICHECK_LE(m, kMMax) << "this instantiation serves at most {{ m_max }} rows";
+  TVM_FFI_ICHECK_EQ(scale_b.size(0), n) << "scale_b must hold one row per output column";
+  TVM_FFI_ICHECK_GE(scale_b.size(1), k / kGroupK) << "scale_b must hold one scale per K128 group";
+  TVM_FFI_ICHECK_EQ(a.stride(1), 1) << "a must be contiguous along K";
+  TVM_FFI_ICHECK_EQ(a.stride(0) % 8, 0) << "a's row stride must keep 16-byte alignment";
+  TVM_FFI_ICHECK_EQ(b.stride(1), 1) << "b must be contiguous along K";
+  TVM_FFI_ICHECK_EQ(d.size(0), m) << "d.shape[0] must match the M dimension of a";
+  TVM_FFI_ICHECK_EQ(d.size(1), n) << "d.shape[1] must match the N dimension of b";
+  if (m == 0 || n == 0 || k == 0) {
+    return;
+  }
+
+  check_mp31(a.device(), "{{ func_name }}");
+  ffi::MUSADeviceGuard device_guard(a.device().device_id);
+  musaStream_t stream = get_stream(a.device());
+
+  TVM_FFI_ICHECK_LE(k / kChunkK, int64_t(kLanesPerRow) * kKSplit * kChunksPerLane)
+      << "K exceeds what this instantiation's lanes cover; pick a larger split or more chunks per lane";
+  const size_t smem_bytes = kASmem ? size_t(m) * size_t(k) * sizeof(ElementA) : 0;
+  if (smem_bytes > 48 * 1024) {
+    MATE_MUSA_RUNTIME_CHECK(
+        musaFuncSetAttribute(w4a16_gemv_kernel, musaFuncAttributeMaxDynamicSharedMemorySize, int(smem_bytes)));
+  }
+  const int64_t blocks = (n + kRowsPerBlock - 1) / kRowsPerBlock;
+  const dim3 grid(static_cast<uint32_t>(blocks));
+  w4a16_gemv_kernel<<<grid, kWarps * 32, smem_bytes, stream>>>(
+      reinterpret_cast<ElementA const*>(a.data_ptr()), a.stride(0),
+      reinterpret_cast<uint8_t const*>(b.data_ptr()), b.stride(0),
+      reinterpret_cast<ElementScale const*>(scale_b.data_ptr()), scale_b.stride(0),
+      kZeroPoints ? reinterpret_cast<ElementScale const*>(zero_b.data_ptr()) : nullptr,
+      kZeroPoints ? zero_b.stride(0) : 0,
+      reinterpret_cast<ElementD*>(d.data_ptr()), d.stride(0),
+      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}

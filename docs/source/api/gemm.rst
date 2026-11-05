@@ -47,6 +47,7 @@ Dense GEMM
 .. currentmodule:: mate.gemm
 
 .. autofunction:: bmm
+.. autofunction:: dense_w4a16_gemm
 
 DeepGEMM Lightning Indexer
 --------------------------

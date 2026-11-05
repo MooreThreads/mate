@@ -1,0 +1,84 @@
+#include <algorithm>
+#include <cstdint>
+
+#include <mutlass/device_kernel.h>
+#include <mutlass/half.h>
+#include <mutlass/kernel_hardware_info.h>
+#include <mutlass/mutlass.h>
+
+#include <mute/tensor.hpp>
+
+#include "mate/gemm/deep_gemm/mp31_dense_w4a16_prefill_gemm.hpp"
+
+#include "op_utils.hpp"
+
+// a: (M, K) fp16. b: (N, K/2) int8, two signed INT4 values per byte, even k in the low nibble.
+// scale_t: (K/128, N) fp16, one scale per (group, n), N-contiguous; with zero points (2K/128, N), rows
+// 2g and 2g+1 holding s and (8 - zp) * s. row_sum_t (zero points only, else ignored): (K/128, >= M)
+// fp32, the sum of each K128 group of every row of a, M-contiguous. d: (M, N).
+void {{ func_name }}(
+    ffi::TensorView a,
+    ffi::TensorView b,
+    ffi::TensorView scale_t,
+    ffi::TensorView row_sum_t,
+    ffi::TensorView d,
+    int num_mps) {
+  using namespace mute;
+  using Kernel = mate::gemm::dense_w4a16_prefill_gemm::Mp31DenseW4A16PrefillGemm<
+      {{ element_d }}, {{ tile_n }}, {{ stages }}, {{ zero_points }}>;
+
+  const int64_t m = a.size(0);
+  const int64_t k = a.size(1);
+  const int64_t n = b.size(0);
+
+  TVM_FFI_ICHECK_EQ(b.size(1) * 2, k) << "the packed weight must hold two INT4 values per byte of K";
+  TVM_FFI_ICHECK_EQ(k % Kernel::BlockK, 0) << "K must be a whole number of 128-wide scale groups";
+  TVM_FFI_ICHECK_EQ(scale_t.size(0), Kernel::ScaleRows * (k / Kernel::BlockK))
+      << "scale_t must hold " << Kernel::ScaleRows << " row(s) per K128 group";
+  TVM_FFI_ICHECK_EQ(scale_t.size(1), n) << "scale_t must hold one scale per output column";
+  TVM_FFI_ICHECK_EQ(scale_t.stride(1), 1) << "scale_t must be contiguous along N";
+  TVM_FFI_ICHECK_EQ(d.size(0), m) << "d.shape[0] must match the M dimension of a";
+  TVM_FFI_ICHECK_EQ(d.size(1), n) << "d.shape[1] must match the N dimension of b";
+  TVM_FFI_ICHECK_EQ(n % 8, 0) << "scale_t rows must be 16-byte aligned for the TME";
+  TVM_FFI_ICHECK_EQ(d.stride(1), 1) << "d must be row-major";
+  if constexpr (Kernel::IsZeroPoints) {
+    TVM_FFI_ICHECK(row_sum_t.size(0) == k / Kernel::BlockK && row_sum_t.size(1) >= m && row_sum_t.stride(1) == 1 &&
+                   row_sum_t.stride(0) % 4 == 0)
+        << "row_sum_t must be (K/128, >= M) fp32, M-contiguous, with 16-byte aligned rows";
+  }
+
+  if (m == 0 || n == 0 || k == 0) {
+    return;
+  }
+
+  check_mp31(a.device(), "{{ func_name }}");
+  ffi::MUSADeviceGuard device_guard(a.device().device_id);
+  const int mp_count       = mutlass::KernelHardwareInfo::query_device_multiprocessor_count();
+  const int launch_num_mps = num_mps > 0 ? std::min(num_mps, mp_count) : mp_count;
+  musaStream_t stream      = get_stream(a.device());
+
+  typename Kernel::Arguments args{
+      .ptr_a        = reinterpret_cast<mutlass::half_t const*>(a.data_ptr()),
+      .ptr_b        = reinterpret_cast<mute::int4_t const*>(b.data_ptr()),
+      .ptr_scale      = reinterpret_cast<mutlass::half_t const*>(scale_t.data_ptr()),
+      .ptr_row_sum    = reinterpret_cast<float const*>(row_sum_t.data_ptr()),
+      .ptr_d          = reinterpret_cast<{{ element_d }}*>(d.data_ptr()),
+      .stride_a       = make_stride(a.stride(0), _1{}, m * k),
+      .stride_b       = make_stride(b.stride(0) * 2, _1{}, n * k),
+      .stride_scale   = make_stride(_1{}, scale_t.stride(0), n * scale_t.size(0)),
+      .stride_row_sum = make_stride(_1{}, row_sum_t.stride(0), row_sum_t.stride(0) * row_sum_t.size(0)),
+      .stride_d       = make_stride(d.stride(0), _1{}, m * n),
+      .m            = static_cast<int>(m),
+      .n            = static_cast<int>(n),
+      .k            = static_cast<int>(k),
+      .num_mps      = launch_num_mps,
+  };
+
+  auto params = Kernel::to_underlying_arguments(args);
+  dim3 grid   = Kernel::get_grid_shape_persistent(params);
+  auto kernel = mutlass::device_kernel<Kernel>;
+  MATE_MUSA_RUNTIME_CHECK(musaFuncSetAttribute(
+      kernel, musaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Kernel::SharedStorageSize)));
+  kernel<<<grid, Kernel::MaxThreadsPerBlock, Kernel::SharedStorageSize, stream>>>(params);
+  MATE_CHECK_MUSA_KERNEL_LAUNCH();
+}
