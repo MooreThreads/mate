@@ -1,9 +1,17 @@
 {
-  "latest": "0.2.8",
+  "latest": "0.2.8.post2",
   "versions": [
     {
-      "version": "0.2.8",
+      "version": "0.2.8.post2",
       "aliases": ["latest"]
+    },
+    {
+      "version": "0.2.8.post1",
+      "ref": "v0.2.8.post1"
+    },
+    {
+      "version": "0.2.8",
+      "ref": "v0.2.8"
     },
     {
       "version": "0.2.7",

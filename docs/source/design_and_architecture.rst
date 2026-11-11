@@ -85,11 +85,11 @@ MATE supports multiple backend building blocks and packaging forms, including:
 MUBIN artifact delivery
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-The ``gemm``, ``flash_attention``, ``flash_mla``, and ``sage_attention``
-families have MUBIN-backed paths whose generated launch artifacts are kept
-outside the main ``mate`` wheel. The Python validation, dispatch, and JIT launch
-code ships with ``mate``. External artifacts contain ``kernel_map.json`` and
-``.o`` kernel objects.
+The ``gemm``, ``flash_attention``, ``flash_attention_bwd``, ``flash_mla``, and
+``sage_attention`` families have MUBIN-backed paths whose generated launch
+artifacts are kept outside the main ``mate`` wheel. The Python validation,
+dispatch, and JIT launch code ships with ``mate``. External artifacts contain
+``kernel_map.json`` and ``.o`` kernel objects.
 
 MATE resolves these artifacts in the following order:
 

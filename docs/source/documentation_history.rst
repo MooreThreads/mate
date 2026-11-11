@@ -8,6 +8,34 @@ For runtime, API, and compatibility changes, see
 
 The current docs site history starts at ``0.2.2``.
 
+0.2.8.post1
+-----------
+
+**Dense attention**
+
+- Added the standalone backward entry point ``mate.fmha_backward`` to
+  :doc:`Attention <api/attention>`, following the FA3 C++ ``mha_bwd``
+  parameter order with independently optional gradient buffers, and exposed
+  the matching ``_flash_attn_backward`` entry in the
+  :doc:`FlashAttention wrapper <wrappers/flash_attention_wrapper>`.
+
+**Linear attention**
+
+- Documented packed GDN state pools in the :doc:`GDN support matrix <gdn>`:
+  padded ``[conv | ssm | pad]`` page views, ``state_indices`` pool mapping,
+  and strided initial/output states.
+
+**Sparse attention**
+
+- Clarified the QSA vector-load alignment, block-hint width, and decode
+  ``page_size`` contracts in :doc:`QSA <api/qsa>`.
+
+**Installation**
+
+- Updated the :doc:`installation <install>` guidance: TileLang MUSA
+  (``tilelang-musa==0.1.12+musa.5``) is now a required dependency instead of
+  an optional extra.
+
 0.2.8
 -----
 

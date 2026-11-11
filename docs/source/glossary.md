@@ -2,7 +2,7 @@
 
 This glossary defines key MATE terms for new users.
 
-This page is part of the MATE 0.2.8 documentation set. See
+This page is part of the MATE 0.2.8.post1 documentation set. See
 {doc}`Documentation History <documentation_history>` for the release history.
 
 ## Core platform

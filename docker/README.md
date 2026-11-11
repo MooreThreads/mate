@@ -164,8 +164,8 @@ https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ```
 
 The current development base pins `apache-tvm-ffi` to
-`0.1.11.post1+musa.1` and `tilelang-musa` to `0.1.12+musa.2`. The TileLang
-local version satisfies MATE's `tilelang-musa==0.1.12` project requirement.
+`0.1.11.post1+musa.1` and `tilelang-musa` to `0.1.12+musa.5`, matching MATE's
+`tilelang-musa==0.1.12+musa.5` project requirement.
 
 The build runs `pip check` and validates every MUSA distribution version from
 installed package metadata. It does not import GPU modules during the build.

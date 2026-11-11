@@ -183,7 +183,7 @@ index. The installed MATE distribution contains the external kernel maps and
 #### `download-mubin`
 
 Download complete metadata and kernel payloads for `gemm`, `flash_attention`,
-`flash_mla`, and `sage_attention`:
+`flash_attention_bwd`, `flash_mla`, and `sage_attention`:
 
 ```bash
 mate download-mubin

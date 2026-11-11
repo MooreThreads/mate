@@ -67,7 +67,7 @@ variables control the downloaded-artifact path and repository behavior.
 | --- | --- | --- |
 | `MATE_MUBIN_DIR` | `~/.cache/mate/mubin` | Root directory for downloaded MUBIN artifacts. Use a directory dedicated to MATE artifacts. |
 | `MATE_MUBIN_REPOSITORY` | `sw-mate-public-generic` | Repository name or HTTP(S) URL used as the artifact source. |
-| `MATE_MUBIN_REPOSITORY_BASE_URL` | `https://sh-repo.mthreads.com/repo/repository` | Base URL prepended when `MATE_MUBIN_REPOSITORY` is a repository name rather than an HTTP(S) URL. |
+| `MATE_MUBIN_REPOSITORY_BASE_URL` | `https://dl.mthreads.com/repo/repository` | Base URL prepended when `MATE_MUBIN_REPOSITORY` is a repository name rather than an HTTP(S) URL. |
 | `MATE_MUBIN_NO_DOWNLOAD` | unset | Disable automatic metadata and kernel downloads when set to any nonempty value. |
 | `MATE_MUBIN_VERIFY_DISABLED` | unset | Disable kernel-map and object hash verification when set to any nonempty value. |
 | `MATE_MUBIN_DOWNLOAD_VERBOSE` | `0` | Print artifact download, cache reuse, and refresh details when enabled. |

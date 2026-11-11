@@ -18,7 +18,7 @@ Steps at a glance
 Step 1. Check Requirements
 --------------------------
 
-MATE 0.2.8 uses the following baseline:
+MATE 0.2.8.post1 uses the following baseline:
 
 .. list-table::
    :header-rows: 1
@@ -194,7 +194,7 @@ installs the matching ``mate`` dependency automatically.
 Run only the command for the package surface used by your framework.
 
 Delivered MUSA wrapper versions use the PEP 440 local version suffix
-``+musa``, for example ``0.2.8+musa``. Check the installed distribution to
+``+musa``, for example ``0.2.8.post1+musa``. Check the installed distribution to
 distinguish the MATE-backed MUSA wrapper from the native implementation:
 
 .. code-block:: bash
@@ -218,7 +218,7 @@ want direct MATE Python APIs without a wrapper package.
      --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
 TileLang and optional TVM-FFI extensions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 TileLang MUSA is a required dependency of MATE. Installing MATE directly or
 through a wrapper installs ``tilelang-musa==0.1.12+musa.5``; no TileLang extra
@@ -311,7 +311,9 @@ MUBIN artifact availability
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 MATE uses external MUBIN artifacts for selected ``gemm``,
-``flash_attention``, ``flash_mla``, and ``sage_attention`` execution paths.
+``flash_attention``, ``flash_attention_bwd``, ``flash_mla``, and
+``sage_attention`` execution paths. ``flash_attention_bwd`` backs the
+standalone attention backward path.
 The public Python APIs remain in ``mate``, but those paths require one of the
 following artifact sources at runtime:
 

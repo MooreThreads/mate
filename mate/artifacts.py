@@ -69,9 +69,9 @@ class ArtifactPath:
     """Artifactory paths for MATE MUBIN artifact families."""
 
     GEMM: str = "gemm/fbd1a6df72047350033cb4c524dd8145b8f18698/"
-    FLASH_ATTENTION: str = "flash_attention/537c521e874ecd495a613931060f242e38b0261d/"
+    FLASH_ATTENTION: str = "flash_attention/c3775d3481828753c03287660426cf10929371a7/"
     FLASH_ATTENTION_BWD: str = (
-        "flash_attention_bwd/537c521e874ecd495a613931060f242e38b0261d/"
+        "flash_attention_bwd/637db50f36bba615b69909e477bd9db49c800e6f/"
     )
     FLASH_MLA: str = "flash_mla/537c521e874ecd495a613931060f242e38b0261d/"
     SAGE_ATTENTION: str = "sage_attention/537c521e874ecd495a613931060f242e38b0261d/"
@@ -106,10 +106,10 @@ class KernelMapHash:
     KERNEL_MAP_FILE: str = "kernel_map.json"
     GEMM: str = "ea051c7e23e3ea57eb77140c632097392ceae938ecd6ff3c41272b921e6c8844"
     FLASH_ATTENTION: str = (
-        "01ccb88b15bafaf94e01a5636fbd7b5531e1a76a046831d263d8cc2dda234b3c"
+        "f6c0712cf993a34681b31d1f27b33d67693206dcbe512419ad76cbdbe023382d"
     )
     FLASH_ATTENTION_BWD: str = (
-        "4dcaadc20d651160fe185ac8de236495326953324d4b1dcf4b91eaa9977916ce"
+        "bd1b53f5bc65ddaef0a76338eeb91f9093e62f9a379797bdfa96508d7c98ae76"
     )
     FLASH_MLA: str = "875baaee8ec41c09a5ebd4efaed3f1dbc0945be1886e7ea7388d819822ab7a27"
     SAGE_ATTENTION: str = (
