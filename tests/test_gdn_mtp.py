@@ -963,7 +963,7 @@ def _run_mate_extra_mtp_case(
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", [1.0])
-@pytest.mark.parametrize("seq_len", [2, 4, 8])
+@pytest.mark.parametrize("seq_len", [1, 2, 4, 8])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
